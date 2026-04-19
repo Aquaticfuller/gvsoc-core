@@ -1,0 +1,502 @@
+// SPDX-FileCopyrightText: 2026 ETH Zurich and University of Bologna
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// InSitu Cache controller — performance model.
+//
+// Single controller. One controller serves a subset of cache lines (address-interleaved at
+// the cache interco). On hit it serves the request in-place with a fixed latency; on miss
+// it triggers a refill and queues the request via an MSHR list until the line arrives.
+//
+// See prompt/insitu_cache_architecture.md §§6-7 for the RTL microarchitecture and
+// prompt/insitu_cache_gvsoc_plan.md §§1-4 for modeling decisions.
+
+#include <cstdint>
+#include <cstring>
+#include <cstdio>
+#include <vector>
+#include <deque>
+
+#include <vp/vp.hpp>
+#include <vp/queue.hpp>
+#include <vp/itf/io.hpp>
+
+namespace {
+
+inline unsigned int ceil_log2(unsigned int n)
+{
+    if (n <= 1) return 0;
+    return 32 - __builtin_clz(n - 1);
+}
+
+// Line state — mirrors RTL §7.6 (VALID / READ_PEND / WRITE_PEND).
+enum class LineState : uint8_t
+{
+    INVALID = 0,
+    VALID,
+    READ_PEND,   // miss in flight; pending read reqs queued on MSHR
+    WRITE_PEND,  // miss in flight for a write; merges on refill
+};
+
+struct CacheLine
+{
+    uint32_t tag = 0;
+    LineState state = LineState::INVALID;
+    bool dirty = false;
+    // Cycle when this line becomes usable. Requests arriving before this pay the diff in
+    // extra latency (captures the "refill just landed, banks still settling" window).
+    int64_t ready_cycle = -1;
+};
+
+// One entry in the per-set MSHR queue. We track the arrival cycle explicitly so the
+// request object's own latency bookkeeping stays clean across save()/restore().
+struct MshrEntry
+{
+    vp::IoReq *req;
+    int64_t arrival_cycle;
+};
+
+}  // namespace
+
+class InsituCacheController : public vp::Component
+{
+public:
+    explicit InsituCacheController(vp::ComponentConf &conf);
+
+    void reset(bool active) override;
+
+private:
+    // ===== IoReq handlers =====
+    static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req);
+    static void refill_resp_handler(vp::Block *__this, vp::IoReq *req);
+
+    // ===== Internal helpers =====
+    vp::IoReqStatus handle_request(vp::IoReq *req);
+    CacheLine *lookup(uint32_t tag, uint32_t set, int *way_out);
+    int pick_victim(uint32_t tag, uint32_t set);
+    void issue_write_through(vp::IoReq *user_req);
+    void issue_refill(uint32_t line_addr, uint32_t set, int way);
+    void issue_eviction(uint32_t line_addr);
+    void fsm_drain_mshr(uint32_t set);
+
+    // ===== Address decomposition =====
+    inline uint32_t addr_set(uint64_t addr) const
+    { return (addr >> line_bits_) & ((1u << set_bits_) - 1); }
+    inline uint32_t addr_tag(uint64_t addr) const
+    { return (uint32_t)(addr >> (line_bits_ + set_bits_)); }
+    inline uint64_t addr_line(uint64_t addr) const
+    { return addr & ~((1ULL << line_bits_) - 1); }
+
+    // ===== Config =====
+    uint32_t cache_line_bytes_;
+    uint32_t num_ways_;
+    uint32_t num_sets_;
+    uint32_t tcdm_word_bytes_;
+    uint32_t refill_beat_bytes_;
+    bool     use_hash_way_select_;
+    int32_t  hit_latency_cycles_;
+    int32_t  refill_bank_write_cycles_;
+    int32_t  folded_evict_penalty_cycles_;
+    int32_t  mshr_drain_cycles_per_subarray_;
+    uint32_t resp_fifo_depth_;
+    uint32_t retr_fifo_depth_;
+    uint32_t miss_fifo_depth_;
+    uint32_t evic_fifo_depth_;
+    uint32_t wt_fifo_depth_;
+
+    uint32_t line_bits_;
+    uint32_t set_bits_;
+
+    // ===== Ports =====
+    vp::IoSlave  input_itf_;
+    vp::IoMaster refill_itf_;
+    vp::IoMaster evict_itf_;
+    vp::IoMaster wt_itf_;
+
+    // ===== State =====
+    std::vector<CacheLine>               lines_;     // [num_sets * num_ways]
+    std::vector<std::vector<uint8_t>>    lru_order_; // [num_sets][num_ways], front=MRU
+    std::vector<std::deque<MshrEntry>>   mshr_;      // [num_sets]
+    std::vector<bool>                    refill_in_flight_;  // [num_sets]
+    std::vector<int64_t>                 set_busy_until_;    // [num_sets]
+
+    // FIFO occupancy counters.
+    uint32_t miss_fifo_level_ = 0;
+    uint32_t evic_fifo_level_ = 0;
+    uint32_t retr_fifo_level_ = 0;
+    uint32_t resp_fifo_level_ = 0;
+
+    // Owned IoReqs for outgoing traffic. Safe because the response path re-derives state
+    // from the request's address, not from these fields.
+    vp::IoReq refill_req_;
+    vp::IoReq evict_req_;
+    vp::IoReq wt_req_;
+    std::vector<uint8_t> evict_data_buf_;
+
+    // ===== Telemetry =====
+    vp::Trace trace_;
+    uint64_t cnt_rd_hit_ = 0;
+    uint64_t cnt_rd_miss_ = 0;
+    uint64_t cnt_wr_hit_ = 0;
+    uint64_t cnt_wr_miss_ = 0;
+    uint64_t cnt_mshr_merge_ = 0;
+    uint64_t cnt_evict_ = 0;
+    uint64_t cnt_wb_dirty_ = 0;
+    uint64_t cnt_stall_miss_fifo_ = 0;
+    uint64_t cnt_stall_evic_fifo_ = 0;
+    uint64_t cnt_stall_mshr_full_ = 0;
+    uint64_t cnt_refills_issued_ = 0;
+    uint64_t cnt_writes_through_ = 0;
+};
+
+InsituCacheController::InsituCacheController(vp::ComponentConf &conf)
+    : vp::Component(conf)
+{
+    auto *cfg = this->get_js_config();
+    cache_line_bytes_              = cfg->get_child_int("cache_line_bytes");
+    num_ways_                      = cfg->get_child_int("num_ways");
+    num_sets_                      = cfg->get_child_int("num_sets");
+    tcdm_word_bytes_               = cfg->get_child_int("tcdm_word_bytes");
+    refill_beat_bytes_             = cfg->get_child_int("refill_beat_bytes");
+    use_hash_way_select_           = cfg->get_child_bool("use_hash_way_select");
+    hit_latency_cycles_            = cfg->get_child_int("hit_latency_cycles");
+    refill_bank_write_cycles_      = cfg->get_child_int("refill_bank_write_cycles");
+    folded_evict_penalty_cycles_   = cfg->get_child_int("folded_evict_penalty_cycles");
+    mshr_drain_cycles_per_subarray_= cfg->get_child_int("mshr_drain_cycles_per_subarray");
+    resp_fifo_depth_               = cfg->get_child_int("resp_fifo_depth");
+    retr_fifo_depth_               = cfg->get_child_int("retr_fifo_depth");
+    miss_fifo_depth_               = cfg->get_child_int("miss_fifo_depth");
+    evic_fifo_depth_               = cfg->get_child_int("evic_fifo_depth");
+    wt_fifo_depth_                 = cfg->get_child_int("wt_fifo_depth");
+
+    line_bits_ = ceil_log2(cache_line_bytes_);
+    set_bits_  = ceil_log2(num_sets_);
+
+    lines_.assign(num_sets_ * num_ways_, CacheLine{});
+    lru_order_.assign(num_sets_, std::vector<uint8_t>{});
+    for (uint32_t s = 0; s < num_sets_; ++s) {
+        lru_order_[s].resize(num_ways_);
+        for (uint32_t w = 0; w < num_ways_; ++w) lru_order_[s][w] = (uint8_t)w;
+    }
+    mshr_.assign(num_sets_, std::deque<MshrEntry>{});
+    refill_in_flight_.assign(num_sets_, false);
+    set_busy_until_.assign(num_sets_, -1);
+    evict_data_buf_.assign(cache_line_bytes_, 0);
+
+    this->input_itf_.set_req_meth(&InsituCacheController::req_handler);
+    this->new_slave_port("input", &this->input_itf_);
+
+    this->refill_itf_.set_resp_meth(&InsituCacheController::refill_resp_handler);
+    this->new_master_port("refill", &this->refill_itf_);
+
+    this->new_master_port("evict", &this->evict_itf_);
+    this->new_master_port("write_through", &this->wt_itf_);
+
+    this->traces.new_trace("trace", &this->trace_, vp::DEBUG);
+
+    this->trace_.msg(vp::Trace::LEVEL_INFO,
+        "InsituCacheController instantiated (line=%u B, ways=%u, sets=%u, total=%u KB, "
+        "hash_way=%d)\n",
+        cache_line_bytes_, num_ways_, num_sets_,
+        (cache_line_bytes_ * num_ways_ * num_sets_) >> 10,
+        (int)use_hash_way_select_);
+}
+
+void InsituCacheController::reset(bool active)
+{
+    if (active) {
+        for (auto &line : lines_) {
+            line.state = LineState::INVALID;
+            line.tag = 0;
+            line.dirty = false;
+            line.ready_cycle = -1;
+        }
+        // refill_in_flight_ is std::vector<bool> (proxy elements) — assign by index.
+        for (size_t i = 0; i < refill_in_flight_.size(); ++i) refill_in_flight_[i] = false;
+        for (auto &v : set_busy_until_) v = -1;
+        for (auto &q : mshr_) q.clear();
+        miss_fifo_level_ = evic_fifo_level_ = retr_fifo_level_ = resp_fifo_level_ = 0;
+    }
+}
+
+// ---------- request entry ----------
+
+vp::IoReqStatus InsituCacheController::req_handler(vp::Block *__this, vp::IoReq *req)
+{
+    InsituCacheController *_this = static_cast<InsituCacheController *>(__this);
+    _this->trace_.msg(vp::Trace::LEVEL_TRACE,
+        "req addr=0x%lx size=%lu wr=%d\n",
+        (unsigned long)req->get_addr(),
+        (unsigned long)req->get_size(),
+        (int)req->get_is_write());
+
+    return _this->handle_request(req);
+}
+
+vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
+{
+    const int64_t now = this->clock.get_cycles();
+    const uint64_t addr = req->get_addr();
+    const uint32_t tag = addr_tag(addr);
+    const uint32_t set = addr_set(addr);
+    const bool is_write = req->get_is_write();
+
+    int way = -1;
+    CacheLine *line = lookup(tag, set, &way);
+
+    // --- hit on VALID line ---
+    if (line != nullptr && line->state == LineState::VALID) {
+        int64_t latency = hit_latency_cycles_;
+        if (line->ready_cycle > now) latency += (line->ready_cycle - now);
+        if (set_busy_until_[set] > now) latency += (set_busy_until_[set] - now);
+        set_busy_until_[set] = now + latency;
+
+        req->inc_latency(latency);
+
+        if (!use_hash_way_select_) {
+            auto &order = lru_order_[set];
+            for (auto it = order.begin(); it != order.end(); ++it) {
+                if (*it == way) { order.erase(it); break; }
+            }
+            order.insert(order.begin(), (uint8_t)way);
+        }
+
+        if (is_write) {
+            line->dirty = true;
+            cnt_wr_hit_++;
+            issue_write_through(req);
+        } else {
+            cnt_rd_hit_++;
+        }
+        return vp::IO_REQ_OK;
+    }
+
+    // --- hit on pending line (MSHR merge) ---
+    if (line != nullptr && (line->state == LineState::READ_PEND ||
+                             line->state == LineState::WRITE_PEND)) {
+        if (retr_fifo_level_ >= retr_fifo_depth_) {
+            cnt_stall_mshr_full_++;
+            return vp::IO_REQ_DENIED;
+        }
+        req->save();
+        mshr_[set].push_back(MshrEntry{req, now});
+        retr_fifo_level_++;
+        cnt_mshr_merge_++;
+        if (is_write) cnt_wr_miss_++; else cnt_rd_miss_++;
+        return vp::IO_REQ_PENDING;
+    }
+
+    // --- miss: allocate + refill ---
+    if (miss_fifo_level_ >= miss_fifo_depth_) {
+        cnt_stall_miss_fifo_++;
+        return vp::IO_REQ_DENIED;
+    }
+
+    int victim_way = pick_victim(tag, set);
+    CacheLine &vline = lines_[set * num_ways_ + victim_way];
+
+    if (vline.state == LineState::VALID && vline.dirty) {
+        if (evic_fifo_level_ >= evic_fifo_depth_) {
+            cnt_stall_evic_fifo_++;
+            return vp::IO_REQ_DENIED;
+        }
+        uint64_t old_line_addr =
+            ((uint64_t)vline.tag << (line_bits_ + set_bits_)) |
+            ((uint64_t)set       <<  line_bits_);
+        issue_eviction((uint32_t)old_line_addr);
+        cnt_evict_++;
+        cnt_wb_dirty_++;
+    }
+
+    vline.tag = tag;
+    vline.state = is_write ? LineState::WRITE_PEND : LineState::READ_PEND;
+    vline.dirty = false;
+
+    req->save();
+    mshr_[set].push_back(MshrEntry{req, now});
+    retr_fifo_level_++;
+    miss_fifo_level_++;
+    refill_in_flight_[set] = true;
+
+    if (is_write) cnt_wr_miss_++; else cnt_rd_miss_++;
+
+    issue_refill((uint32_t)addr_line(addr), set, victim_way);
+    return vp::IO_REQ_PENDING;
+}
+
+// ---------- tag lookup ----------
+
+CacheLine *InsituCacheController::lookup(uint32_t tag, uint32_t set, int *way_out)
+{
+    for (uint32_t w = 0; w < num_ways_; ++w) {
+        CacheLine &ln = lines_[set * num_ways_ + w];
+        if (ln.state != LineState::INVALID && ln.tag == tag) {
+            *way_out = (int)w;
+            return &ln;
+        }
+    }
+    *way_out = -1;
+    return nullptr;
+}
+
+// ---------- victim selection ----------
+
+int InsituCacheController::pick_victim(uint32_t tag, uint32_t set)
+{
+    for (uint32_t w = 0; w < num_ways_; ++w) {
+        if (lines_[set * num_ways_ + w].state == LineState::INVALID) return (int)w;
+    }
+
+    if (use_hash_way_select_) {
+        uint32_t h = tag * 2654435761u;
+        h ^= set * 0x9E3779B1u;
+        return (int)(h % num_ways_);
+    } else {
+        return (int)lru_order_[set].back();
+    }
+}
+
+// ---------- outgoing helpers ----------
+
+void InsituCacheController::issue_write_through(vp::IoReq *user_req)
+{
+    if (!this->wt_itf_.is_bound()) return;
+    wt_req_.init();
+    wt_req_.set_addr(user_req->get_addr());
+    wt_req_.set_size(user_req->get_size());
+    wt_req_.set_is_write(true);
+    wt_req_.set_data(user_req->get_data());
+    (void)this->wt_itf_.req(&wt_req_);
+    cnt_writes_through_++;
+}
+
+void InsituCacheController::issue_refill(uint32_t line_addr, uint32_t set, int way)
+{
+    (void)set; (void)way;
+    refill_req_.init();
+    refill_req_.set_addr(line_addr);
+    refill_req_.set_size(cache_line_bytes_);
+    refill_req_.set_is_write(false);
+    refill_req_.set_data(nullptr);
+    uint64_t beats = cache_line_bytes_ / refill_beat_bytes_;
+    if (beats == 0) beats = 1;
+    refill_req_.set_duration(beats);
+
+    cnt_refills_issued_++;
+
+    vp::IoReqStatus st = this->refill_itf_.req(&refill_req_);
+    if (st == vp::IO_REQ_OK) {
+        // Synchronous response path — the master's resp_meth was NOT invoked by the
+        // target. Treat the same-cycle OK status as a refill completion right now.
+        refill_resp_handler(this, &refill_req_);
+    } else if (st != vp::IO_REQ_PENDING) {
+        this->trace_.msg(vp::Trace::LEVEL_WARNING,
+            "refill rejected (st=%d) addr=0x%x\n", (int)st, line_addr);
+    }
+}
+
+void InsituCacheController::issue_eviction(uint32_t line_addr)
+{
+    if (!this->evict_itf_.is_bound()) return;
+    evict_req_.init();
+    evict_req_.set_addr(line_addr);
+    evict_req_.set_size(cache_line_bytes_);
+    evict_req_.set_is_write(true);
+    evict_req_.set_data(evict_data_buf_.data());
+    uint64_t beats = cache_line_bytes_ / refill_beat_bytes_;
+    if (beats == 0) beats = 1;
+    evict_req_.set_duration(beats);
+
+    evic_fifo_level_++;
+    (void)this->evict_itf_.req(&evict_req_);
+    if (evic_fifo_level_ > 0) evic_fifo_level_--;  // single-slot model — phase 6 can refine
+}
+
+// ---------- refill response ----------
+
+void InsituCacheController::refill_resp_handler(vp::Block *__this, vp::IoReq *req)
+{
+    InsituCacheController *_this = static_cast<InsituCacheController *>(__this);
+    const int64_t now = _this->clock.get_cycles();
+
+    // Recover set from the refill req's address. Find the pending way in that set
+    // (exactly one way is in {READ_PEND, WRITE_PEND} with the matching tag).
+    const uint32_t set = _this->addr_set(req->get_addr());
+    const uint32_t tag = _this->addr_tag(req->get_addr());
+    int pending_way = -1;
+    for (uint32_t w = 0; w < _this->num_ways_; ++w) {
+        CacheLine &ln = _this->lines_[set * _this->num_ways_ + w];
+        if ((ln.state == LineState::READ_PEND || ln.state == LineState::WRITE_PEND) &&
+            ln.tag == tag) {
+            pending_way = (int)w;
+            break;
+        }
+    }
+    if (pending_way < 0) {
+        _this->trace_.msg(vp::Trace::LEVEL_WARNING,
+            "refill response with no matching pending line set=%u tag=0x%x\n", set, tag);
+        return;
+    }
+
+    CacheLine &line = _this->lines_[set * _this->num_ways_ + pending_way];
+    int64_t refill_lat = req->get_full_latency() + _this->refill_bank_write_cycles_;
+    line.state = LineState::VALID;
+    line.ready_cycle = now + refill_lat;
+    _this->refill_in_flight_[set] = false;
+    if (_this->miss_fifo_level_ > 0) _this->miss_fifo_level_--;
+
+    _this->trace_.msg(vp::Trace::LEVEL_DEBUG,
+        "refill done set=%u way=%d tag=0x%x ready_cycle=%ld\n",
+        set, pending_way, tag, (long)line.ready_cycle);
+
+    _this->fsm_drain_mshr(set);
+}
+
+// ---------- MSHR drain ----------
+
+void InsituCacheController::fsm_drain_mshr(uint32_t set)
+{
+    auto &queue = mshr_[set];
+    int subarray_idx = 0;
+
+    while (!queue.empty()) {
+        MshrEntry entry = queue.front();
+        queue.pop_front();
+        if (retr_fifo_level_ > 0) retr_fifo_level_--;
+
+        vp::IoReq *req = entry.req;
+        req->restore();
+
+        // re-derive set/way now that state is valid
+        uint64_t addr = req->get_addr();
+        uint32_t s = addr_set(addr);
+        uint32_t tag = addr_tag(addr);
+        int way = -1;
+        CacheLine *line = lookup(tag, s, &way);
+
+        int64_t base_latency = 0;
+        if (line != nullptr && line->ready_cycle > entry.arrival_cycle) {
+            base_latency = line->ready_cycle - entry.arrival_cycle;
+        } else {
+            base_latency = hit_latency_cycles_;
+        }
+        base_latency += (int64_t)subarray_idx * mshr_drain_cycles_per_subarray_;
+
+        req->inc_latency(base_latency);
+
+        if (req->get_is_write() && line != nullptr) {
+            line->dirty = true;
+            issue_write_through(req);
+        }
+
+        req->get_resp_port()->resp(req);
+        subarray_idx++;
+    }
+}
+
+// ---------- Module entry point ----------
+
+extern "C" vp::Component *gv_new(vp::ComponentConf &config)
+{
+    return new InsituCacheController(config);
+}
