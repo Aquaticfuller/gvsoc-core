@@ -131,7 +131,12 @@ private:
     vp::IoReq refill_req_;
     vp::IoReq evict_req_;
     vp::IoReq wt_req_;
+    // Scratch buffers backing each req's data pointer. The downstream memory model
+    // performs a memcpy against the request's data pointer, so we must provide a real
+    // buffer even though the perf model doesn't care about the byte values.
+    std::vector<uint8_t> refill_data_buf_;
     std::vector<uint8_t> evict_data_buf_;
+    std::vector<uint8_t> wt_data_buf_;
 
     // ===== Telemetry =====
     vp::Trace trace_;
@@ -181,7 +186,9 @@ InsituCacheController::InsituCacheController(vp::ComponentConf &conf)
     mshr_.assign(num_sets_, std::deque<MshrEntry>{});
     refill_in_flight_.assign(num_sets_, false);
     set_busy_until_.assign(num_sets_, -1);
+    refill_data_buf_.assign(cache_line_bytes_, 0);
     evict_data_buf_.assign(cache_line_bytes_, 0);
+    wt_data_buf_.assign(cache_line_bytes_, 0);
 
     this->input_itf_.set_req_meth(&InsituCacheController::req_handler);
     this->new_slave_port("input", &this->input_itf_);
@@ -365,7 +372,9 @@ void InsituCacheController::issue_write_through(vp::IoReq *user_req)
     wt_req_.set_addr(user_req->get_addr());
     wt_req_.set_size(user_req->get_size());
     wt_req_.set_is_write(true);
-    wt_req_.set_data(user_req->get_data());
+    // Downstream memory memcpys from the data pointer. Use our scratch buffer — the
+    // perf model doesn't track byte values, so zeroed bytes are safe to forward.
+    wt_req_.set_data(wt_data_buf_.data());
     (void)this->wt_itf_.req(&wt_req_);
     cnt_writes_through_++;
 }
@@ -377,7 +386,8 @@ void InsituCacheController::issue_refill(uint32_t line_addr, uint32_t set, int w
     refill_req_.set_addr(line_addr);
     refill_req_.set_size(cache_line_bytes_);
     refill_req_.set_is_write(false);
-    refill_req_.set_data(nullptr);
+    // Downstream memory memcpys into the data pointer. Use our scratch buffer.
+    refill_req_.set_data(refill_data_buf_.data());
     uint64_t beats = cache_line_bytes_ / refill_beat_bytes_;
     if (beats == 0) beats = 1;
     refill_req_.set_duration(beats);

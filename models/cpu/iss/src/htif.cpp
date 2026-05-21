@@ -101,6 +101,10 @@ void Htif::handle_syscall(uint64_t cmd)
 {
     if (cmd & 1) // test pass/fail
     {
+        // Report simulated cycle count on exit so RTL<->GVSoC comparison is easy.
+        fprintf(stderr, "[HTIF] Simulation exiting: retval=%lu cycles=%ld\n",
+                (unsigned long)(cmd >> 1),
+                (long)this->iss.top.clock.get_cycles());
         this->iss.top.time.get_engine()->quit(cmd >> 1);
     }
     else

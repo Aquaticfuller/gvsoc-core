@@ -62,8 +62,11 @@ private:
     vp::ClockEvent *watchdog_event_ = nullptr;
     int32_t watchdog_cnt_ = 0;
 
-    // Outgoing req
+    // Outgoing req + scratch data buffer. Downstream memory memcpys from this pointer
+    // on the wide flush write; we don't track byte values in the perf model so a zeroed
+    // buffer is sufficient.
     vp::IoReq out_req_;
+    std::vector<uint8_t> out_data_buf_;
 
     // Telemetry
     vp::Trace trace_;
@@ -80,6 +83,8 @@ InsituCacheCoalescer::InsituCacheCoalescer(vp::ComponentConf &conf)
     auto *cfg = this->get_js_config();
     cache_line_bytes_ = cfg->get_child_int("cache_line_bytes");
     watchdog_cycles_  = cfg->get_child_int("watchdog_cycles");
+
+    out_data_buf_.assign(cache_line_bytes_, 0);
 
     this->input_itf_.set_req_meth(&InsituCacheCoalescer::input_req_handler);
     this->new_slave_port("input", &this->input_itf_);
@@ -226,7 +231,7 @@ void InsituCacheCoalescer::flush_line()
     out_req_.set_addr(coal_tag_);
     out_req_.set_size(cache_line_bytes_);
     out_req_.set_is_write(true);
-    out_req_.set_data(nullptr);
+    out_req_.set_data(out_data_buf_.data());
 
     if (this->out_itf_.is_bound()) {
         (void)this->out_itf_.req(&out_req_);
