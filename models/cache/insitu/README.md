@@ -3,8 +3,23 @@
 A cycle-approximate GVSoC model of the CachePool InSitu L1 data cache. Targets
 <5% cycle error vs. RTL on typical streaming + random-access workloads.
 
-- **Architecture spec** (RTL-side reference): `prompt/insitu_cache_architecture.md`
+- **Architecture spec (latest, v2 — read first):** `prompt/insitu_cache_architecture_v2.md`
+- **Architecture spec (legacy, v1):** `prompt/insitu_cache_architecture.md` (older RTL revision)
 - **Implementation plan** (design decisions, phases, fidelity knobs): `prompt/insitu_cache_gvsoc_plan.md`
+
+**Status (2026-06-02).** Config knobs track the latest RTL — `write_through_mode`
+(default `False`, pure write-back), `enable_multi_read_pend`, `enable_spm` +
+`bank_depth_for_spm`, `enable_flush` (reserved), `use_forwarding_buffer`. The
+shipping `cachepool_512` default is the **production** cache (folded + hash-way +
+forwarding-buffer; `make_cachepool_512_config`); the unfolded + LRU + no-fwd
+"conventional" cache is `make_cachepool_512_conventional_config`. The model is
+calibrated against the RTL standalone testbench — warm hit 10, cold miss
+MemLatency+17, miss-throughput serialization, write latency 8 / throughput ~0.49,
+read-after-write forwarding 7 — via the `insitu_cache_calib` target (trace replay
++ a fixed-latency serializing refill memory `insitu_calib_mem`). See
+`prompt/insitu_cache_calib_report.md`. Phase B (single wide cache + N→1
+coalescer + scalar bypass) is documented in
+`prompt/insitu_cache_architecture_v2.md` §11 and is not yet implemented.
 
 ---
 

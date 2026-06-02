@@ -80,8 +80,17 @@ private:
     void fsm_drain_mshr(uint32_t set);
 
     // ===== Address decomposition =====
-    inline uint32_t addr_set(uint64_t addr) const
+    inline uint32_t addr_set_raw(uint64_t addr) const
     { return (addr >> line_bits_) & ((1u << set_bits_) - 1); }
+    inline uint32_t addr_set(uint64_t addr) const {
+        // Latest RTL's partition-flushable wrapper remaps incoming addresses so the
+        // cache only ever sees sets in [bank_depth_for_spm_, num_sets_). We approximate
+        // that here by folding the raw set into the cacheable region. SPM-region access
+        // does not flow through this controller in the real system.
+        if (!enable_spm_ || bank_depth_for_spm_ == 0) return addr_set_raw(addr);
+        const uint32_t s = addr_set_raw(addr);
+        return bank_depth_for_spm_ + (s % effective_num_sets_);
+    }
     inline uint32_t addr_tag(uint64_t addr) const
     { return (uint32_t)(addr >> (line_bits_ + set_bits_)); }
     inline uint64_t addr_line(uint64_t addr) const
@@ -94,7 +103,20 @@ private:
     uint32_t tcdm_word_bytes_;
     uint32_t refill_beat_bytes_;
     bool     use_hash_way_select_;
+    bool     use_forwarding_buffer_;   // RTL UseForwardingBuffer; informational — its
+                                       // same-row-forward timing effect is absorbed into
+                                       // hit_latency_cycles for now (Phase B: explicit).
+    // Latest-RTL-tracking knobs (insitu_cache_architecture_v2.md):
+    bool     write_through_mode_;       // false = pure write-back (latest RTL default)
+    bool     enable_multi_read_pend_;   // false = legacy single-read MSHR per line
+    bool     enable_spm_;
+    uint32_t bank_depth_for_spm_;       // # bank rows reserved for SPM
+    bool     enable_flush_;             // reserved; flush sequence not yet implemented
     int32_t  hit_latency_cycles_;
+    int32_t  write_hit_latency_cycles_;   // <0 ⇒ use hit_latency_cycles_
+    int32_t  write_commit_cycles_;        // min cycles between accepted write hits
+    int32_t  fwd_hit_latency_cycles_;     // read hit on the fwd-buffer line; <0 ⇒ hit_latency_cycles_
+    int32_t  miss_penalty_cycles_;
     int32_t  refill_bank_write_cycles_;
     int32_t  folded_evict_penalty_cycles_;
     int32_t  mshr_drain_cycles_per_subarray_;
@@ -103,6 +125,8 @@ private:
     uint32_t miss_fifo_depth_;
     uint32_t evic_fifo_depth_;
     uint32_t wt_fifo_depth_;
+    // Derived: when enable_spm_, the number of *cacheable* sets is reduced.
+    uint32_t effective_num_sets_;
 
     uint32_t line_bits_;
     uint32_t set_bits_;
@@ -119,6 +143,14 @@ private:
     std::vector<std::deque<MshrEntry>>   mshr_;      // [num_sets]
     std::vector<bool>                    refill_in_flight_;  // [num_sets]
     std::vector<int64_t>                 set_busy_until_;    // [num_sets]
+
+    // 1-entry forwarding buffer: the line whose row is currently cached in the access
+    // controller's registers. A read hit on this line forwards combinationally (skips the
+    // SRAM read) → fwd_hit_latency_cycles_. -1 == buffer empty.
+    int64_t fwd_buffer_line_ = -1;
+    // Controller-wide write-commit backpressure: earliest cycle a new write hit may be
+    // accepted (models the write-info FIFO + per-way commit serialization).
+    int64_t write_commit_busy_until_ = -1;
 
     // FIFO occupancy counters.
     uint32_t miss_fifo_level_ = 0;
@@ -164,7 +196,17 @@ InsituCacheController::InsituCacheController(vp::ComponentConf &conf)
     tcdm_word_bytes_               = cfg->get_child_int("tcdm_word_bytes");
     refill_beat_bytes_             = cfg->get_child_int("refill_beat_bytes");
     use_hash_way_select_           = cfg->get_child_bool("use_hash_way_select");
+    use_forwarding_buffer_         = cfg->get_child_bool("use_forwarding_buffer");
+    write_through_mode_            = cfg->get_child_bool("write_through_mode");
+    enable_multi_read_pend_        = cfg->get_child_bool("enable_multi_read_pend");
+    enable_spm_                    = cfg->get_child_bool("enable_spm");
+    bank_depth_for_spm_            = cfg->get_child_int("bank_depth_for_spm");
+    enable_flush_                  = cfg->get_child_bool("enable_flush");
     hit_latency_cycles_            = cfg->get_child_int("hit_latency_cycles");
+    write_hit_latency_cycles_      = cfg->get_child_int("write_hit_latency_cycles");
+    write_commit_cycles_           = cfg->get_child_int("write_commit_cycles");
+    fwd_hit_latency_cycles_        = cfg->get_child_int("fwd_hit_latency_cycles");
+    miss_penalty_cycles_           = cfg->get_child_int("miss_penalty_cycles");
     refill_bank_write_cycles_      = cfg->get_child_int("refill_bank_write_cycles");
     folded_evict_penalty_cycles_   = cfg->get_child_int("folded_evict_penalty_cycles");
     mshr_drain_cycles_per_subarray_= cfg->get_child_int("mshr_drain_cycles_per_subarray");
@@ -176,6 +218,18 @@ InsituCacheController::InsituCacheController(vp::ComponentConf &conf)
 
     line_bits_ = ceil_log2(cache_line_bytes_);
     set_bits_  = ceil_log2(num_sets_);
+
+    // SPM partitioning: shrink the cacheable set space (architecture_v2.md §5). The
+    // RTL's wrapper rebases addresses so the cache only ever sees the upper sets; for
+    // perf modelling we approximate this by reducing the effective number of sets used
+    // for tag matching and victim selection. The bank arrays still cover all `num_sets_`
+    // entries (so memory footprint is unchanged) — the cache simply never allocates
+    // in the SPM-reserved sets.
+    if (enable_spm_ && bank_depth_for_spm_ < num_sets_) {
+        effective_num_sets_ = num_sets_ - bank_depth_for_spm_;
+    } else {
+        effective_num_sets_ = num_sets_;
+    }
 
     lines_.assign(num_sets_ * num_ways_, CacheLine{});
     lru_order_.assign(num_sets_, std::vector<uint8_t>{});
@@ -203,10 +257,10 @@ InsituCacheController::InsituCacheController(vp::ComponentConf &conf)
 
     this->trace_.msg(vp::Trace::LEVEL_INFO,
         "InsituCacheController instantiated (line=%u B, ways=%u, sets=%u, total=%u KB, "
-        "hash_way=%d)\n",
+        "hash_way=%d, fwd_buf=%d)\n",
         cache_line_bytes_, num_ways_, num_sets_,
         (cache_line_bytes_ * num_ways_ * num_sets_) >> 10,
-        (int)use_hash_way_select_);
+        (int)use_hash_way_select_, (int)use_forwarding_buffer_);
 }
 
 void InsituCacheController::reset(bool active)
@@ -223,6 +277,8 @@ void InsituCacheController::reset(bool active)
         for (auto &v : set_busy_until_) v = -1;
         for (auto &q : mshr_) q.clear();
         miss_fifo_level_ = evic_fifo_level_ = retr_fifo_level_ = resp_fifo_level_ = 0;
+        fwd_buffer_line_ = -1;
+        write_commit_busy_until_ = -1;
     }
 }
 
@@ -248,15 +304,47 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
     const uint32_t set = addr_set(addr);
     const bool is_write = req->get_is_write();
 
+    // Write-commit backpressure: the RTL write path serializes through the write-info
+    // FIFO + per-way commit, so writes accept at most once per write_commit_cycles_.
+    // Deny (back-pressure) a write that arrives while the commit slot is still busy; the
+    // upstream retries on the next cycle. (No effect when write_commit_cycles_ <= 1.)
+    if (is_write && write_commit_cycles_ > 1 && now < write_commit_busy_until_) {
+        return vp::IO_REQ_DENIED;
+    }
+    if (is_write && write_commit_cycles_ > 1) {
+        write_commit_busy_until_ = now + write_commit_cycles_;
+    }
+
     int way = -1;
     CacheLine *line = lookup(tag, set, &way);
 
     // --- hit on VALID line ---
     if (line != nullptr && line->state == LineState::VALID) {
-        int64_t latency = hit_latency_cycles_;
+        // Base hit latency: writes ack faster than reads return (write-info FIFO push);
+        // a read on the forwarding-buffer line forwards combinationally (skips SRAM read).
+        bool forwarded = false;
+        int64_t base = hit_latency_cycles_;
+        if (is_write) {
+            base = (write_hit_latency_cycles_ >= 0) ? write_hit_latency_cycles_
+                                                    : hit_latency_cycles_;
+        } else if (use_forwarding_buffer_ &&
+                   fwd_buffer_line_ == (int64_t)addr_line(addr)) {
+            base = (fwd_hit_latency_cycles_ >= 0) ? fwd_hit_latency_cycles_
+                                                  : hit_latency_cycles_;
+            forwarded = true;
+        }
+        int64_t latency = base;
         if (line->ready_cycle > now) latency += (line->ready_cycle - now);
-        if (set_busy_until_[set] > now) latency += (set_busy_until_[set] - now);
-        set_busy_until_[set] = now + latency;
+        // A forwarded read is served from the buffer registers, bypassing the SRAM bank,
+        // so it does not contend for the per-set bank slot (no set_busy stall, and it
+        // does not occupy the bank). Non-forwarded hits serialize on the bank as usual.
+        if (!forwarded) {
+            if (set_busy_until_[set] > now) latency += (set_busy_until_[set] - now);
+            set_busy_until_[set] = now + latency;
+        }
+
+        // This access caches its row in the 1-entry forwarding buffer.
+        fwd_buffer_line_ = (int64_t)addr_line(addr);
 
         req->inc_latency(latency);
 
@@ -271,7 +359,10 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
         if (is_write) {
             line->dirty = true;
             cnt_wr_hit_++;
-            issue_write_through(req);
+            // Write-through is only emitted in WriteThroughMode=1. In pure write-back
+            // mode (the latest RTL default) the dirty bit alone records the write and
+            // the line will be evicted later. See architecture_v2.md §0/§8.
+            if (write_through_mode_) issue_write_through(req);
         } else {
             cnt_rd_hit_++;
         }
@@ -281,13 +372,21 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
     // --- hit on pending line (MSHR merge) ---
     if (line != nullptr && (line->state == LineState::READ_PEND ||
                              line->state == LineState::WRITE_PEND)) {
-        if (retr_fifo_level_ >= retr_fifo_depth_) {
+        // ENABLE_MULTI_READ_PEND: the latest RTL allows a per-line linked list of
+        // pending reads (architecture_v2.md §7) — capacity is `num_ways_` per set, not
+        // the retr_fifo. With the flag on we relax the gating so reads merging onto an
+        // already-pending line bypass the global retr_fifo limit (they're cheap — just
+        // a linked-list pointer update in the RTL). Writes still go through the normal
+        // retr_fifo accounting because each write needs its dirty-merge byte tracking.
+        const bool is_read_pend_merge =
+            enable_multi_read_pend_ && !is_write && line->state == LineState::READ_PEND;
+        if (!is_read_pend_merge && retr_fifo_level_ >= retr_fifo_depth_) {
             cnt_stall_mshr_full_++;
             return vp::IO_REQ_DENIED;
         }
         req->save();
         mshr_[set].push_back(MshrEntry{req, now});
-        retr_fifo_level_++;
+        if (!is_read_pend_merge) retr_fifo_level_++;
         cnt_mshr_merge_++;
         if (is_write) cnt_wr_miss_++; else cnt_rd_miss_++;
         return vp::IO_REQ_PENDING;
@@ -449,7 +548,11 @@ void InsituCacheController::refill_resp_handler(vp::Block *__this, vp::IoReq *re
     }
 
     CacheLine &line = _this->lines_[set * _this->num_ways_ + pending_way];
-    int64_t refill_lat = req->get_full_latency() + _this->refill_bank_write_cycles_;
+    // Refill completion = memory latency (carried on the refill req) + bank-write +
+    // the fixed cache-pipeline miss penalty (calibrated so a cold miss = MemLatency+17;
+    // see prompt/insitu_cache_calib_report.md).
+    int64_t refill_lat = req->get_full_latency() + _this->refill_bank_write_cycles_
+                         + _this->miss_penalty_cycles_;
     line.state = LineState::VALID;
     line.ready_cycle = now + refill_lat;
     _this->refill_in_flight_[set] = false;
@@ -496,7 +599,9 @@ void InsituCacheController::fsm_drain_mshr(uint32_t set)
 
         if (req->get_is_write() && line != nullptr) {
             line->dirty = true;
-            issue_write_through(req);
+            // Same gating as on the synchronous write-hit path above: only emit on the
+            // write-through path when WriteThroughMode=1 (see architecture_v2.md §0/§8).
+            if (write_through_mode_) issue_write_through(req);
         }
 
         req->get_resp_port()->resp(req);
