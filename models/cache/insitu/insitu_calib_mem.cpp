@@ -68,6 +68,8 @@ private:
     uint32_t word_bytes_;
     bool     fill_pattern_;
     bool     writeback_overlap_;   // write (eviction) jobs don't serialize on mem_busy_until
+    bool     serialize_refills_;   // when false, refill READS are concurrent (no mem_busy_until)
+    int64_t  max_outstanding_;     // informational: depth the responder advertises (THROUGHPUT_EXPERIMENT §2)
 
     // ===== Ports =====
     vp::IoSlave input_itf_;
@@ -97,6 +99,8 @@ InsituCalibMem::InsituCalibMem(vp::ComponentConf &conf)
     word_bytes_        = cfg->get_child_int("word_bytes");
     fill_pattern_      = cfg->get_child_bool("fill_pattern");
     writeback_overlap_ = cfg->get_child_bool("writeback_overlap");
+    serialize_refills_ = cfg->get_child_bool("serialize_refills");
+    max_outstanding_   = cfg->get_child_int("max_outstanding");
 
     this->input_itf_.set_req_meth(&InsituCalibMem::req_handler);
     this->new_slave_port("input", &this->input_itf_);
@@ -104,9 +108,10 @@ InsituCalibMem::InsituCalibMem(vp::ComponentConf &conf)
     this->traces.new_trace("trace", &this->trace_, vp::DEBUG);
     this->trace_.msg(vp::Trace::LEVEL_INFO,
         "InsituCalibMem instantiated (mem_latency=%ld beat_gap=%ld accept_every=%ld "
-        "refill_beat=%uB word=%uB fill_pattern=%d)\n",
+        "refill_beat=%uB word=%uB fill_pattern=%d serialize_refills=%d max_outstanding=%ld)\n",
         (long)mem_latency_, (long)beat_gap_, (long)accept_every_,
-        refill_beat_bytes_, word_bytes_, (int)fill_pattern_);
+        refill_beat_bytes_, word_bytes_, (int)fill_pattern_,
+        (int)serialize_refills_, (long)max_outstanding_);
 }
 
 void InsituCalibMem::reset(bool active)
@@ -143,23 +148,25 @@ vp::IoReqStatus InsituCalibMem::req_handler(vp::Block *__this, vp::IoReq *req)
     const int64_t  occupancy = _this->mem_latency_ +
                                (int64_t)(beats - 1) * (1 + _this->beat_gap_);
 
-    const bool overlap_wr = is_wr && _this->writeback_overlap_;
+    // A request runs "concurrent" (no mem_busy_until serialization, responds at
+    // accept+occupancy regardless of others) when its class is non-serializing:
+    //   - writeback writes when writeback_overlap_ (hide within the per-miss budget);
+    //   - refill reads when !serialize_refills_ — the wide single-beat config where
+    //     multiple line refills are outstanding at once (THROUGHPUT_EXPERIMENT §1/§2).
+    // Otherwise the request serializes one-at-a-time via mem_busy_until (BurstLength>1,
+    // single-outstanding-refill RTL path).
+    const bool concurrent = is_wr ? _this->writeback_overlap_ : (!_this->serialize_refills_);
 
-    // An overlapping writeback (dirty eviction) is serviced on a separate writeback path:
-    // it does not wait behind the refill-read serialization and does not push it back —
-    // it hides within the per-miss budget (matches the RTL: writeback adds no serial
-    // stall, only a small per-miss latency adder modelled cache-side). It still takes
-    // MemLatency to complete.
-    const int64_t service_start = overlap_wr
+    const int64_t service_start = concurrent
         ? now
         : ((now > _this->mem_busy_until_) ? now : _this->mem_busy_until_);
     const int64_t completion = service_start + occupancy;
     int64_t latency = completion - now;
     if (latency < 0) latency = 0;
 
-    if (!overlap_wr) {
-        // Earliest the memory can begin the next read job: when this one finishes, but no
-        // sooner than AcceptEvery cycles after this one's service start.
+    if (!concurrent) {
+        // Earliest the memory can begin the next serialized job: when this one finishes,
+        // but no sooner than AcceptEvery cycles after this one's service start.
         int64_t next_free = completion;
         const int64_t accept_bound = service_start + _this->accept_every_;
         if (accept_bound > next_free) next_free = accept_bound;

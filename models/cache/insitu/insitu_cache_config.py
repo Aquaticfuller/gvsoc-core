@@ -164,6 +164,29 @@ class InsituCacheControllerConfig(Config):
         "Cycles added per pending MSHR subarray when draining after a refill"
     ))
 
+    # -------- Occupancy model (deferred-completion path; default OFF = inline) --------
+    # The default model resolves a miss INLINE (synchronous): issue_refill -> the memory's
+    # OK response -> refill_resp_handler in the same cycle, so FIFO/resource counters never
+    # accumulate depth and per-access latency is flat. That suffices for latency + memory-
+    # traffic calibration and is what the Spatz integration uses. Setting defer_refills=True
+    # switches to an occupancy model where refills complete via scheduled events, so cache
+    # resources (refill pool, evic FIFO, MSHR) bind, outstanding accumulates, and per-access
+    # latency inflates under load — needed to match the RTL wide-refill (BurstLength=1) miss
+    # *throughput* (see prompt/insitu_cache_calib_report.md §9.1 + REPORT_BL1.md).
+    defer_refills: bool = cfg_field(default=False, dump=True, desc=(
+        "Enable the deferred-completion occupancy path. Default False = inline resolution "
+        "(unchanged behaviour; Spatz/BL4 take this path). True = refill completions are "
+        "serialized through the install pipeline (refill_drain_cycles) so per-access latency "
+        "inflates under load and miss throughput is install-rate-bound (calib wide config)."
+    ))
+    refill_drain_cycles: int = cfg_field(default=0, dump=True, desc=(
+        "Min cycles between successive refill/writeback *completions* draining into the "
+        "cache (only when defer_refills). Models the near-serial single-line install "
+        "pipeline (~1 completion per N cycles) that inflates per-access latency under load "
+        "and sets wide-mode miss throughput. 0 = no completion serialization. The driver's "
+        "outstanding budget + this rate together reproduce the RTL wide-refill numbers."
+    ))
+
     # -------- FIFO depths (§3.3) --------
     resp_fifo_depth: int = cfg_field(default=4, dump=True, desc=(
         "Hit response FIFO depth"

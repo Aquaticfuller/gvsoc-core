@@ -62,7 +62,9 @@ class InsituCalibMem(Component):
                  refill_beat_bytes: int = 16,
                  word_bytes: int = 4,
                  fill_pattern: bool = False,
-                 writeback_overlap: bool = False):
+                 writeback_overlap: bool = False,
+                 serialize_refills: bool = True,
+                 max_outstanding: int = 8):
         super().__init__(parent, name)
 
         self.add_sources(['cache/insitu/insitu_calib_mem.cpp'])
@@ -75,6 +77,10 @@ class InsituCalibMem(Component):
             'word_bytes': word_bytes,
             'fill_pattern': fill_pattern,
             'writeback_overlap': writeback_overlap,
+            # When False, refill reads run concurrently (no one-at-a-time serialization) —
+            # the wide single-beat refill config (THROUGHPUT_EXPERIMENT.md §1/§2).
+            'serialize_refills': serialize_refills,
+            'max_outstanding': max_outstanding,
         })
 
     def i_INPUT(self) -> SlaveItf:

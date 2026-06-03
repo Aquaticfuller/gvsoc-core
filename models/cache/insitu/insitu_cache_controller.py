@@ -78,6 +78,8 @@ class InsituCacheController(Component):
             'refill_bank_write_cycles': config.refill_bank_write_cycles,
             'folded_evict_penalty_cycles': config.folded_evict_penalty_cycles,
             'mshr_drain_cycles_per_subarray': config.mshr_drain_cycles_per_subarray,
+            'defer_refills': config.defer_refills,
+            'refill_drain_cycles': config.refill_drain_cycles,
             'resp_fifo_depth': config.resp_fifo_depth,
             'retr_fifo_depth': config.retr_fifo_depth,
             'miss_fifo_depth': config.miss_fifo_depth,

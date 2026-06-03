@@ -79,6 +79,19 @@ private:
     void issue_eviction(uint32_t line_addr);
     void fsm_drain_mshr(uint32_t set);
 
+    // Reserve one slot in the (near-serial) refill/writeback install pipeline. A completion
+    // can occur no earlier than the pipe being free (`refill_drain_busy_until_ + step`) and
+    // no earlier than `floor`; the pipe is then busy until that cycle. Returns the
+    // completion cycle. Monotonic (never runs backwards). Used by both the refill-response
+    // and the dirty-writeback paths so the drain invariant lives in one place.
+    inline int64_t reserve_install_pipe(int64_t step, int64_t floor)
+    {
+        int64_t c = refill_drain_busy_until_ + step;
+        if (floor > c) c = floor;
+        refill_drain_busy_until_ = c;
+        return c;
+    }
+
     // ===== Address decomposition =====
     inline uint32_t addr_set_raw(uint64_t addr) const
     { return (addr >> line_bits_) & ((1u << set_bits_) - 1); }
@@ -117,6 +130,10 @@ private:
     int32_t  write_commit_cycles_;        // min cycles between accepted write hits
     int32_t  fwd_hit_latency_cycles_;     // read hit on the fwd-buffer line; <0 ⇒ hit_latency_cycles_
     int32_t  miss_penalty_cycles_;
+    // Occupancy model (only active when defer_refills_): serialize refill/writeback
+    // completions through the install pipeline at refill_drain_cycles_ apart.
+    bool     defer_refills_;
+    int32_t  refill_drain_cycles_;        // min cycles between completions (install rate)
     int32_t  refill_bank_write_cycles_;
     int32_t  folded_evict_penalty_cycles_;
     int32_t  mshr_drain_cycles_per_subarray_;
@@ -151,6 +168,9 @@ private:
     // Controller-wide write-commit backpressure: earliest cycle a new write hit may be
     // accepted (models the write-info FIFO + per-way commit serialization).
     int64_t write_commit_busy_until_ = -1;
+    // Occupancy: serializes refill completions into the cache at the install rate
+    // (refill_drain_cycles_) so queued misses' completion latency inflates under load.
+    int64_t refill_drain_busy_until_ = -1;
 
     // FIFO occupancy counters.
     uint32_t miss_fifo_level_ = 0;
@@ -207,6 +227,8 @@ InsituCacheController::InsituCacheController(vp::ComponentConf &conf)
     write_commit_cycles_           = cfg->get_child_int("write_commit_cycles");
     fwd_hit_latency_cycles_        = cfg->get_child_int("fwd_hit_latency_cycles");
     miss_penalty_cycles_           = cfg->get_child_int("miss_penalty_cycles");
+    defer_refills_                 = cfg->get_child_bool("defer_refills");
+    refill_drain_cycles_           = cfg->get_child_int("refill_drain_cycles");
     refill_bank_write_cycles_      = cfg->get_child_int("refill_bank_write_cycles");
     folded_evict_penalty_cycles_   = cfg->get_child_int("folded_evict_penalty_cycles");
     mshr_drain_cycles_per_subarray_= cfg->get_child_int("mshr_drain_cycles_per_subarray");
@@ -279,6 +301,7 @@ void InsituCacheController::reset(bool active)
         miss_fifo_level_ = evic_fifo_level_ = retr_fifo_level_ = resp_fifo_level_ = 0;
         fwd_buffer_line_ = -1;
         write_commit_busy_until_ = -1;
+        refill_drain_busy_until_ = -1;
     }
 }
 
@@ -519,6 +542,17 @@ void InsituCacheController::issue_eviction(uint32_t line_addr)
     evic_fifo_level_++;
     (void)this->evict_itf_.req(&evict_req_);
     if (evic_fifo_level_ > 0) evic_fifo_level_--;  // single-slot model — phase 6 can refine
+
+    // Occupancy: a dirty writeback shares the near-serial install/writeback pipeline with
+    // refills, so it consumes a drain slot (refills + writebacks serialize on the same
+    // resource). This is what makes a write-allocate-with-eviction stream (evict_dirty/
+    // evict_wb) run at ~half the read-miss rate (RTL evict ≈ 0.177 vs cold_stream 0.243).
+    // Folded victim read (folded_evict_penalty_cycles_) adds to the writeback's drain cost.
+    if (defer_refills_ && refill_drain_cycles_ > 0) {
+        const int64_t now = this->clock.get_cycles();
+        const int64_t step = refill_drain_cycles_ + folded_evict_penalty_cycles_;
+        (void)reserve_install_pipe(step, now + step);
+    }
 }
 
 // ---------- refill response ----------
@@ -553,6 +587,17 @@ void InsituCacheController::refill_resp_handler(vp::Block *__this, vp::IoReq *re
     // see prompt/insitu_cache_calib_report.md).
     int64_t refill_lat = req->get_full_latency() + _this->refill_bank_write_cycles_
                          + _this->miss_penalty_cycles_;
+    // Occupancy: when refills pipeline (defer_refills_), the near-serial single-line
+    // install pipeline drains at most one refill completion every refill_drain_cycles_.
+    // Serialize completion cycles so a queued miss's completion (and thus the latency the
+    // requester sees, t_resp = t_issue + full_latency) is pushed out under load — this is
+    // what turns the flat-63 plateau into the RTL ramp + install-rate-bound throughput.
+    // Head-of-line (isolated) miss is unaffected: the cyclestamp is in the past.
+    if (_this->defer_refills_ && _this->refill_drain_cycles_ > 0) {
+        int64_t completion = _this->reserve_install_pipe(_this->refill_drain_cycles_,
+                                                         now + refill_lat);
+        refill_lat = completion - now;
+    }
     line.state = LineState::VALID;
     line.ready_cycle = now + refill_lat;
     _this->refill_in_flight_[set] = false;
