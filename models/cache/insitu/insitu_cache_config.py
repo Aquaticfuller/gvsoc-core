@@ -232,6 +232,26 @@ class InsituCacheIntercoConfig(Config):
     interco_latency_cycles: int = cfg_field(default=1, dump=True, desc=(
         "Fixed forward latency through the interco (1 cycle per §5)"
     ))
+    enable_input_coalesce: bool = cfg_field(default=False, dump=True, desc=(
+        "Model the input par-coalescer: same-cycle, same-line READ-HIT requests across "
+        "ports to the same output collapse into ONE cache lookup. The first such read "
+        "forwards normally; followers in the same cycle to the same line inherit its "
+        "latency and do NOT re-consume the per-output accept slot — so N same-line reads "
+        "cost ~one bank access (RTL coal_warm = ~4x the single-port hit rate). Misses are "
+        "forwarded through (the controller's MSHR merge handles them → coal_cold mem_rd "
+        "unchanged). Default False = no coalescing (Spatz/default path unchanged)."
+    ))
+    cache_line_bytes: int = cfg_field(default=64, dump=True, desc=(
+        "Cache line size in bytes — used only by enable_input_coalesce to group same-line "
+        "requests. Must match the controller's cache_line_bytes."
+    ))
+    coalesce_max_latency: int = cfg_field(default=-1, dump=True, desc=(
+        "Only a forwarded read whose resulting latency is <= this many cycles seeds the "
+        "coalescing window (i.e. only TRUE warm hits coalesce). A cold line that was just "
+        "refilled inline reports a large (refill-sized) latency and so does NOT coalesce — "
+        "its same-cycle followers fall through to the controller's MSHR merge, keeping the "
+        "cold-miss-stream throughput unchanged. -1 = no limit (merge any OK read)."
+    ))
 
 
 @dataclass
@@ -379,6 +399,15 @@ def make_cachepool_512_calib_config() -> InsituCacheTileConfig:
     cfg.interco.num_inputs = 5
     cfg.interco.num_outputs = 1
     cfg.interco.dynamic_offset = 2
+    # Input par-coalescer: the 4 VLSU ports reading the same line in the same cycle merge
+    # into one cache lookup (RTL coal_warm). Hit-path only; misses still go through the
+    # MSHR merge. Calib-only — the spatz tile's interco keeps this off.
+    cfg.interco.enable_input_coalesce = True
+    cfg.interco.cache_line_bytes = cfg.controller.cache_line_bytes
+    # Only true warm hits coalesce: interco(1) + hit_latency(9) ≈ 10. A cold line refilled
+    # inline reports a refill-sized latency (>> this) so its same-cycle followers do NOT
+    # merge — they fall through to the controller's MSHR merge (coal_cold throughput intact).
+    cfg.interco.coalesce_max_latency = cfg.controller.hit_latency_cycles + 7
     return cfg
 
 

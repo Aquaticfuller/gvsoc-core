@@ -48,6 +48,9 @@ class InsituCacheInterco(Component):
             'num_outputs': config.num_outputs,
             'dynamic_offset': config.dynamic_offset,
             'interco_latency_cycles': config.interco_latency_cycles,
+            'enable_input_coalesce': config.enable_input_coalesce,
+            'cache_line_bytes': config.cache_line_bytes,
+            'coalesce_max_latency': config.coalesce_max_latency,
         })
 
     def i_INPUT(self, port: int) -> SlaveItf:
