@@ -126,6 +126,8 @@ private:
     uint32_t bank_depth_for_spm_;       // # bank rows reserved for SPM
     bool     enable_flush_;             // reserved; flush sequence not yet implemented
     int32_t  hit_latency_cycles_;
+    int32_t  streaming_hit_latency_cycles_;  // <0 ⇒ OFF (flat hit_latency_cycles_ for every hit)
+    int64_t  last_read_hit_cycle_ = -1;      // pipeline-warmth anchor (streaming-hit model)
     int32_t  write_hit_latency_cycles_;   // <0 ⇒ use hit_latency_cycles_
     int32_t  write_commit_cycles_;        // min cycles between accepted write hits
     int32_t  fwd_hit_latency_cycles_;     // read hit on the fwd-buffer line; <0 ⇒ hit_latency_cycles_
@@ -223,6 +225,7 @@ InsituCacheController::InsituCacheController(vp::ComponentConf &conf)
     bank_depth_for_spm_            = cfg->get_child_int("bank_depth_for_spm");
     enable_flush_                  = cfg->get_child_bool("enable_flush");
     hit_latency_cycles_            = cfg->get_child_int("hit_latency_cycles");
+    streaming_hit_latency_cycles_  = cfg->get_child_int("streaming_hit_latency_cycles");
     write_hit_latency_cycles_      = cfg->get_child_int("write_hit_latency_cycles");
     write_commit_cycles_           = cfg->get_child_int("write_commit_cycles");
     fwd_hit_latency_cycles_        = cfg->get_child_int("fwd_hit_latency_cycles");
@@ -300,6 +303,7 @@ void InsituCacheController::reset(bool active)
         for (auto &q : mshr_) q.clear();
         miss_fifo_level_ = evic_fifo_level_ = retr_fifo_level_ = resp_fifo_level_ = 0;
         fwd_buffer_line_ = -1;
+        last_read_hit_cycle_ = -1;
         write_commit_busy_until_ = -1;
         refill_drain_busy_until_ = -1;
     }
@@ -355,6 +359,18 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
             base = (fwd_hit_latency_cycles_ >= 0) ? fwd_hit_latency_cycles_
                                                   : hit_latency_cycles_;
             forwarded = true;
+        } else if (streaming_hit_latency_cycles_ >= 0) {
+            // Streaming read-hit pipelining. The RTL hit path has three decoupling registers
+            // (coalescer req-spill, resp-spill, rsp_spliter/output-FIFO) that an isolated
+            // access must fill in series (→ hit_latency_cycles_) but a back-to-back stream
+            // keeps continuously occupied (→ streaming_hit_latency_cycles_). One register
+            // drains per idle cycle, so the fill cost is the number drained since the last
+            // read hit, capped at the depth difference — reproducing the RTL gap-sweep
+            // (gap0→7, gap1→8, gap3→10). MemLatency-independent.
+            const int64_t fill_max = (int64_t)hit_latency_cycles_ - streaming_hit_latency_cycles_;
+            const int64_t gap = now - last_read_hit_cycle_ - 1;
+            const int64_t drained = (gap <= 0) ? 0 : (gap < fill_max ? gap : fill_max);
+            base = streaming_hit_latency_cycles_ + drained;
         }
         int64_t latency = base;
         if (line->ready_cycle > now) latency += (line->ready_cycle - now);
@@ -388,6 +404,9 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
             if (write_through_mode_) issue_write_through(req);
         } else {
             cnt_rd_hit_++;
+            // A read hit keeps the hit pipeline's decoupling registers occupied; the next
+            // read hit within the fill window inherits the streaming latency.
+            last_read_hit_cycle_ = now;
         }
         return vp::IO_REQ_OK;
     }

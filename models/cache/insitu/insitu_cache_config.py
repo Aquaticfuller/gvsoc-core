@@ -123,7 +123,19 @@ class InsituCacheControllerConfig(Config):
 
     # -------- Timing knobs --------
     hit_latency_cycles: int = cfg_field(default=4, dump=True, desc=(
-        "Cycles from request acceptance at the controller to response emit on a read hit"
+        "Cycles from request acceptance at the controller to response emit on a read hit "
+        "(the ISOLATED / pipeline-fill latency)"
+    ))
+    streaming_hit_latency_cycles: int = cfg_field(default=-1, dump=True, desc=(
+        "Steady-state per-access read-hit latency once the hit pipeline is full. The RTL hit "
+        "path has three decoupling registers (coalescer req-spill, resp-spill, "
+        "rsp_spliter/output-FIFO) that an isolated access fills in series (→ hit_latency_cycles) "
+        "but a back-to-back stream keeps continuously occupied (→ this value). Modelled as a "
+        "per-controller warmth gradient: base = streaming + min(hit_latency-streaming, "
+        "cycles_since_last_read_hit), so an isolated hit pays the full fill latency, a streaming "
+        "hit pays this, and a gapped hit interpolates (RTL gap-sweep 7/8/9/10). READ hits only "
+        "(writes/forwarded reads keep their own latency). -1 = OFF (every hit pays "
+        "hit_latency_cycles, unchanged — the Spatz/default path)."
     ))
     write_hit_latency_cycles: int = cfg_field(default=-1, dump=True, desc=(
         "Cycles from acceptance to response on a WRITE hit. The RTL acks a write earlier "
@@ -408,6 +420,10 @@ def make_cachepool_512_calib_config() -> InsituCacheTileConfig:
     # inline reports a refill-sized latency (>> this) so its same-cycle followers do NOT
     # merge — they fall through to the controller's MSHR merge (coal_cold throughput intact).
     cfg.interco.coalesce_max_latency = cfg.controller.hit_latency_cycles + 7
+    # Streaming read-hit pipelining: an isolated hit pays interco(1)+9 = 10 (RTL), a
+    # back-to-back stream settles to interco(1)+6 = 7 (RTL). The coalescer inherits the
+    # first reader's latency, so coal_warm follows to 7/7/7 with no further change.
+    cfg.controller.streaming_hit_latency_cycles = cfg.controller.hit_latency_cycles - 3
     return cfg
 
 
