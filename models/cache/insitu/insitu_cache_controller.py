@@ -72,6 +72,7 @@ class InsituCacheController(Component):
             'enable_flush': config.enable_flush,
             'hit_latency_cycles': config.hit_latency_cycles,
             'streaming_hit_latency_cycles': config.streaming_hit_latency_cycles,
+            'bank_accept_cycles': config.bank_accept_cycles,
             'write_hit_latency_cycles': config.write_hit_latency_cycles,
             'write_commit_cycles': config.write_commit_cycles,
             'fwd_hit_latency_cycles': config.fwd_hit_latency_cycles,

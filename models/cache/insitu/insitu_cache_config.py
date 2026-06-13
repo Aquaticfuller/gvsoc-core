@@ -137,6 +137,16 @@ class InsituCacheControllerConfig(Config):
         "(writes/forwarded reads keep their own latency). -1 = OFF (every hit pays "
         "hit_latency_cycles, unchanged — the Spatz/default path)."
     ))
+    bank_accept_cycles: int = cfg_field(default=1, dump=True, desc=(
+        "Per-set bank ACCEPT interval (cycles between accepting two successive accesses to the "
+        "same set). The data bank is PIPELINED: it accepts a new access every this-many cycles, "
+        "each responding `latency` cycles later — so back-to-back accesses to a hot/heavily-reused "
+        "set PIPELINE rather than serialize at the full hit latency. Default 1 = one access per "
+        "set per cycle (BankFactor=1). Real kernels reuse few lines intensely across many ports; "
+        "advancing the per-set busy stamp by the full latency (the pre-2026-06 behaviour) "
+        "over-serialized those and inflated per-access latency ~6x on real traces (see "
+        "prompt/insitu_cache_realkernel_alignment_2026-06-12.md)."
+    ))
     write_hit_latency_cycles: int = cfg_field(default=-1, dump=True, desc=(
         "Cycles from acceptance to response on a WRITE hit. The RTL acks a write earlier "
         "than a read returns (write-info FIFO push: `wresp_valid = ~winfo_fifo_empty`), so "

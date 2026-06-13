@@ -128,6 +128,7 @@ private:
     int32_t  hit_latency_cycles_;
     int32_t  streaming_hit_latency_cycles_;  // <0 ⇒ OFF (flat hit_latency_cycles_ for every hit)
     int64_t  last_read_hit_cycle_ = -1;      // pipeline-warmth anchor (streaming-hit model)
+    int32_t  bank_accept_cycles_;            // per-set bank accept interval (pipelined, ≈1)
     int32_t  write_hit_latency_cycles_;   // <0 ⇒ use hit_latency_cycles_
     int32_t  write_commit_cycles_;        // min cycles between accepted write hits
     int32_t  fwd_hit_latency_cycles_;     // read hit on the fwd-buffer line; <0 ⇒ hit_latency_cycles_
@@ -226,6 +227,8 @@ InsituCacheController::InsituCacheController(vp::ComponentConf &conf)
     enable_flush_                  = cfg->get_child_bool("enable_flush");
     hit_latency_cycles_            = cfg->get_child_int("hit_latency_cycles");
     streaming_hit_latency_cycles_  = cfg->get_child_int("streaming_hit_latency_cycles");
+    bank_accept_cycles_            = cfg->get_child_int("bank_accept_cycles");
+    if (bank_accept_cycles_ < 1) bank_accept_cycles_ = 1;
     write_hit_latency_cycles_      = cfg->get_child_int("write_hit_latency_cycles");
     write_commit_cycles_           = cfg->get_child_int("write_commit_cycles");
     fwd_hit_latency_cycles_        = cfg->get_child_int("fwd_hit_latency_cycles");
@@ -374,12 +377,18 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
         }
         int64_t latency = base;
         if (line->ready_cycle > now) latency += (line->ready_cycle - now);
-        // A forwarded read is served from the buffer registers, bypassing the SRAM bank,
-        // so it does not contend for the per-set bank slot (no set_busy stall, and it
-        // does not occupy the bank). Non-forwarded hits serialize on the bank as usual.
+        // A forwarded read is served from the buffer registers, bypassing the SRAM bank, so it
+        // does not contend for the per-set bank slot. Non-forwarded hits contend for the bank —
+        // but the bank is PIPELINED: it accepts a new access to this set every bank_accept_cycles_
+        // (≈1), each responding `latency` later, so back-to-back accesses to a hot/reused set
+        // pipeline instead of serializing at the full latency. set_busy_until_[set] tracks the
+        // cycle the bank is next free to ACCEPT; an access backed up beyond that pays the
+        // queue-wait. (Advancing by the full latency — the pre-2026-06 behaviour — over-serialized
+        // hot-set reuse and inflated real-kernel per-access latency ~6x.)
         if (!forwarded) {
-            if (set_busy_until_[set] > now) latency += (set_busy_until_[set] - now);
-            set_busy_until_[set] = now + latency;
+            const int64_t accept_cycle = (set_busy_until_[set] > now) ? set_busy_until_[set] : now;
+            latency += (accept_cycle - now);                       // queue-wait if bank backed up
+            set_busy_until_[set] = accept_cycle + bank_accept_cycles_;
         }
 
         // This access caches its row in the 1-entry forwarding buffer.
