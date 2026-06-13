@@ -129,6 +129,8 @@ private:
     int32_t  streaming_hit_latency_cycles_;  // <0 ⇒ OFF (flat hit_latency_cycles_ for every hit)
     int64_t  last_read_hit_cycle_ = -1;      // pipeline-warmth anchor (streaming-hit model)
     int32_t  bank_accept_cycles_;            // per-set bank accept interval (pipelined, ≈1)
+    int32_t  scalar_bypass_port_;            // input port that bypasses the coalescer/bank (-1=none)
+    int32_t  scalar_hit_latency_cycles_;     // read-hit latency on the scalar bypass port (<0=hit_latency)
     int32_t  write_hit_latency_cycles_;   // <0 ⇒ use hit_latency_cycles_
     int32_t  write_commit_cycles_;        // min cycles between accepted write hits
     int32_t  fwd_hit_latency_cycles_;     // read hit on the fwd-buffer line; <0 ⇒ hit_latency_cycles_
@@ -229,6 +231,8 @@ InsituCacheController::InsituCacheController(vp::ComponentConf &conf)
     streaming_hit_latency_cycles_  = cfg->get_child_int("streaming_hit_latency_cycles");
     bank_accept_cycles_            = cfg->get_child_int("bank_accept_cycles");
     if (bank_accept_cycles_ < 1) bank_accept_cycles_ = 1;
+    scalar_bypass_port_            = cfg->get_child_int("scalar_bypass_port");
+    scalar_hit_latency_cycles_     = cfg->get_child_int("scalar_hit_latency_cycles");
     write_hit_latency_cycles_      = cfg->get_child_int("write_hit_latency_cycles");
     write_commit_cycles_           = cfg->get_child_int("write_commit_cycles");
     fwd_hit_latency_cycles_        = cfg->get_child_int("fwd_hit_latency_cycles");
@@ -333,6 +337,10 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
     const uint32_t tag = addr_tag(addr);
     const uint32_t set = addr_set(addr);
     const bool is_write = req->get_is_write();
+    // Scalar bypass: the interco tags the request's initiator with its input-port index when
+    // forward_initiator is on; the scalar port reads bypass the coalescer + bank contention.
+    const bool is_scalar = (scalar_bypass_port_ >= 0) &&
+                           (req->get_initiator() == scalar_bypass_port_);
 
     // Write-commit backpressure: the RTL write path serializes through the write-info
     // FIFO + per-way commit, so writes accept at most once per write_commit_cycles_.
@@ -357,6 +365,11 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
         if (is_write) {
             base = (write_hit_latency_cycles_ >= 0) ? write_hit_latency_cycles_
                                                     : hit_latency_cycles_;
+        } else if (is_scalar && scalar_hit_latency_cycles_ >= 0) {
+            // Scalar bypass read hit: short xbar path (RTL ≈ 3 cy), served outside the
+            // coalescer/bank — does not contend for the per-set bank slot (treat as forwarded).
+            base = scalar_hit_latency_cycles_;
+            forwarded = true;
         } else if (use_forwarding_buffer_ &&
                    fwd_buffer_line_ == (int64_t)addr_line(addr)) {
             base = (fwd_hit_latency_cycles_ >= 0) ? fwd_hit_latency_cycles_
@@ -644,11 +657,17 @@ void InsituCacheController::fsm_drain_mshr(uint32_t set)
 {
     auto &queue = mshr_[set];
     int subarray_idx = 0;
+    int64_t prev_arrival = -1;   // same-cycle readers coalesce → share a drain subarray
 
     while (!queue.empty()) {
         MshrEntry entry = queue.front();
         queue.pop_front();
         if (retr_fifo_level_ > 0) retr_fifo_level_--;
+        // The RTL par_coalescer merges same-cycle same-line reads into ONE entry, so they
+        // retire together — only advance the per-subarray drain stagger for a reader that
+        // arrived in a LATER cycle than the previous one (not per pending reader).
+        if (prev_arrival >= 0 && entry.arrival_cycle != prev_arrival) subarray_idx++;
+        prev_arrival = entry.arrival_cycle;
 
         vp::IoReq *req = entry.req;
         req->restore();
@@ -678,7 +697,6 @@ void InsituCacheController::fsm_drain_mshr(uint32_t set)
         }
 
         req->get_resp_port()->resp(req);
-        subarray_idx++;
     }
 }
 

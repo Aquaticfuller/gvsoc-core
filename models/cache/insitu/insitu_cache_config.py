@@ -147,6 +147,16 @@ class InsituCacheControllerConfig(Config):
         "over-serialized those and inflated per-access latency ~6x on real traces (see "
         "prompt/insitu_cache_realkernel_alignment_2026-06-12.md)."
     ))
+    scalar_bypass_port: int = cfg_field(default=-1, dump=True, desc=(
+        "Input port index of the Snitch scalar bypass (RTL: the scalar goes through a 2:1 xbar, "
+        "not the coalescer). A read from this port takes scalar_hit_latency_cycles and bypasses "
+        "the per-set bank contention (its own port). -1 = no bypass (all ports treated as VLSU). "
+        "Requires the interco to tag the request port (forward_initiator). Calib DUT = 4."
+    ))
+    scalar_hit_latency_cycles: int = cfg_field(default=-1, dump=True, desc=(
+        "Read-hit latency on the scalar bypass port (RTL ≈ 3 cy — shorter pipeline than the VLSU "
+        "coalescer path). <0 = use hit_latency_cycles. Only meaningful with scalar_bypass_port>=0."
+    ))
     write_hit_latency_cycles: int = cfg_field(default=-1, dump=True, desc=(
         "Cycles from acceptance to response on a WRITE hit. The RTL acks a write earlier "
         "than a read returns (write-info FIFO push: `wresp_valid = ~winfo_fifo_empty`), so "
@@ -273,6 +283,13 @@ class InsituCacheIntercoConfig(Config):
         "refilled inline reports a large (refill-sized) latency and so does NOT coalesce — "
         "its same-cycle followers fall through to the controller's MSHR merge, keeping the "
         "cold-miss-stream throughput unchanged. -1 = no limit (merge any OK read)."
+    ))
+    forward_initiator: bool = cfg_field(default=False, dump=True, desc=(
+        "When true, tag each forwarded request's `initiator` field with its input-port index so "
+        "the downstream controller can identify the port (used for the scalar bypass, "
+        "controller.scalar_bypass_port). Default False = leave initiator untouched (Spatz path "
+        "unchanged; the user request is resp'd at the controller and never reaches memory, so the "
+        "tag does not interfere with the memory models' LR/SC initiator use)."
     ))
 
 
@@ -434,6 +451,12 @@ def make_cachepool_512_calib_config() -> InsituCacheTileConfig:
     # back-to-back stream settles to interco(1)+6 = 7 (RTL). The coalescer inherits the
     # first reader's latency, so coal_warm follows to 7/7/7 with no further change.
     cfg.controller.streaming_hit_latency_cycles = cfg.controller.hit_latency_cycles - 3
+    # Scalar bypass: port 4 (Snitch scalar) goes through the RTL 2:1 xbar, not the coalescer —
+    # a read hit returns in ~3 cy and does not contend for the per-set bank. The interco tags
+    # each request's port so the controller can recognise port 4.
+    cfg.controller.scalar_bypass_port = 4
+    cfg.controller.scalar_hit_latency_cycles = 3
+    cfg.interco.forward_initiator = True
     return cfg
 
 

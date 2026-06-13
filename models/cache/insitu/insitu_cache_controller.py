@@ -73,6 +73,8 @@ class InsituCacheController(Component):
             'hit_latency_cycles': config.hit_latency_cycles,
             'streaming_hit_latency_cycles': config.streaming_hit_latency_cycles,
             'bank_accept_cycles': config.bank_accept_cycles,
+            'scalar_bypass_port': config.scalar_bypass_port,
+            'scalar_hit_latency_cycles': config.scalar_hit_latency_cycles,
             'write_hit_latency_cycles': config.write_hit_latency_cycles,
             'write_commit_cycles': config.write_commit_cycles,
             'fwd_hit_latency_cycles': config.fwd_hit_latency_cycles,

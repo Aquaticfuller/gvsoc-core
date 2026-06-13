@@ -41,6 +41,7 @@ private:
     bool     enable_input_coalesce_;
     uint32_t line_bits_;            // log2(cache_line_bytes), for same-line grouping
     int64_t  coalesce_max_latency_; // only reads with latency <= this seed the window (-1 = no limit)
+    bool     forward_initiator_;    // tag req->initiator with the input-port index (scalar bypass)
 
     std::vector<vp::IoSlave *>  inputs_;
     std::vector<vp::IoMaster *> outputs_;
@@ -70,6 +71,7 @@ InsituCacheInterco::InsituCacheInterco(vp::ComponentConf &conf)
     enable_input_coalesce_  = cfg->get_child_bool("enable_input_coalesce");
     line_bits_              = ceil_log2((unsigned)cfg->get_child_int("cache_line_bytes"));
     coalesce_max_latency_   = cfg->get_child_int("coalesce_max_latency");
+    forward_initiator_      = cfg->get_child_bool("forward_initiator");
 
     output_bits_ = ceil_log2(num_outputs_);
     output_mask_ = (num_outputs_ > 1) ? (num_outputs_ - 1) : 0;
@@ -110,6 +112,14 @@ vp::IoReqStatus InsituCacheInterco::req_handler(vp::Block *__this, vp::IoReq *re
     _this->trace_.msg(vp::Trace::LEVEL_TRACE,
         "forward input=%d → output=%u addr=0x%lx\n",
         input_id, out_id, (unsigned long)addr);
+
+    // Tag the request with its input-port index so the controller can recognise the scalar
+    // bypass port. Off by default (Spatz unchanged); the user request is resp'd at the
+    // controller and never reaches memory, so this does not collide with the memory models'
+    // initiator (LR/SC) use.
+    if (_this->forward_initiator_) {
+        req->set_initiator(input_id);
+    }
 
     const int64_t now = _this->clock.get_cycles();
 
