@@ -291,6 +291,21 @@ class InsituCacheIntercoConfig(Config):
         "unchanged; the user request is resp'd at the controller and never reaches memory, so the "
         "tag does not interfere with the memory models' LR/SC initiator use)."
     ))
+    per_cycle_output_arb: bool = cfg_field(default=False, dump=True, desc=(
+        "Output accept arbitration mode. Default False = ACCUMULATE: a monotonic per-output "
+        "busy-until cyclestamp models sustained 1/cyc backpressure across cycles — correct for "
+        "CLOSED-LOOP use (Spatz, microbench), where the core actually stalls on the returned "
+        "latency. True = PER-CYCLE: reset the accept counter each cycle and serialize only "
+        "genuinely same-cycle requests (output_accept_width per cycle) — correct for OPEN-LOOP "
+        "trace replay (calib), where the trace's t_issue already encodes the RTL's cross-cycle "
+        "backpressure, so accumulating would double-count it (~+33 cy hit inflation on fft)."
+    ))
+    output_accept_width: int = cfg_field(default=1, dump=True, desc=(
+        "Per-cycle-arbitration mode only: how many accepts one output absorbs per cycle before "
+        "same-cycle followers serialize (the k-th same-cycle accept waits k//width). Models the "
+        "RTL coalescer + wide-datapath accept bandwidth. 1 = strict one-per-cycle (different-line "
+        "same-cycle reads each cost +1). Ignored when per_cycle_output_arb is False."
+    ))
 
 
 @dataclass
@@ -457,6 +472,13 @@ def make_cachepool_512_calib_config() -> InsituCacheTileConfig:
     cfg.controller.scalar_bypass_port = 4
     cfg.controller.scalar_hit_latency_cycles = 3
     cfg.interco.forward_initiator = True
+    # NB: per_cycle_output_arb is intentionally left at its default (False = accumulate) here.
+    # The output-arbitration mode tracks the *injection semantics* of the trace, not the DUT:
+    #   • synthetic phase traces inject at max rate (delay=0) and RELY on accumulate-mode
+    #     backpressure to produce the saturated-throughput metrics (coal_warm, cold_stream…);
+    #   • real-kernel traces carry pre-throttled t_issue, for which accumulate double-counts
+    #     the RTL backpressure (~+33 cy hit inflation) and per-cycle arbitration is correct.
+    # The real-kernel replay opts in via INSITU_CALIB_PER_CYCLE_ARB (see insitu_cache_calib).
     return cfg
 
 

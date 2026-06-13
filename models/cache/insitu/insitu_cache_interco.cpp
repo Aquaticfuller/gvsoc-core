@@ -42,12 +42,22 @@ private:
     uint32_t line_bits_;            // log2(cache_line_bytes), for same-line grouping
     int64_t  coalesce_max_latency_; // only reads with latency <= this seed the window (-1 = no limit)
     bool     forward_initiator_;    // tag req->initiator with the input-port index (scalar bypass)
+    int32_t  output_accept_width_;  // accepts per output per cycle before serialization kicks in
+    bool     per_cycle_output_arb_; // true = per-cycle reset (open-loop replay); false = accumulate
 
     std::vector<vp::IoSlave *>  inputs_;
     std::vector<vp::IoMaster *> outputs_;
 
-    // Per-output busy-until cyclestamps for single-accept-per-cycle arbitration.
-    std::vector<int64_t> output_busy_until_;
+    // Output accept arbitration — two modes (see req_handler for why):
+    //  • accumulate (default): monotonic busy-until cyclestamp. Models sustained 1/cyc output
+    //    backpressure across cycles — correct for CLOSED-LOOP (Spatz/microbench), where the core
+    //    actually stalls on the returned latency.
+    //  • per-cycle (per_cycle_output_arb_): reset the accept counter each cycle, serialize only
+    //    same-cycle requests. Correct for OPEN-LOOP trace replay (calib), where t_issue already
+    //    encodes the RTL's cross-cycle backpressure and accumulating would double-count it.
+    std::vector<int64_t> output_busy_until_;     // accumulate mode
+    std::vector<int64_t> out_cycle_stamp_;       // per-cycle mode
+    std::vector<int64_t> out_accepts_in_cycle_;  // per-cycle mode
 
     // Input par-coalescer state, per output. A same-cycle (cycle == hit_win_cycle_) read
     // to the same line (hit_win_line_) that the cycle's first reader HIT inherits its
@@ -72,6 +82,9 @@ InsituCacheInterco::InsituCacheInterco(vp::ComponentConf &conf)
     line_bits_              = ceil_log2((unsigned)cfg->get_child_int("cache_line_bytes"));
     coalesce_max_latency_   = cfg->get_child_int("coalesce_max_latency");
     forward_initiator_      = cfg->get_child_bool("forward_initiator");
+    output_accept_width_    = cfg->get_child_int("output_accept_width");
+    if (output_accept_width_ < 1) output_accept_width_ = 1;
+    per_cycle_output_arb_   = cfg->get_child_bool("per_cycle_output_arb");
 
     output_bits_ = ceil_log2(num_outputs_);
     output_mask_ = (num_outputs_ > 1) ? (num_outputs_ - 1) : 0;
@@ -79,6 +92,8 @@ InsituCacheInterco::InsituCacheInterco(vp::ComponentConf &conf)
     inputs_.resize(num_inputs_);
     outputs_.resize(num_outputs_);
     output_busy_until_.assign(num_outputs_, -1);
+    out_cycle_stamp_.assign(num_outputs_, -1);
+    out_accepts_in_cycle_.assign(num_outputs_, 0);
     hit_win_cycle_.assign(num_outputs_, -1);
     hit_win_line_.assign(num_outputs_, 0);
     hit_win_latency_.assign(num_outputs_, 0);
@@ -137,13 +152,29 @@ vp::IoReqStatus InsituCacheInterco::req_handler(vp::Block *__this, vp::IoReq *re
         }
     }
 
-    // Per-output single-accept-per-cycle arbitration. If another input already drove this
-    // output this cycle, delay by interco_latency_cycles (1 cycle in canonical config).
-    int64_t latency = _this->interco_latency_cycles_;
-    if (_this->output_busy_until_[out_id] > now) {
-        latency += (_this->output_busy_until_[out_id] - now);
+    // Output accept arbitration (see member declaration for the two modes).
+    int64_t latency;
+    if (_this->per_cycle_output_arb_) {
+        // Per-cycle: the RTL coalescer + wide datapath absorbs output_accept_width accepts per
+        // cycle; only requests beyond that within the SAME cycle pay a serialization cost. This
+        // does NOT accumulate across cycles — the replay trace's t_issue already encodes the RTL's
+        // cross-cycle backpressure (the core stalled when the cache couldn't accept), so a monotonic
+        // busy-until would double-count it and inflate hit latency (~+33 cy on the fft trace; see
+        // insitu_cache_realkernel_alignment_2026-06-12.md §9).
+        if (now != _this->out_cycle_stamp_[out_id]) {
+            _this->out_cycle_stamp_[out_id]      = now;
+            _this->out_accepts_in_cycle_[out_id] = 0;
+        }
+        const int64_t k = _this->out_accepts_in_cycle_[out_id]++;
+        latency = _this->interco_latency_cycles_ + (k / _this->output_accept_width_);
+    } else {
+        // Accumulate (default): monotonic 1/cyc output backpressure, correct for closed-loop.
+        latency = _this->interco_latency_cycles_;
+        if (_this->output_busy_until_[out_id] > now) {
+            latency += (_this->output_busy_until_[out_id] - now);
+        }
+        _this->output_busy_until_[out_id] = now + latency;
     }
-    _this->output_busy_until_[out_id] = now + latency;
 
     req->inc_latency(latency);
     vp::IoReqStatus st = _this->outputs_[out_id]->req_forward(req);
