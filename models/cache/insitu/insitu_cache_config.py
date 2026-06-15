@@ -383,6 +383,13 @@ class InsituCacheTileConfig:
     # each interco output and its controller (merge + arb done there; interco becomes a pure
     # router). Default False = monolithic interco does merge+arb inline (today, byte-identical).
     use_structural_coalescer: bool = False
+    # Phase-2 inc1 — per-core controller cardinality. When True the *integration site*
+    # (snitch_cluster) sets num_controllers = nb_core (RTL NumL1CacheCtrl = NumCores → one cache
+    # per core), instead of the factory's fixed 4. Default False = num_controllers unchanged
+    # (today's topology, byte-identical). NB: requires power-of-two nb_core (interco routes by
+    # `(addr>>dynamic_offset)&(num_outputs-1)`); per-controller capacity is not yet RTL-scaled
+    # (that is Phase-2 inc3) so total tile capacity changes with the controller count until then.
+    controllers_track_cores: bool = False
     controller: InsituCacheControllerConfig = field(
         default_factory=InsituCacheControllerConfig)
     coalescer: InsituCacheCoalescerConfig = field(
