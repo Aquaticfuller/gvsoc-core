@@ -85,6 +85,26 @@ class InsituCacheControllerConfig(Config):
         "eviction. Phase-A note: the controller still issues a coalescer event on "
         "write hits regardless of this flag — Phase B will gate it."
     ))
+    inline_sync_miss: bool = cfg_field(default=False, dump=True, desc=(
+        "CLOSED-LOOP protocol. When a refill resolves SYNCHRONOUSLY (downstream memory returns "
+        "IO_REQ_OK in the same call), complete the miss INLINE and return IO_REQ_OK — exactly as a "
+        "hit does (data filled, miss latency stamped) — instead of parking on the MSHR and calling "
+        "resp(). A real core LSU treats OK as done (writes fire-and-forget, reads complete with "
+        "latency) and faults on a re-entrant resp() during its request, so the park+resp path "
+        "deadlocks/aborts it. Default False keeps the park+MSHR-drain path the open-loop calib "
+        "driver relies on for its same-line MSHR-merge throughput modelling (coal_cold). "
+        "Single-outstanding-refill model."
+    ))
+    functional_writethrough: bool = cfg_field(default=False, dump=True, desc=(
+        "FUNCTIONAL coherence only (not a timing knob). When true, every write also pushes "
+        "its real bytes straight to the backing memory (bypassing the coalescer, which carries "
+        "no data), so a backdoor reader — e.g. the ISS/HTIF syscall path that reads target "
+        "memory through a separate port — sees the writes. Required for CLOSED-LOOP runs "
+        "(Spatz cluster) to compute correctly and terminate; without it write-back dirty data "
+        "is invisible to HTIF and the program hangs in a bogus syscall. Default False so the "
+        "open-loop calib/microbench memory-traffic and throughput numbers are untouched. NB: "
+        "the data path is orthogonal to the latency model; this only adds bytes to memory."
+    ))
     enable_multi_read_pend: bool = cfg_field(default=False, dump=True, desc=(
         "When true, multiple read requests to the same in-flight (READ_PEND) cache line "
         "queue on a per-line linked list rather than stalling with MSHR_FULL. Matches "
@@ -362,6 +382,13 @@ def make_cachepool_512_config() -> InsituCacheTileConfig:
         use_forwarding_buffer=True,
         # Pure write-back (WriteThroughMode=0).
         write_through_mode=False,
+        # NB: inline_sync_miss / functional_writethrough are DRIVER/integration flags, not cache
+        # geometry — they are left at their field defaults (False) here so every open-loop config
+        # derived from this factory (calib, conventional, legacy) inherits the calibrated
+        # park+MSHR+defer_refills timing path. The closed-loop Spatz cluster turns them on at the
+        # instantiation site (snitch_cluster.py) because the real core LSU requires a synchronous
+        # slave + functional coherence. Setting them here would silently bypass the occupancy model
+        # (reserve_install_pipe) in every derived open-loop DUT — see insitu_cache_calib_report §10.
         # Multi-read MSHR is opt-in; the legacy GVSoC behaviour matches `False`.
         enable_multi_read_pend=False,
         # SPM and flush off by default — see v2 doc §5/§6.

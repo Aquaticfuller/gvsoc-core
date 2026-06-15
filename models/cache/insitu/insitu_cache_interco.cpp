@@ -48,6 +48,11 @@ private:
     std::vector<vp::IoSlave *>  inputs_;
     std::vector<vp::IoMaster *> outputs_;
 
+    // Scratch request used to split a wide access (one larger than the interleave granularity)
+    // into per-owning-controller byte ranges. Single-outstanding (synchronous slave) so one
+    // scratch req is safe.
+    vp::IoReq split_subreq_;
+
     // Output accept arbitration — two modes (see req_handler for why):
     //  • accumulate (default): monotonic busy-until cyclestamp. Models sustained 1/cyc output
     //    backpressure across cycles — correct for CLOSED-LOOP (Spatz/microbench), where the core
@@ -119,6 +124,44 @@ vp::IoReqStatus InsituCacheInterco::req_handler(vp::Block *__this, vp::IoReq *re
 {
     InsituCacheInterco *_this = static_cast<InsituCacheInterco *>(__this);
     const uint64_t addr = req->get_addr();
+
+    // Wide-access split: the controller-select bits ([dynamic_offset +: log2(num_outputs)]) sit
+    // WITHIN the cache line, so an access larger than the interleave granularity (1<<dynamic_offset)
+    // spans multiple controllers. Route each byte range to its OWNING controller — otherwise an
+    // 8-byte store routed wholesale to ctrl0 leaves ctrl1's copy of the upper word stale (a later
+    // narrow read of that word goes to ctrl1 and reads garbage). Each owning controller fills its
+    // slice of the request's data buffer in place. (Accesses within one granule skip this.)
+    if (_this->num_outputs_ > 1) {
+        const uint32_t gran = 1u << _this->dynamic_offset_;
+        const uint32_t size = (uint32_t)req->get_size();
+        if (((uint32_t)(addr & (gran - 1)) + size) > gran) {
+            uint8_t *data = req->get_data();
+            const bool is_wr = req->get_is_write();
+            uint64_t a = addr;
+            uint32_t rem = size;
+            int64_t max_lat = 0;
+            while (rem > 0) {
+                const uint32_t out = (uint32_t)((a >> _this->dynamic_offset_) & _this->output_mask_);
+                const uint32_t to_bound = gran - (uint32_t)(a & (gran - 1));
+                const uint32_t chunk = (rem < to_bound) ? rem : to_bound;
+                _this->split_subreq_.init();
+                _this->split_subreq_.set_addr(a);
+                _this->split_subreq_.set_size(chunk);
+                _this->split_subreq_.set_is_write(is_wr);
+                if (data != nullptr) _this->split_subreq_.set_data(data + (uint32_t)(a - addr));
+                if (_this->forward_initiator_) _this->split_subreq_.set_initiator(input_id);
+                _this->split_subreq_.inc_latency(_this->interco_latency_cycles_);
+                (void)_this->outputs_[out]->req(&_this->split_subreq_);
+                const int64_t l = (int64_t)_this->split_subreq_.get_full_latency();
+                if (l > max_lat) max_lat = l;
+                a += chunk;
+                rem -= chunk;
+            }
+            req->inc_latency(max_lat);
+            return vp::IO_REQ_OK;
+        }
+    }
+
     const uint32_t out_id =
         (_this->num_outputs_ > 1)
             ? (uint32_t)((addr >> _this->dynamic_offset_) & _this->output_mask_)

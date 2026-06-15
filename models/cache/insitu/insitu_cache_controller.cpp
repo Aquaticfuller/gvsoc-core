@@ -69,13 +69,16 @@ private:
     // ===== IoReq handlers =====
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req);
     static void refill_resp_handler(vp::Block *__this, vp::IoReq *req);
+    static vp::IoReqStatus flush_req_handler(vp::Block *__this, vp::IoReq *req);
+    void flush_all();
 
     // ===== Internal helpers =====
     vp::IoReqStatus handle_request(vp::IoReq *req);
     CacheLine *lookup(uint32_t tag, uint32_t set, int *way_out);
     int pick_victim(uint32_t tag, uint32_t set);
     void issue_write_through(vp::IoReq *user_req);
-    void issue_refill(uint32_t line_addr, uint32_t set, int way);
+    void functional_write_mem(vp::IoReq *user_req);
+    vp::IoReqStatus issue_refill(uint32_t line_addr, uint32_t set, int way);
     void issue_eviction(uint32_t line_addr);
     void fsm_drain_mshr(uint32_t set);
 
@@ -109,6 +112,23 @@ private:
     inline uint64_t addr_line(uint64_t addr) const
     { return addr & ~((1ULL << line_bits_) - 1); }
 
+    // Functional data path: each cached line holds its bytes in line_data_ so loads return
+    // correct values (the timing model above is orthogonal). Copy req's word from/to the
+    // line at the access offset. line_to_req=true serves a read; false applies a write.
+    inline void exchange_line_data(vp::IoReq *req, uint32_t set, int way, bool line_to_req)
+    {
+        if (way < 0) return;
+        uint8_t *d = req->get_data();
+        if (d == nullptr) return;
+        const uint32_t off = (uint32_t)(req->get_addr() & (cache_line_bytes_ - 1));
+        uint32_t n = (uint32_t)req->get_size();
+        if (off >= cache_line_bytes_) return;
+        if (off + n > cache_line_bytes_) n = cache_line_bytes_ - off;  // clamp (no line straddle)
+        uint8_t *ln = &line_data_[((size_t)set * num_ways_ + (uint32_t)way) * cache_line_bytes_ + off];
+        if (line_to_req) memcpy(d, ln, n);
+        else             memcpy(ln, d, n);
+    }
+
     // ===== Config =====
     uint32_t cache_line_bytes_;
     uint32_t num_ways_;
@@ -121,6 +141,9 @@ private:
                                        // hit_latency_cycles for now (Phase B: explicit).
     // Latest-RTL-tracking knobs (insitu_cache_architecture_v2.md):
     bool     write_through_mode_;       // false = pure write-back (latest RTL default)
+    bool     functional_writethrough_;  // push real write bytes to memory for backdoor coherence
+    bool     inline_sync_miss_;         // synchronous refill → complete inline + return OK (no park/resp)
+    bool     carry_data_;               // model line data (closed-loop); OFF = open-loop calib (timing-only)
     bool     enable_multi_read_pend_;   // false = legacy single-read MSHR per line
     bool     enable_spm_;
     uint32_t bank_depth_for_spm_;       // # bank rows reserved for SPM
@@ -155,12 +178,14 @@ private:
 
     // ===== Ports =====
     vp::IoSlave  input_itf_;
+    vp::IoSlave  flush_itf_;
     vp::IoMaster refill_itf_;
     vp::IoMaster evict_itf_;
     vp::IoMaster wt_itf_;
 
     // ===== State =====
     std::vector<CacheLine>               lines_;     // [num_sets * num_ways]
+    std::vector<uint8_t>                 line_data_; // [num_sets*num_ways*line_bytes] functional data
     std::vector<std::vector<uint8_t>>    lru_order_; // [num_sets][num_ways], front=MRU
     std::vector<std::deque<MshrEntry>>   mshr_;      // [num_sets]
     std::vector<bool>                    refill_in_flight_;  // [num_sets]
@@ -188,6 +213,13 @@ private:
     vp::IoReq refill_req_;
     vp::IoReq evict_req_;
     vp::IoReq wt_req_;
+    vp::IoReq funcwr_req_;   // functional write-through to memory (data coherence; see flag)
+    // Original (pre-routing) line address of the outstanding refill. A downstream router
+    // (e.g. the cluster wide_axi) rewrites refill_req_'s address in place (subtracts its
+    // remove_offset), so the response carries the *transformed* address. The refill response
+    // handler must re-decode the cache set/tag from THIS original address, not req->get_addr(),
+    // or it fails to match the pending line and the miss never completes. (-1 = none.)
+    uint64_t pending_refill_addr_ = 0;
     // Scratch buffers backing each req's data pointer. The downstream memory model
     // performs a memcpy against the request's data pointer, so we must provide a real
     // buffer even though the perf model doesn't care about the byte values.
@@ -209,6 +241,7 @@ private:
     uint64_t cnt_stall_mshr_full_ = 0;
     uint64_t cnt_refills_issued_ = 0;
     uint64_t cnt_writes_through_ = 0;
+    uint64_t cnt_flush_ = 0;
 };
 
 InsituCacheController::InsituCacheController(vp::ComponentConf &conf)
@@ -223,6 +256,11 @@ InsituCacheController::InsituCacheController(vp::ComponentConf &conf)
     use_hash_way_select_           = cfg->get_child_bool("use_hash_way_select");
     use_forwarding_buffer_         = cfg->get_child_bool("use_forwarding_buffer");
     write_through_mode_            = cfg->get_child_bool("write_through_mode");
+    functional_writethrough_       = cfg->get_child_bool("functional_writethrough");
+    inline_sync_miss_              = cfg->get_child_bool("inline_sync_miss");
+    // Carry real line data only in the closed-loop (cluster) config; the open-loop calib is a
+    // pure timing model (no data checks) and must stay byte-identical to its calibration.
+    carry_data_                    = inline_sync_miss_ || functional_writethrough_;
     enable_multi_read_pend_        = cfg->get_child_bool("enable_multi_read_pend");
     enable_spm_                    = cfg->get_child_bool("enable_spm");
     bank_depth_for_spm_            = cfg->get_child_int("bank_depth_for_spm");
@@ -264,6 +302,7 @@ InsituCacheController::InsituCacheController(vp::ComponentConf &conf)
     }
 
     lines_.assign(num_sets_ * num_ways_, CacheLine{});
+    line_data_.assign((size_t)num_sets_ * num_ways_ * cache_line_bytes_, 0);
     lru_order_.assign(num_sets_, std::vector<uint8_t>{});
     for (uint32_t s = 0; s < num_sets_; ++s) {
         lru_order_[s].resize(num_ways_);
@@ -278,6 +317,12 @@ InsituCacheController::InsituCacheController(vp::ComponentConf &conf)
 
     this->input_itf_.set_req_meth(&InsituCacheController::req_handler);
     this->new_slave_port("input", &this->input_itf_);
+
+    // Flush/invalidate port: a write here (driven by the cluster L1D-flush peripheral on a
+    // software cache_sync) invalidates all valid lines so subsequent reads refill fresh from
+    // memory — needed because the cluster DMA writes TCDM directly, bypassing this cache.
+    this->flush_itf_.set_req_meth(&InsituCacheController::flush_req_handler);
+    this->new_slave_port("flush", &this->flush_itf_);
 
     this->refill_itf_.set_resp_meth(&InsituCacheController::refill_resp_handler);
     this->new_master_port("refill", &this->refill_itf_);
@@ -330,6 +375,32 @@ vp::IoReqStatus InsituCacheController::req_handler(vp::Block *__this, vp::IoReq 
     return _this->handle_request(req);
 }
 
+// Invalidate every valid line so subsequent reads refill fresh from memory. Dirty data is already
+// in memory (functional write-through in the cluster config), so dropping lines loses nothing.
+// Models the RTL cache_sync "flush+invalidate" (insn 2'b10). Single-outstanding cluster mode has
+// no in-flight MSHR state at sync points.
+void InsituCacheController::flush_all()
+{
+    for (auto &line : lines_) {
+        line.state = LineState::INVALID;
+        line.dirty = false;
+        line.ready_cycle = -1;
+    }
+    fwd_buffer_line_ = -1;
+    for (auto &b : set_busy_until_) b = -1;
+    cnt_flush_++;
+}
+
+vp::IoReqStatus InsituCacheController::flush_req_handler(vp::Block *__this, vp::IoReq *req)
+{
+    InsituCacheController *_this = static_cast<InsituCacheController *>(__this);
+    (void)req;
+    _this->flush_all();
+    _this->trace_.msg(vp::Trace::LEVEL_DEBUG, "cache flush/invalidate (now %ld)\n",
+                      (long)_this->clock.get_cycles());
+    return vp::IO_REQ_OK;
+}
+
 vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
 {
     const int64_t now = this->clock.get_cycles();
@@ -344,13 +415,21 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
 
     // Write-commit backpressure: the RTL write path serializes through the write-info
     // FIFO + per-way commit, so writes accept at most once per write_commit_cycles_.
-    // Deny (back-pressure) a write that arrives while the commit slot is still busy; the
-    // upstream retries on the next cycle. (No effect when write_commit_cycles_ <= 1.)
-    if (is_write && write_commit_cycles_ > 1 && now < write_commit_busy_until_) {
-        return vp::IO_REQ_DENIED;
-    }
     if (is_write && write_commit_cycles_ > 1) {
-        write_commit_busy_until_ = now + write_commit_cycles_;
+        if (inline_sync_miss_) {
+            // Synchronous-slave mode (cluster): the core LSU cannot retry a DENIED (no grant
+            // handshake in this ISS build), so model the commit serialization as ADDED LATENCY
+            // on an OK response instead of denying — writes still serialize at write_commit_cycles_.
+            const int64_t accept = (write_commit_busy_until_ > now) ? write_commit_busy_until_ : now;
+            req->inc_latency(accept - now);
+            write_commit_busy_until_ = accept + write_commit_cycles_;
+        } else {
+            // Open-loop calib: deny; the trace-replay driver retries next cycle.
+            if (now < write_commit_busy_until_) {
+                return vp::IO_REQ_DENIED;
+            }
+            write_commit_busy_until_ = now + write_commit_cycles_;
+        }
     }
 
     int way = -1;
@@ -418,6 +497,10 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
         }
 
         if (is_write) {
+            if (carry_data_) {
+                exchange_line_data(req, set, way, /*line_to_req=*/false);   // apply write to line
+                functional_write_mem(req);                                  // keep memory coherent
+            }
             line->dirty = true;
             cnt_wr_hit_++;
             // Write-through is only emitted in WriteThroughMode=1. In pure write-back
@@ -425,6 +508,7 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
             // the line will be evicted later. See architecture_v2.md §0/§8.
             if (write_through_mode_) issue_write_through(req);
         } else {
+            if (carry_data_) exchange_line_data(req, set, way, /*line_to_req=*/true);  // serve read
             cnt_rd_hit_++;
             // A read hit keeps the hit pipeline's decoupling registers occupied; the next
             // read hit within the fill window inherits the streaming latency.
@@ -473,6 +557,11 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
         uint64_t old_line_addr =
             ((uint64_t)vline.tag << (line_bits_ + set_bits_)) |
             ((uint64_t)set       <<  line_bits_);
+        // Write back the victim's actual bytes so the backing memory stays coherent
+        // (issue_eviction sends evict_data_buf_ to the next level).
+        memcpy(evict_data_buf_.data(),
+               &line_data_[((size_t)set * num_ways_ + (uint32_t)victim_way) * cache_line_bytes_],
+               cache_line_bytes_);
         issue_eviction((uint32_t)old_line_addr);
         cnt_evict_++;
         cnt_wb_dirty_++;
@@ -482,15 +571,55 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
     vline.state = is_write ? LineState::WRITE_PEND : LineState::READ_PEND;
     vline.dirty = false;
 
+    if (inline_sync_miss_) {
+        // Closed-loop synchronous slave: send the refill; if it resolves synchronously (cluster
+        // L2 returns OK in the same call), complete the miss INLINE and return OK — exactly as a
+        // hit does — so we never call resp() re-entrantly into the core LSU (which it rejects) nor
+        // leave the request pending.
+        if (is_write) cnt_wr_miss_++; else cnt_rd_miss_++;
+        const vp::IoReqStatus rst = issue_refill((uint32_t)addr_line(addr), set, victim_way);
+        if (rst == vp::IO_REQ_OK) {
+            int64_t refill_lat = (int64_t)refill_req_.get_full_latency()
+                                 + refill_bank_write_cycles_ + miss_penalty_cycles_;
+            vline.state = LineState::VALID;
+            vline.ready_cycle = now + refill_lat;
+            if (refill_req_.get_data() != nullptr) {
+                memcpy(&line_data_[((size_t)set * num_ways_ + (uint32_t)victim_way) * cache_line_bytes_],
+                       refill_req_.get_data(), cache_line_bytes_);
+            }
+            if (is_write) {
+                exchange_line_data(req, set, victim_way, /*line_to_req=*/false);
+                functional_write_mem(req);
+                vline.dirty = true;
+            } else {
+                exchange_line_data(req, set, victim_way, /*line_to_req=*/true);
+            }
+            req->inc_latency(refill_lat);
+            return vp::IO_REQ_OK;
+        }
+        // async fallback (not expected for the cluster's synchronous L2): park.
+        req->save();
+        mshr_[set].push_back(MshrEntry{req, now});
+        retr_fifo_level_++;
+        miss_fifo_level_++;
+        refill_in_flight_[set] = true;
+        return vp::IO_REQ_PENDING;
+    }
+
+    // Open-loop / calib: original flow exactly — park on the MSHR first, then issue the refill,
+    // which drains synchronously here on an OK response (the trace-replay driver tolerates the
+    // re-entrant resp) or completes later via the async resp callback for a PENDING response. The
+    // functional data copies (line_data) are orthogonal to this timing path.
     req->save();
     mshr_[set].push_back(MshrEntry{req, now});
     retr_fifo_level_++;
     miss_fifo_level_++;
     refill_in_flight_[set] = true;
-
     if (is_write) cnt_wr_miss_++; else cnt_rd_miss_++;
-
-    issue_refill((uint32_t)addr_line(addr), set, victim_way);
+    const vp::IoReqStatus rst = issue_refill((uint32_t)addr_line(addr), set, victim_way);
+    if (rst == vp::IO_REQ_OK) {
+        refill_resp_handler(this, &refill_req_);
+    }
     return vp::IO_REQ_PENDING;
 }
 
@@ -528,6 +657,23 @@ int InsituCacheController::pick_victim(uint32_t tag, uint32_t set)
 
 // ---------- outgoing helpers ----------
 
+void InsituCacheController::functional_write_mem(vp::IoReq *user_req)
+{
+    // Data-coherence only (gated by functional_writethrough_): push the write's real bytes
+    // straight to the backing memory via the evict port (direct to L2, bypassing the
+    // coalescer which carries no data) so a backdoor reader (ISS/HTIF) sees the store. The
+    // memory reads the bytes from the user request's own data pointer. Fire-and-forget; the
+    // latency it returns is ignored (the timing model already accounted for the access).
+    if (!functional_writethrough_ || !this->evict_itf_.is_bound()) return;
+    if (user_req->get_data() == nullptr) return;
+    funcwr_req_.init();
+    funcwr_req_.set_addr(user_req->get_addr());
+    funcwr_req_.set_size(user_req->get_size());
+    funcwr_req_.set_is_write(true);
+    funcwr_req_.set_data(user_req->get_data());
+    (void)this->evict_itf_.req(&funcwr_req_);
+}
+
 void InsituCacheController::issue_write_through(vp::IoReq *user_req)
 {
     if (!this->wt_itf_.is_bound()) return;
@@ -535,16 +681,24 @@ void InsituCacheController::issue_write_through(vp::IoReq *user_req)
     wt_req_.set_addr(user_req->get_addr());
     wt_req_.set_size(user_req->get_size());
     wt_req_.set_is_write(true);
-    // Downstream memory memcpys from the data pointer. Use our scratch buffer — the
-    // perf model doesn't track byte values, so zeroed bytes are safe to forward.
+    // Carry the user's actual write bytes so the downstream memory stays coherent.
+    if (user_req->get_data() != nullptr) {
+        uint32_t n = (uint32_t)user_req->get_size();
+        if (n > cache_line_bytes_) n = cache_line_bytes_;
+        memcpy(wt_data_buf_.data(), user_req->get_data(), n);
+    }
     wt_req_.set_data(wt_data_buf_.data());
     (void)this->wt_itf_.req(&wt_req_);
     cnt_writes_through_++;
 }
 
-void InsituCacheController::issue_refill(uint32_t line_addr, uint32_t set, int way)
+// Send the line-refill request to the next level and return its status WITHOUT completing it.
+// The caller (handle_request) decides how to complete: inline (synchronous IO_REQ_OK, closed-loop)
+// or park-and-drain (the open-loop calib / async path via refill_resp_handler).
+vp::IoReqStatus InsituCacheController::issue_refill(uint32_t line_addr, uint32_t set, int way)
 {
     (void)set; (void)way;
+    pending_refill_addr_ = line_addr;   // remember pre-routing address for the resp handler
     refill_req_.init();
     refill_req_.set_addr(line_addr);
     refill_req_.set_size(cache_line_bytes_);
@@ -558,14 +712,11 @@ void InsituCacheController::issue_refill(uint32_t line_addr, uint32_t set, int w
     cnt_refills_issued_++;
 
     vp::IoReqStatus st = this->refill_itf_.req(&refill_req_);
-    if (st == vp::IO_REQ_OK) {
-        // Synchronous response path — the master's resp_meth was NOT invoked by the
-        // target. Treat the same-cycle OK status as a refill completion right now.
-        refill_resp_handler(this, &refill_req_);
-    } else if (st != vp::IO_REQ_PENDING) {
+    if (st != vp::IO_REQ_OK && st != vp::IO_REQ_PENDING) {
         this->trace_.msg(vp::Trace::LEVEL_WARNING,
             "refill rejected (st=%d) addr=0x%x\n", (int)st, line_addr);
     }
+    return st;
 }
 
 void InsituCacheController::issue_eviction(uint32_t line_addr)
@@ -603,10 +754,16 @@ void InsituCacheController::refill_resp_handler(vp::Block *__this, vp::IoReq *re
     InsituCacheController *_this = static_cast<InsituCacheController *>(__this);
     const int64_t now = _this->clock.get_cycles();
 
-    // Recover set from the refill req's address. Find the pending way in that set
-    // (exactly one way is in {READ_PEND, WRITE_PEND} with the matching tag).
-    const uint32_t set = _this->addr_set(req->get_addr());
-    const uint32_t tag = _this->addr_tag(req->get_addr());
+    // Recover set from the ORIGINAL (pre-routing) refill address — a downstream router may have
+    // rewritten req->get_addr() in place. Find the pending way in that set (exactly one way is in
+    // {READ_PEND, WRITE_PEND} with the matching tag).
+    // Open-loop calib: the refill req's address is unmodified (no routing transform), so use it
+    // directly — byte-identical to the calibrated baseline. Closed-loop: a router rewrote the
+    // req's address in place, so use the original pre-routing address we stashed.
+    const uint64_t refill_addr = _this->carry_data_ ? _this->pending_refill_addr_
+                                                     : req->get_addr();
+    const uint32_t set = _this->addr_set(refill_addr);
+    const uint32_t tag = _this->addr_tag(refill_addr);
     int pending_way = -1;
     for (uint32_t w = 0; w < _this->num_ways_; ++w) {
         CacheLine &ln = _this->lines_[set * _this->num_ways_ + w];
@@ -641,6 +798,13 @@ void InsituCacheController::refill_resp_handler(vp::Block *__this, vp::IoReq *re
     }
     line.state = LineState::VALID;
     line.ready_cycle = now + refill_lat;
+    // Install the fetched line bytes (the downstream memory filled the refill req's data
+    // buffer) so subsequent hits and the draining MSHR readers return correct data.
+    if (_this->carry_data_ && req->get_data() != nullptr) {
+        memcpy(&_this->line_data_[((size_t)set * _this->num_ways_ + (uint32_t)pending_way)
+                                  * _this->cache_line_bytes_],
+               req->get_data(), _this->cache_line_bytes_);
+    }
     _this->refill_in_flight_[set] = false;
     if (_this->miss_fifo_level_ > 0) _this->miss_fifo_level_--;
 
@@ -690,10 +854,16 @@ void InsituCacheController::fsm_drain_mshr(uint32_t set)
         req->inc_latency(base_latency);
 
         if (req->get_is_write() && line != nullptr) {
+            if (carry_data_) {
+                exchange_line_data(req, s, way, /*line_to_req=*/false);  // apply deferred write
+                functional_write_mem(req);                              // keep memory coherent
+            }
             line->dirty = true;
             // Same gating as on the synchronous write-hit path above: only emit on the
             // write-through path when WriteThroughMode=1 (see architecture_v2.md §0/§8).
             if (write_through_mode_) issue_write_through(req);
+        } else if (carry_data_ && line != nullptr) {
+            exchange_line_data(req, s, way, /*line_to_req=*/true);   // serve deferred read
         }
 
         req->get_resp_port()->resp(req);

@@ -66,6 +66,8 @@ class InsituCacheController(Component):
             'use_hash_way_select': config.use_hash_way_select,
             'use_forwarding_buffer': config.use_forwarding_buffer,
             'write_through_mode': config.write_through_mode,
+            'functional_writethrough': config.functional_writethrough,
+            'inline_sync_miss': config.inline_sync_miss,
             'enable_multi_read_pend': config.enable_multi_read_pend,
             'enable_spm': config.enable_spm,
             'bank_depth_for_spm': config.bank_depth_for_spm,
@@ -96,6 +98,11 @@ class InsituCacheController(Component):
     def i_INPUT(self) -> SlaveItf:
         """TCDM request input (from upstream interco)."""
         return SlaveItf(self, 'input', signature='io')
+
+    def i_FLUSH(self) -> SlaveItf:
+        """Flush/invalidate trigger (a write invalidates all valid lines). Driven by the
+        cluster L1D-flush peripheral on a software cache_sync."""
+        return SlaveItf(self, 'flush', signature='io')
 
     def o_REFILL(self, itf: SlaveItf):
         """Bind the line-fill request port to the next memory level."""

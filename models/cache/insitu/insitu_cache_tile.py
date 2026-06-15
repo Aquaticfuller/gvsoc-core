@@ -100,6 +100,13 @@ class InsituCacheTile(Component):
             self.bind(self._ctrls[i], 'refill', self, 'l2')
             self.bind(self._ctrls[i], 'evict',  self, 'l2')
 
+            # Flush: expose one composite slave port per controller so the cluster L1D-flush
+            # peripheral can invalidate every controller (cache_sync flush-all). Only in the
+            # multi-controller (cluster) config — the single-controller open-loop calib DUT has
+            # no flush driver, so binding an externally-undriven composite port there is skipped.
+            if n_ctrl > 1:
+                self.bind(self, f'flush_{i}', self._ctrls[i], 'flush')
+
     # ---------- port factories ----------
 
     def i_INPUT(self, port: int) -> SlaveItf:
@@ -109,6 +116,14 @@ class InsituCacheTile(Component):
                 f'InsituCacheTile port {port} out of range [0, '
                 f'{self._config.num_tcdm_ports})')
         return SlaveItf(self, f'in_{port}', signature='io')
+
+    def num_flush_ports(self) -> int:
+        """Number of flush ports = number of controllers (one per controller)."""
+        return self._config.num_controllers
+
+    def i_FLUSH(self, ctrl: int) -> SlaveItf:
+        """Flush/invalidate trigger for controller ``ctrl`` (a write invalidates its lines)."""
+        return SlaveItf(self, f'flush_{ctrl}', signature='io')
 
     def o_L2(self, itf: SlaveItf):
         """Bind the tile's L2 output to ``itf``.
