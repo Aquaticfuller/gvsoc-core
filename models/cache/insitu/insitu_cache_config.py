@@ -326,6 +326,45 @@ class InsituCacheIntercoConfig(Config):
         "RTL coalescer + wide-datapath accept bandwidth. 1 = strict one-per-cycle (different-line "
         "same-cycle reads each cost +1). Ignored when per_cycle_output_arb is False."
     ))
+    defer_to_coalescer: bool = cfg_field(default=False, dump=True, desc=(
+        "Phase-1 structural mode. When True the interco becomes a pure ADDRESS ROUTER: it skips "
+        "the inline read-merge AND the output-accept arbitration AND the interco_latency add, and "
+        "just routes each request to its owning output and forwards it — the downstream "
+        "InsituCacheParCoalescer does the merge + arbitration + latency instead. Set by the tile "
+        "when use_structural_coalescer=True. Default False = the interco does everything inline "
+        "(today's calibrated path), byte-identical."
+    ))
+
+
+class InsituCacheParCoalescerConfig(Config):
+    """Configuration for the per-controller parallel coalescer (RTL ``par_coalescer``).
+
+    Phase-1 increment 1: the structural front-end that does the same-cycle/same-line read
+    merge + output-accept arbitration extracted from the interco. Mirrors the interco's
+    merge/arb knobs so the structural path reproduces the calibrated numbers.
+    """
+
+    interco_latency_cycles: int = cfg_field(default=1, dump=True, desc=(
+        "Fixed forward latency added by the coalescer (the interco no longer adds it in "
+        "structural mode)."
+    ))
+    merge_same_line_reads: bool = cfg_field(default=True, dump=True, desc=(
+        "Same-cycle, same-line READ followers inherit the cycle's first warm-hit latency and "
+        "return OK without re-forwarding or consuming an accept slot (RTL coal_warm)."
+    ))
+    cache_line_bytes: int = cfg_field(default=64, dump=True, desc=(
+        "Cache line size in bytes — for same-line grouping. Must match the controller."
+    ))
+    coalesce_max_latency: int = cfg_field(default=-1, dump=True, desc=(
+        "Only a forwarded read with latency <= this seeds the merge window (TRUE warm hits "
+        "only). -1 = no limit."
+    ))
+    output_accept_width: int = cfg_field(default=1, dump=True, desc=(
+        "Per-cycle-arbitration accept bandwidth (see InsituCacheIntercoConfig.output_accept_width)."
+    ))
+    per_cycle_output_arb: bool = cfg_field(default=False, dump=True, desc=(
+        "Output arbitration mode (see InsituCacheIntercoConfig.per_cycle_output_arb)."
+    ))
 
 
 @dataclass
@@ -340,6 +379,10 @@ class InsituCacheTileConfig:
     num_controllers: int = 4
     num_cores: int = 4
     tcdm_ports_per_core: int = 5
+    # Phase-1 structural mode: when True the tile inserts one InsituCacheParCoalescer between
+    # each interco output and its controller (merge + arb done there; interco becomes a pure
+    # router). Default False = monolithic interco does merge+arb inline (today, byte-identical).
+    use_structural_coalescer: bool = False
     controller: InsituCacheControllerConfig = field(
         default_factory=InsituCacheControllerConfig)
     coalescer: InsituCacheCoalescerConfig = field(

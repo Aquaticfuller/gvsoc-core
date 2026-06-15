@@ -44,6 +44,7 @@ private:
     bool     forward_initiator_;    // tag req->initiator with the input-port index (scalar bypass)
     int32_t  output_accept_width_;  // accepts per output per cycle before serialization kicks in
     bool     per_cycle_output_arb_; // true = per-cycle reset (open-loop replay); false = accumulate
+    bool     defer_to_coalescer_;   // true = pure router (merge+arb+latency moved downstream)
 
     std::vector<vp::IoSlave *>  inputs_;
     std::vector<vp::IoMaster *> outputs_;
@@ -90,6 +91,7 @@ InsituCacheInterco::InsituCacheInterco(vp::ComponentConf &conf)
     output_accept_width_    = cfg->get_child_int("output_accept_width");
     if (output_accept_width_ < 1) output_accept_width_ = 1;
     per_cycle_output_arb_   = cfg->get_child_bool("per_cycle_output_arb");
+    defer_to_coalescer_     = cfg->get_child_bool("defer_to_coalescer");
 
     output_bits_ = ceil_log2(num_outputs_);
     output_mask_ = (num_outputs_ > 1) ? (num_outputs_ - 1) : 0;
@@ -177,6 +179,13 @@ vp::IoReqStatus InsituCacheInterco::req_handler(vp::Block *__this, vp::IoReq *re
     // initiator (LR/SC) use.
     if (_this->forward_initiator_) {
         req->set_initiator(input_id);
+    }
+
+    // Phase-1 structural mode: become a pure address router. The downstream
+    // InsituCacheParCoalescer does the read-merge + output arbitration + interco_latency,
+    // so here we just forward to the owning output. (Default off = the inline path below.)
+    if (_this->defer_to_coalescer_) {
+        return _this->outputs_[out_id]->req_forward(req);
     }
 
     const int64_t now = _this->clock.get_cycles();

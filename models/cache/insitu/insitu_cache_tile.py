@@ -32,11 +32,13 @@ from gvsoc.systree import Component, SlaveItf
 
 from cache.insitu.insitu_cache_config import (
     InsituCacheTileConfig,
+    InsituCacheParCoalescerConfig,
     make_cachepool_512_config,
 )
 from cache.insitu.insitu_cache_controller import InsituCacheController
 from cache.insitu.insitu_cache_coalescer import InsituCacheCoalescer
 from cache.insitu.insitu_cache_interco import InsituCacheInterco
+from cache.insitu.insitu_cache_par_coalescer import InsituCacheParCoalescer
 
 
 class InsituCacheTile(Component):
@@ -68,17 +70,41 @@ class InsituCacheTile(Component):
         config.interco.num_inputs = n_ports
         config.interco.num_outputs = n_ctrl
 
+        # Phase-1 structural mode: insert one par_coalescer between each interco output and its
+        # controller. The interco becomes a pure router (defer_to_coalescer), and the coalescer
+        # does the read-merge + output arbitration + interco_latency — extracting what
+        # enable_input_coalesce did inline. Default off ⇒ monolithic interco (byte-identical).
+        self._use_struct_coal = config.use_structural_coalescer
+        if self._use_struct_coal:
+            config.interco.defer_to_coalescer = True
+            # Mirror the interco's merge/arb knobs onto the coalescer so the structural path
+            # reproduces the calibrated numbers; carry the merge intent from enable_input_coalesce.
+            self._parcoal_cfg = InsituCacheParCoalescerConfig(
+                interco_latency_cycles=config.interco.interco_latency_cycles,
+                merge_same_line_reads=config.interco.enable_input_coalesce,
+                cache_line_bytes=config.interco.cache_line_bytes,
+                coalesce_max_latency=config.interco.coalesce_max_latency,
+                output_accept_width=config.interco.output_accept_width,
+                per_cycle_output_arb=config.interco.per_cycle_output_arb,
+            )
+            # The interco no longer merges inline (the coalescer does); keep the flag coherent.
+            config.interco.enable_input_coalesce = False
+
         # -------- sub-components --------
 
         self._interco = InsituCacheInterco(self, 'interco', config=config.interco)
 
         self._ctrls = []
         self._coals = []
+        self._parcoals = []
         for i in range(n_ctrl):
             ctrl = InsituCacheController(self, f'ctrl_{i}', config=config.controller)
             coal = InsituCacheCoalescer(self, f'coal_{i}', config=config.coalescer)
             self._ctrls.append(ctrl)
             self._coals.append(coal)
+            if self._use_struct_coal:
+                self._parcoals.append(
+                    InsituCacheParCoalescer(self, f'parcoal_{i}', config=self._parcoal_cfg))
 
         # -------- wiring --------
         # TCDM inputs → interco inputs (pass-through this composite's slave ports)
@@ -91,7 +117,12 @@ class InsituCacheTile(Component):
         # This follows the hierarchical_cache.py pattern (multiple inner masters → one
         # composite master → one external slave).
         for i in range(n_ctrl):
-            self._interco.o_OUTPUT(i, self._ctrls[i].i_INPUT())
+            # Interco output i → (par_coalescer i →) controller i.
+            if self._use_struct_coal:
+                self._interco.o_OUTPUT(i, self._parcoals[i].i_INPUT())
+                self._parcoals[i].o_OUTPUT(self._ctrls[i].i_INPUT())
+            else:
+                self._interco.o_OUTPUT(i, self._ctrls[i].i_INPUT())
             self._ctrls[i].o_WRITE_THROUGH(self._coals[i].i_INPUT())
 
             # Fan-in to the tile's composite `l2` master. The binding framework

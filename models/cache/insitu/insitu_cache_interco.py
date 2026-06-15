@@ -54,6 +54,7 @@ class InsituCacheInterco(Component):
             'forward_initiator': config.forward_initiator,
             'per_cycle_output_arb': config.per_cycle_output_arb,
             'output_accept_width': config.output_accept_width,
+            'defer_to_coalescer': config.defer_to_coalescer,
         })
 
     def i_INPUT(self, port: int) -> SlaveItf:
