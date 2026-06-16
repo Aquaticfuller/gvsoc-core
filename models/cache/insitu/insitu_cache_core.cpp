@@ -89,8 +89,14 @@ private:
     std::vector<uint8_t> data_;            // [num_sets*num_ways*line_bytes]
     BankArray bank_;
 
-    // 1-deep input buffer (stage-0 admission)
-    vp::IoReq *req_buf_ = nullptr;
+    // Input acceptance queue (stage-0 admission). The RTL upstream streams requests in (the
+    // requester holds valid until accepted, up to NumSpatzOutstandingLoads=32 in flight); model
+    // that as a bounded accept queue rather than a 1-deep buffer, so a request is accepted at its
+    // arrival cycle and the emergent latency reflects the cache pipeline + MSHR queueing, not an
+    // artificial 1-outstanding DENY-retry backpressure. Genuine backpressure (queue full) still
+    // returns IO_REQ_DENIED.
+    std::deque<vp::IoReq*> in_q_;
+    uint32_t in_q_cap_ = 32;   // ~NumSpatzOutstandingLoads
 
     // stage-0→stage-1 pipeline register
     struct PrereadTask { bool valid=false; bool is_refill=false; vp::IoReq *req=nullptr;
@@ -174,7 +180,7 @@ void InsituCacheCore::reset(bool active)
         for (uint32_t w = 0; w < num_ways_; w++) meta_[(size_t)s*num_ways_+w].lru = w;
     for (auto &q : mshr_) q.clear();
     resp_fifo_.clear(); miss_fifo_.clear(); evic_fifo_.clear();
-    req_buf_ = nullptr; preread_q_ = PrereadTask{};
+    in_q_.clear(); preread_q_ = PrereadTask{};
     refill_pending_ = refill_spill_valid_ = false; retr_level_ = 0;
 }
 
@@ -185,7 +191,7 @@ void InsituCacheCore::schedule_tick()
 
 bool InsituCacheCore::any_work() const
 {
-    return preread_q_.valid || req_buf_ != nullptr || refill_spill_valid_ ||
+    return preread_q_.valid || !in_q_.empty() || refill_spill_valid_ ||
            !resp_fifo_.empty() || !miss_fifo_.empty() || !evic_fifo_.empty();
 }
 
@@ -193,9 +199,9 @@ bool InsituCacheCore::any_work() const
 vp::IoReqStatus InsituCacheCore::req_handler(vp::Block *__this, vp::IoReq *req)
 {
     InsituCacheCore *_this = static_cast<InsituCacheCore *>(__this);
-    if (_this->req_buf_ != nullptr) return vp::IO_REQ_DENIED;   // 1-deep input full → backpressure
+    if (_this->in_q_.size() >= _this->in_q_cap_) return vp::IO_REQ_DENIED;  // accept queue full → backpressure
     req->save();
-    _this->req_buf_ = req;
+    _this->in_q_.push_back(req);
     _this->schedule_tick();
     return vp::IO_REQ_PENDING;
 }
@@ -383,10 +389,10 @@ void InsituCacheCore::stage0_arbitrate()
         preread_q_.valid = true; preread_q_.is_refill = true; preread_q_.req = nullptr;
         return;
     }
-    if (req_buf_ != nullptr) {
-        preread_q_.valid = true; preread_q_.is_refill = false; preread_q_.req = req_buf_;
-        preread_q_.addr = req_buf_->get_addr(); preread_q_.is_write = req_buf_->get_is_write();
-        req_buf_ = nullptr;   // free the input → upstream may admit the next request
+    if (!in_q_.empty()) {
+        vp::IoReq *r = in_q_.front(); in_q_.pop_front();
+        preread_q_.valid = true; preread_q_.is_refill = false; preread_q_.req = r;
+        preread_q_.addr = r->get_addr(); preread_q_.is_write = r->get_is_write();
     }
 }
 
