@@ -46,9 +46,10 @@ private:
     static void refill_resp_handler(vp::Block *__this, vp::IoReq *req);
     static void tick(vp::Block *__this, vp::ClockEvent *event);
 
-    void schedule_tick();
+    void schedule_tick(int64_t cycles = 1);
     void stage1_process();                 // decode + FSM + bank write
-    void process_request(vp::IoReq *req);  // REQ_PROC body
+    bool process_request(vp::IoReq *req);  // REQ_PROC body; returns true=done, false=stalled (retry)
+    bool maybe_install_refill();           // install a ready refill (priority bank op); true if installed
     void install_refill();                 // refill block
     void drain_outputs();                  // one beat per output FIFO
     void stage0_arbitrate();               // pick next preread task
@@ -112,8 +113,12 @@ private:
     uint32_t retr_level_ = 0;
 
     // single-outstanding refill
-    bool refill_pending_ = false;
-    bool refill_spill_valid_ = false;
+    bool refill_pending_ = false;          // a refill req is outstanding on the async path (awaiting resp())
+    bool refill_spill_valid_ = false;      // refilled line is ready to install (stage-1 next tick)
+    int64_t refill_ready_cycle_ = -1;      // sync responder: cycle the refill's data is actually ready
+                                           //   (= issue cycle + the latency the responder stamped via
+                                           //   inc_latency). Until then the line is in flight; the next
+                                           //   refill is gated on it → serialized miss throughput. -1 = none.
     uint64_t pending_refill_addr_ = 0;
 
     // ports
@@ -181,17 +186,18 @@ void InsituCacheCore::reset(bool active)
     for (auto &q : mshr_) q.clear();
     resp_fifo_.clear(); miss_fifo_.clear(); evic_fifo_.clear();
     in_q_.clear(); preread_q_ = PrereadTask{};
-    refill_pending_ = refill_spill_valid_ = false; retr_level_ = 0;
+    refill_pending_ = refill_spill_valid_ = false; refill_ready_cycle_ = -1; retr_level_ = 0;
 }
 
-void InsituCacheCore::schedule_tick()
+void InsituCacheCore::schedule_tick(int64_t cycles)
 {
-    if (!tick_event_->is_enqueued()) event_enqueue(tick_event_, 1);
+    if (cycles < 1) cycles = 1;
+    if (!tick_event_->is_enqueued()) event_enqueue(tick_event_, cycles);
 }
 
 bool InsituCacheCore::any_work() const
 {
-    return preread_q_.valid || !in_q_.empty() || refill_spill_valid_ ||
+    return preread_q_.valid || !in_q_.empty() || refill_spill_valid_ || refill_ready_cycle_ >= 0 ||
            !resp_fifo_.empty() || !miss_fifo_.empty() || !evic_fifo_.empty();
 }
 
@@ -218,18 +224,46 @@ void InsituCacheCore::tick(vp::Block *__this, vp::ClockEvent *event)
     _this->drain_outputs();                 // one beat per output FIFO
     _this->stage0_arbitrate();              // latch next preread task
 
-    if (_this->any_work()) _this->schedule_tick();
+    // Reschedule. If the only pending work is a sync-responder refill still in flight (its data
+    // becomes ready at refill_ready_cycle_), jump straight to that cycle instead of spinning every
+    // cycle — the refill latency EMERGES as the gap between issue and install.
+    const int64_t now2 = _this->clock.get_cycles();
+    const bool near_work = _this->preread_q_.valid || !_this->in_q_.empty() ||
+        _this->refill_spill_valid_ || !_this->resp_fifo_.empty() || !_this->evic_fifo_.empty() ||
+        (!_this->miss_fifo_.empty() && !_this->refill_pending_ && _this->refill_ready_cycle_ < 0);
+    if (near_work) {
+        _this->schedule_tick(1);
+    } else if (_this->refill_ready_cycle_ > now2) {
+        _this->schedule_tick(_this->refill_ready_cycle_ - now2);   // wake when the refill completes
+    } else if (_this->any_work()) {
+        _this->schedule_tick(1);
+    }
 }
 
 void InsituCacheCore::stage1_process()
 {
+    // Refill install has priority for the single bank port (RTL core.sv:894-903 retr-room gate) and a
+    // SEPARATE path from the request pipeline — so a stalled request in preread_q_ can never block the
+    // refill that would unblock it (the deadlock when refills are deferred). If a refill installs this
+    // tick, the latched request simply waits one more tick in preread_q_.
+    if (maybe_install_refill()) return;
     if (!preread_q_.valid) return;
-    if (preread_q_.is_refill) install_refill();
-    else process_request(preread_q_.req);
-    preread_q_.valid = false;
+    if (process_request(preread_q_.req)) preread_q_.valid = false;   // done; a stall keeps it latched
 }
 
-void InsituCacheCore::process_request(vp::IoReq *req)
+// Install a refilled line if its data is ready (async resp set refill_spill_valid_, or the sync
+// responder's stamped latency has elapsed at refill_ready_cycle_). Returns true if it installed.
+bool InsituCacheCore::maybe_install_refill()
+{
+    const bool sync_ready = (refill_ready_cycle_ >= 0 && clock.get_cycles() >= refill_ready_cycle_);
+    if (!refill_spill_valid_ && !sync_ready) return false;
+    refill_spill_valid_ = false;
+    refill_ready_cycle_ = -1;
+    install_refill();
+    return true;
+}
+
+bool InsituCacheCore::process_request(vp::IoReq *req)
 {
     const uint64_t addr = req->get_addr();
     const bool is_write = req->get_is_write();
@@ -243,9 +277,7 @@ void InsituCacheCore::process_request(vp::IoReq *req)
         // bank read conflict: a write took this (way,bank-select) to a different row this cycle.
         if (!is_write && bank_.read_conflict(now, d.way, set)) {
             cnt_bank_conflict_++;
-            preread_q_.valid = true; preread_q_.req = req; preread_q_.is_refill = false;  // retry next tick
-            preread_q_.addr = addr; preread_q_.is_write = is_write;
-            return;
+            return false;   // bank conflict → stall, retry next tick (stays in preread_q_)
         }
         if (is_write) {
             exchange_line_data(req, set, d.way, /*line_to_req=*/false);
@@ -261,7 +293,7 @@ void InsituCacheCore::process_request(vp::IoReq *req)
             cnt_rd_hit_++;
         }
         resp_fifo_.push_back(req);
-        return;
+        return true;
     }
 
     // hit on a pending line (in-situ MSHR merge)
@@ -269,29 +301,23 @@ void InsituCacheCore::process_request(vp::IoReq *req)
         mshr_[(size_t)set*num_ways_ + d.way].push_back(req);
         cnt_mshr_merge_++;
         if (is_write) cnt_wr_miss_++; else cnt_rd_miss_++;
-        return;
+        return true;   // parked on the pending line's reader list
     }
 
     // conflict / all-pend → stall by retrying next tick (functional stall; full FSM enum is TODO)
     if (d.is_hit_conflit || d.is_all_pend) {
-        preread_q_.valid = true; preread_q_.req = req; preread_q_.is_refill = false;
-        preread_q_.addr = addr; preread_q_.is_write = is_write;
-        return;
+        return false;
     }
 
     // miss: allocate victim + refill
     if (miss_fifo_.size() >= miss_fifo_depth_ || retr_level_ >= retr_fifo_depth_) {
-        preread_q_.valid = true; preread_q_.req = req; preread_q_.is_refill = false;  // FIFO full → retry
-        preread_q_.addr = addr; preread_q_.is_write = is_write;
-        return;
+        return false;   // miss/retr FIFO full → stall, retry next tick
     }
     uint32_t vw = d.way;
     WayMeta &vline = ways[vw];
     if (vline.status == VALID && vline.dirty) {
         if (evic_fifo_.size() >= evic_fifo_depth_) {
-            preread_q_.valid = true; preread_q_.req = req; preread_q_.is_refill = false;
-            preread_q_.addr = addr; preread_q_.is_write = is_write;
-            return;
+            return false;   // eviction FIFO full → stall
         }
         uint64_t old_line = ((uint64_t)vline.tag << (geom_.off_bits + geom_.depth_bits)) |
                             ((uint64_t)set << geom_.off_bits);
@@ -308,6 +334,7 @@ void InsituCacheCore::process_request(vp::IoReq *req)
     retr_level_++;
     miss_fifo_.push_back(addr_line(addr));
     if (is_write) cnt_wr_miss_++; else cnt_rd_miss_++;
+    return true;   // miss allocated, refill queued
 }
 
 void InsituCacheCore::install_refill()
@@ -356,8 +383,10 @@ void InsituCacheCore::drain_outputs()
         vp::IoReq *r = resp_fifo_.front(); resp_fifo_.pop_front();
         r->get_resp_port()->resp(r);
     }
-    // one refill issue per tick, single-outstanding
-    if (!refill_pending_ && !refill_spill_valid_ && !miss_fifo_.empty()) {
+    // one refill issue per tick, single-outstanding: gate on refill_pending_ (async in flight),
+    // refill_spill_valid_ (ready, awaiting install) AND refill_ready_cycle_ (sync refill in flight) —
+    // so a new line-refill cannot start until the current one installs (serialized miss throughput).
+    if (!refill_pending_ && !refill_spill_valid_ && refill_ready_cycle_ < 0 && !miss_fifo_.empty()) {
         uint64_t line = miss_fifo_.front(); miss_fifo_.pop_front();
         pending_refill_addr_ = line;
         refill_req_.init();
@@ -367,7 +396,16 @@ void InsituCacheCore::drain_outputs()
         refill_req_.set_data(refill_data_buf_.data());
         refill_pending_ = true;
         vp::IoReqStatus st = refill_itf_.req(&refill_req_);
-        if (st == vp::IO_REQ_OK) { refill_spill_valid_ = true; refill_pending_ = false; }  // sync responder
+        if (st == vp::IO_REQ_OK) {
+            // Synchronous responder: it returned the data now but stamped the access latency via
+            // inc_latency. The refill's data is ready `lat` cycles from now — defer the install so the
+            // cold-miss latency EMERGES as that gap (matches the RTL refill_mem_model). A 0-latency
+            // responder installs next tick (lat<=0 → ready now).
+            refill_pending_ = false;
+            const int64_t lat = (int64_t)refill_req_.get_full_latency();
+            const int64_t now = clock.get_cycles();
+            refill_ready_cycle_ = now + (lat > 0 ? lat : 0);
+        }
     }
     // one eviction issue per tick
     if (!evic_fifo_.empty()) {
@@ -383,12 +421,8 @@ void InsituCacheCore::drain_outputs()
 
 void InsituCacheCore::stage0_arbitrate()
 {
-    if (preread_q_.valid) return;   // stage-1 re-queued a stall this tick
-    // refill spill has priority (install it next), if there is retr room
-    if (refill_spill_valid_) {
-        preread_q_.valid = true; preread_q_.is_refill = true; preread_q_.req = nullptr;
-        return;
-    }
+    if (preread_q_.valid) return;   // stage-1 still holds a latched/stalled request
+    // (refill install is handled separately in maybe_install_refill — it does not use preread_q_.)
     if (!in_q_.empty()) {
         vp::IoReq *r = in_q_.front(); in_q_.pop_front();
         preread_q_.valid = true; preread_q_.is_refill = false; preread_q_.req = r;
