@@ -58,6 +58,12 @@ class InsituCacheControllerConfig(Config):
     num_sets: int = cfg_field(default=128, dump=True, desc=(
         "Sets per controller (CacheBankDepth in the RTL)"
     ))
+    bank_factor: int = cfg_field(default=2, dump=True, desc=(
+        "RTL L1BankFactor = NumPseudoDualBanks (hardcoded 2): the pseudo-dual-port split. Used by "
+        "the structural cache core's bank model (insitu_cache_bank_array) to detect same-cycle "
+        "read-vs-write conflicts on the same (way, bank-select). Power-of-two. Ignored by the "
+        "cycle-approximate controller (which uses set_busy)."
+    ))
     tcdm_word_bytes: int = cfg_field(default=4, dump=True, desc=(
         "Upstream request granularity in bytes (NarrowDataWidth/8 = 4)"
     ))
@@ -390,6 +396,11 @@ class InsituCacheTileConfig:
     # `(addr>>dynamic_offset)&(num_outputs-1)`); per-controller capacity is not yet RTL-scaled
     # (that is Phase-2 inc3) so total tile capacity changes with the controller count until then.
     controllers_track_cores: bool = False
+    # Structural-rewrite switch (Step 4): when True the tile instantiates the RTL-faithful
+    # per-cycle InsituCacheCore instead of the cycle-approximate InsituCacheController. Default
+    # False = the calibrated controller (today). First runnable on the OPEN-LOOP calib tile only
+    # (async per-cycle FSM); the cluster keeps the controller until the synchronous-slave mode lands.
+    use_structural_core: bool = False
     controller: InsituCacheControllerConfig = field(
         default_factory=InsituCacheControllerConfig)
     coalescer: InsituCacheCoalescerConfig = field(

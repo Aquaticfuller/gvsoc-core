@@ -36,6 +36,7 @@ from cache.insitu.insitu_cache_config import (
     make_cachepool_512_config,
 )
 from cache.insitu.insitu_cache_controller import InsituCacheController
+from cache.insitu.insitu_cache_core import InsituCacheCore
 from cache.insitu.insitu_cache_coalescer import InsituCacheCoalescer
 from cache.insitu.insitu_cache_interco import InsituCacheInterco
 from cache.insitu.insitu_cache_par_coalescer import InsituCacheParCoalescer
@@ -74,6 +75,9 @@ class InsituCacheTile(Component):
         # controller. The interco becomes a pure router (defer_to_coalescer), and the coalescer
         # does the read-merge + output arbitration + interco_latency — extracting what
         # enable_input_coalesce did inline. Default off ⇒ monolithic interco (byte-identical).
+        # Structural-rewrite switch: instantiate the RTL-faithful per-cycle InsituCachecore instead
+        # of the cycle-approximate InsituCacheController (open-loop/async only for now).
+        self._use_struct_core = config.use_structural_core
         self._use_struct_coal = config.use_structural_coalescer
         if self._use_struct_coal:
             config.interco.defer_to_coalescer = True
@@ -98,7 +102,10 @@ class InsituCacheTile(Component):
         self._coals = []
         self._parcoals = []
         for i in range(n_ctrl):
-            ctrl = InsituCacheController(self, f'ctrl_{i}', config=config.controller)
+            if self._use_struct_core:
+                ctrl = InsituCacheCore(self, f'ctrl_{i}', config=config.controller)
+            else:
+                ctrl = InsituCacheController(self, f'ctrl_{i}', config=config.controller)
             coal = InsituCacheCoalescer(self, f'coal_{i}', config=config.coalescer)
             self._ctrls.append(ctrl)
             self._coals.append(coal)
@@ -123,11 +130,14 @@ class InsituCacheTile(Component):
                 self._parcoals[i].o_OUTPUT(self._ctrls[i].i_INPUT())
             else:
                 self._interco.o_OUTPUT(i, self._ctrls[i].i_INPUT())
-            self._ctrls[i].o_WRITE_THROUGH(self._coals[i].i_INPUT())
+            # Write-through path exists only on the cycle-approximate controller; the structural
+            # core folds writes into its evict/functional path (no separate WT port).
+            if not self._use_struct_core:
+                self._ctrls[i].o_WRITE_THROUGH(self._coals[i].i_INPUT())
+                self.bind(self._coals[i], 'out', self, 'l2')
 
             # Fan-in to the tile's composite `l2` master. The binding framework
             # multiplexes the inner masters onto the single external destination.
-            self.bind(self._coals[i], 'out',   self, 'l2')
             self.bind(self._ctrls[i], 'refill', self, 'l2')
             self.bind(self._ctrls[i], 'evict',  self, 'l2')
 
