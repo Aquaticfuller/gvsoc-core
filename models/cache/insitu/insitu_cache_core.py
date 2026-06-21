@@ -28,7 +28,8 @@ class InsituCacheCore(Component):
     """Structural per-cycle cache core. Drop-in for InsituCacheController (calib/structural mode)."""
 
     def __init__(self, parent: Component, name: str,
-                 config: InsituCacheControllerConfig | None = None):
+                 config: InsituCacheControllerConfig | None = None,
+                 num_input_ports: int = 1):
         if config is None:
             config = InsituCacheControllerConfig()
 
@@ -36,6 +37,7 @@ class InsituCacheCore(Component):
 
         self.add_sources(['cache/insitu/insitu_cache_core.cpp'])
 
+        self._num_input_ports = num_input_ports
         self.add_properties({
             'cache_line_bytes': config.cache_line_bytes,
             'num_ways': config.num_ways,
@@ -48,11 +50,14 @@ class InsituCacheCore(Component):
             'miss_fifo_depth': config.miss_fifo_depth,
             'evic_fifo_depth': config.evic_fifo_depth,
             'bank_factor': config.bank_factor,
+            # Multi-lane core port (RTL controller has a 5-wide core port). Default 1 = single 'input'
+            # port (backward identical); the structural tile sets this to NrTCDMPortsPerCore.
+            'num_input_ports': num_input_ports,
         })
 
-    def i_INPUT(self) -> SlaveItf:
-        """TCDM request input (from the upstream interco / par_coalescer)."""
-        return SlaveItf(self, 'input', signature='io')
+    def i_INPUT(self, port: int = 0) -> SlaveItf:
+        """TCDM request input. port 0 = 'input' (default); lanes 1.. = 'input_{port}' (multi-lane core)."""
+        return SlaveItf(self, 'input' if port == 0 else f'input_{port}', signature='io')
 
     def i_FLUSH(self) -> SlaveItf:
         """Flush/invalidate trigger (stub for now; full cache_sync FSM is Step 6)."""

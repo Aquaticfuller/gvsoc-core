@@ -122,7 +122,9 @@ private:
     uint64_t pending_refill_addr_ = 0;
 
     // ports
-    vp::IoSlave  input_itf_;
+    vp::IoSlave  input_itf_;                    // port "input" (lane 0 / the single-port default)
+    std::vector<vp::IoSlave *> extra_inputs_;   // "input_1".."input_{N-1}" — the multi-lane core port
+                                                 // (RTL controller has a 5-wide core port); all feed in_q_
     vp::IoMaster refill_itf_;
     vp::IoMaster evict_itf_;
     vp::IoSlave  flush_itf_;
@@ -165,6 +167,19 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
 
     input_itf_.set_req_meth(&InsituCacheCore::req_handler);
     new_slave_port("input", &input_itf_);
+    // Multi-lane core port (RTL cachepool_cache_ctrl has a 5-wide core port). Extra lanes all share the
+    // same admission handler → the single in_q_; the per-cycle pipeline + bank then serialize them onto
+    // the one bank port (the coalescer/bypass that merges them faithfully is wired in front by the tile).
+    {
+        uint32_t num_input_ports = (uint32_t)cfg->get_child_int("num_input_ports");
+        if (num_input_ports < 1) num_input_ports = 1;
+        for (uint32_t i = 1; i < num_input_ports; i++) {
+            auto *p = new vp::IoSlave();
+            p->set_req_meth(&InsituCacheCore::req_handler);
+            new_slave_port("input_" + std::to_string(i), p);
+            extra_inputs_.push_back(p);
+        }
+    }
     flush_itf_.set_req_meth(&InsituCacheCore::req_handler);   // flush TODO (Step 6); accept-as-OK stub
     new_slave_port("flush", &flush_itf_);
     refill_itf_.set_resp_meth(&InsituCacheCore::refill_resp_handler);
