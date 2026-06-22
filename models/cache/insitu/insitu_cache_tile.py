@@ -245,10 +245,11 @@ class InsituCacheTile(Component):
         self._n_remote = n_remote
         if n_remote > 0:
             for j in range(n_ppc):
-                # remote-out: xbar[j].out_(n_ctrl) → tile master 'remote_out_{j}' (to the group).
-                self.bind(self._xbars[j], f'out_{n_ctrl}', self, f'remote_out_{j}')
-                # remote-in: tile slave 'remote_in_{j}' → xbar[j].in_(n_cores) (from the group).
-                self.bind(self, f'remote_in_{j}', self._xbars[j], f'in_{n_cores}')
+                for r in range(n_remote):
+                    # remote-out: xbar[j].out_(n_ctrl+r) → tile master 'remote_out_{j}_{r}' (to the group).
+                    self.bind(self._xbars[j], f'out_{n_ctrl + r}', self, f'remote_out_{j}_{r}')
+                    # remote-in: tile slave 'remote_in_{j}_{r}' → xbar[j].in_(n_cores+r) (from the group).
+                    self.bind(self, f'remote_in_{j}_{r}', self._xbars[j], f'in_{n_cores + r}')
 
     # ---------- port factories ----------
 
@@ -268,13 +269,13 @@ class InsituCacheTile(Component):
         """Flush/invalidate trigger for controller ``ctrl`` (a write invalidates its lines)."""
         return SlaveItf(self, f'flush_{ctrl}', signature='io')
 
-    def i_REMOTE_IN(self, port_class: int) -> SlaveItf:
-        """Remote-in slave for port-class ``port_class`` (requests from other tiles to this tile's banks)."""
-        return SlaveItf(self, f'remote_in_{port_class}', signature='io')
+    def i_REMOTE_IN(self, port_class: int, slot: int = 0) -> SlaveItf:
+        """Remote-in slave for port-class ``port_class``, remote slot ``slot`` (other tiles → this tile)."""
+        return SlaveItf(self, f'remote_in_{port_class}_{slot}', signature='io')
 
-    def o_REMOTE_OUT(self, port_class: int, itf: SlaveItf):
-        """Bind this tile's remote-out master for port-class ``port_class`` (cross-tile requests out)."""
-        self.itf_bind(f'remote_out_{port_class}', itf, signature='io')
+    def o_REMOTE_OUT(self, port_class: int, slot: int, itf: SlaveItf):
+        """Bind this tile's remote-out master for port-class ``port_class``, remote slot ``slot``."""
+        self.itf_bind(f'remote_out_{port_class}_{slot}', itf, signature='io')
 
     def o_L2(self, itf: SlaveItf):
         """Bind the tile's L2 output to ``itf``.

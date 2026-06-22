@@ -24,7 +24,7 @@ class InsituCacheRemoteXbar(Component):
     """One per-port-class inter-tile router: route by target tile-id."""
 
     def __init__(self, parent: Component, name: str, *,
-                 num_tiles: int, num_cores: int, num_cache: int,
+                 num_tiles: int, num_cores: int, num_cache: int, num_remote_port_core: int = 1,
                  dynamic_offset: int = 6, addr_width: int = 32, hop_latency_cycles: int = 0):
         super().__init__(parent, name)
         self.add_sources(['cache/insitu/insitu_cache_remote_xbar.cpp'])
@@ -32,15 +32,16 @@ class InsituCacheRemoteXbar(Component):
             'num_tiles': num_tiles,
             'num_cores': num_cores,
             'num_cache': num_cache,
+            'num_remote_port_core': num_remote_port_core,
             'dynamic_offset': dynamic_offset,
             'addr_width': addr_width,
             'hop_latency_cycles': hop_latency_cycles,
         })
 
-    def i_INPUT(self, src_tile: int) -> SlaveItf:
-        """Remote-out from source tile ``src_tile``."""
-        return SlaveItf(self, f'in_{src_tile}', signature='io')
+    def i_INPUT(self, slot: int) -> SlaveItf:
+        """Input slot = src_tile*num_remote_port_core + r (a source tile's remote-out)."""
+        return SlaveItf(self, f'in_{slot}', signature='io')
 
-    def o_OUTPUT(self, tgt_tile: int, itf: SlaveItf):
-        """Bind to target tile ``tgt_tile``'s remote-in."""
-        self.itf_bind(f'out_{tgt_tile}', itf, signature='io')
+    def o_OUTPUT(self, slot: int, itf: SlaveItf):
+        """Output slot = tgt_tile*num_remote_port_core + r (bind to a target tile's remote-in)."""
+        self.itf_bind(f'out_{slot}', itf, signature='io')

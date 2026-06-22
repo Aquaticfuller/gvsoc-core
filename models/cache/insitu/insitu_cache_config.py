@@ -507,6 +507,37 @@ def make_cachepool_512_config() -> InsituCacheTileConfig:
     )
 
 
+def make_cachepool_fpu_512_config() -> InsituCacheTileConfig:
+    """Matches RTL ``config/cachepool_fpu_512.mk`` (commit f5c3ef4) — the 4-tile / 16-core CachePool
+    GROUP. Per-tile config for :class:`InsituCacheGroup` (the group clones it per tile with tile_id).
+
+    Topology (cachepool_pkg.sv): ``num_tiles=4``, ``num_cores_per_tile=4``, ``NumL1CacheCtrl=NumCores=16``
+    → 4 controllers/tile, ``NrTCDMPortsPerCore=5`` (4 Spatz VLSU + 1 Snitch/FPU scalar),
+    ``num_remote_ports_per_tile=2`` → ``NumRemotePortCore=2``.
+    Per-controller cache: 4-way × 256-set × 64 B = **64 KiB** (256 KiB/tile ÷ 4), ``L1BankFactor=2``
+    (hardcoded in the pkg; the .mk ``l1d_bank_factor=1`` is overridden), folded + hash-way + fwd-buffer.
+    ``L1CoalFactor=2``. L2: 4 channels, ``l2_interleave=16`` (used at the cluster L2 step, not group routing).
+    Line-granular bank routing (``dynamic_offset = log2(line)``) so an access never spans the granule.
+    """
+    cfg = make_cachepool_512_config()
+    # Per-controller geometry: 64 KiB (= 256 KiB/tile ÷ 4 controllers).
+    cfg.controller.num_sets = 256
+    cfg.controller.bank_factor = 2
+    # Group topology (per-tile values; InsituCacheGroup builds num_tiles of these).
+    cfg.structural_tile = True
+    cfg.num_tiles = 4
+    cfg.num_cores = 4                 # cores per tile
+    cfg.num_controllers = 4           # controllers per tile (NumL1CtrlTile = NumL1CacheCtrl/NumTiles)
+    cfg.tcdm_ports_per_core = 5
+    cfg.num_remote_port_core = 2      # num_remote_ports_per_tile=2
+    cfg.addr_width = 32
+    # Line-granular routing (the structural xbar routes a whole access to one bank; no cross-granule split).
+    cfg.interco.dynamic_offset = 6    # log2(64)
+    cfg.interco.num_inputs = cfg.num_cores * cfg.tcdm_ports_per_core
+    cfg.interco.num_outputs = cfg.num_controllers
+    return cfg
+
+
 def make_cachepool_512_conventional_config() -> InsituCacheTileConfig:
     """The opt-in **conventional** (unfolded + LRU + no forwarding-buffer) cache.
 

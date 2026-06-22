@@ -55,20 +55,24 @@ class InsituCacheGroup(Component):
             tcfg.tile_id = t
             self._tiles.append(InsituCacheTile(self, f'tile_{t}', config=tcfg))
 
-        # --- per-port-class inter-tile remote crossbars ---
+        # --- per-port-class inter-tile remote crossbars (NumInp=NumOut = num_tiles * num_remote_port_core) ---
+        n_remote = config.num_remote_port_core
         self._rxbars = []
         for j in range(n_ppc):
             self._rxbars.append(InsituCacheRemoteXbar(
                 self, f'rxbar_{j}', num_tiles=n_tiles, num_cores=cores_per_tile,
-                num_cache=ctrl_per_tile, dynamic_offset=config.interco.dynamic_offset,
-                addr_width=config.addr_width))
+                num_cache=ctrl_per_tile, num_remote_port_core=n_remote,
+                dynamic_offset=config.interco.dynamic_offset, addr_width=config.addr_width))
 
-        # --- remote wiring: tile[t].remote_out[j] → rxbar[j].in[t]; rxbar[j].out[T] → tile[T].remote_in[j] ---
+        # --- remote wiring (slot = tile*num_remote_port_core + r) ---
+        # tile[t].remote_out[j][r] → rxbar[j].in[t*nr + r]; rxbar[j].out[T*nr + r] → tile[T].remote_in[j][r].
         for j in range(n_ppc):
             for t in range(n_tiles):
-                self._tiles[t].o_REMOTE_OUT(j, self._rxbars[j].i_INPUT(t))
+                for r in range(n_remote):
+                    self._tiles[t].o_REMOTE_OUT(j, r, self._rxbars[j].i_INPUT(t * n_remote + r))
             for tgt in range(n_tiles):
-                self._rxbars[j].o_OUTPUT(tgt, self._tiles[tgt].i_REMOTE_IN(j))
+                for r in range(n_remote):
+                    self._rxbars[j].o_OUTPUT(tgt * n_remote + r, self._tiles[tgt].i_REMOTE_IN(j, r))
 
         # --- group inputs → tile inputs ---
         for p in range(n_tiles * self._tile_ports):

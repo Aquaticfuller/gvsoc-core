@@ -33,7 +33,7 @@ private:
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req, int input_id);
 
     RouteGeom geom_;
-    uint32_t  num_tiles_;
+    uint32_t  num_tiles_, nrpc_, n_slots_;
     int32_t   hop_latency_cycles_;
     std::vector<vp::IoSlave *>  inputs_;
     std::vector<vp::IoMaster *> outputs_;
@@ -44,39 +44,46 @@ InsituCacheRemoteXbar::InsituCacheRemoteXbar(vp::ComponentConf &conf) : vp::Comp
 {
     auto *cfg = this->get_js_config();
     num_tiles_          = cfg->get_child_int("num_tiles");
+    nrpc_               = cfg->get_child_int("num_remote_port_core");
+    if (nrpc_ < 1) nrpc_ = 1;
+    n_slots_            = num_tiles_ * nrpc_;    // NumInp = NumOut = NumTiles * NumRemotePortCore
     hop_latency_cycles_ = cfg->get_child_int("hop_latency_cycles");
 
-    geom_.init(/*n_cache*/cfg->get_child_int("num_cache"), /*n_remote*/1,
+    geom_.init(/*n_cache*/cfg->get_child_int("num_cache"), /*n_remote*/nrpc_,
                /*n_cores*/cfg->get_child_int("num_cores"), /*n_tiles*/num_tiles_,
                /*dyn_offset*/cfg->get_child_int("dynamic_offset"), /*addr_w*/cfg->get_child_int("addr_width"),
                /*priv_start*/0);
 
-    inputs_.resize(num_tiles_);
-    outputs_.resize(num_tiles_);
-    for (uint32_t i = 0; i < num_tiles_; i++) {
+    inputs_.resize(n_slots_);
+    outputs_.resize(n_slots_);
+    for (uint32_t i = 0; i < n_slots_; i++) {
         inputs_[i] = new vp::IoSlave();
         inputs_[i]->set_req_meth_muxed(&InsituCacheRemoteXbar::req_handler, (int)i);
         this->new_slave_port("in_" + std::to_string(i), inputs_[i]);
     }
-    for (uint32_t o = 0; o < num_tiles_; o++) {
+    for (uint32_t o = 0; o < n_slots_; o++) {
         outputs_[o] = new vp::IoMaster();
         this->new_master_port("out_" + std::to_string(o), outputs_[o]);
     }
 
     this->traces.new_trace("trace", &this->trace_, vp::DEBUG);
-    this->trace_.msg(vp::Trace::LEVEL_INFO, "InsituCacheRemoteXbar tiles=%u\n", num_tiles_);
+    this->trace_.msg(vp::Trace::LEVEL_INFO, "InsituCacheRemoteXbar tiles=%u nrpc=%u\n", num_tiles_, nrpc_);
 }
 
 vp::IoReqStatus InsituCacheRemoteXbar::req_handler(vp::Block *__this, vp::IoReq *req, int input_id)
 {
     InsituCacheRemoteXbar *_this = static_cast<InsituCacheRemoteXbar *>(__this);
-    (void)input_id;
+    // Input slot = source_tile*nrpc + r. Route to the TARGET tile (by the address TileID); within the
+    // target, pin the slot by source-tile-mod-N (RTL group.sv:285-295). The GVSoC response auto-routes
+    // back along the preserved resp-port chain, so the exact slot is a timing/contention choice only.
+    const uint32_t source = (uint32_t)input_id / _this->nrpc_;
     uint32_t target = _this->geom_.addr_tile(req->get_addr());
     if (target >= _this->num_tiles_) target = _this->num_tiles_ - 1;   // safety clamp
+    const uint32_t out = target * _this->nrpc_ + (source % _this->nrpc_);
     if (_this->hop_latency_cycles_ > 0) req->inc_latency(_this->hop_latency_cycles_);
-    _this->trace_.msg(vp::Trace::LEVEL_TRACE, "remote src=%d addr=0x%lx -> tile=%u\n",
-                      input_id, (unsigned long)req->get_addr(), target);
-    return _this->outputs_[target]->req_forward(req);
+    _this->trace_.msg(vp::Trace::LEVEL_TRACE, "remote src=%u addr=0x%lx -> tile=%u slot=%u\n",
+                      source, (unsigned long)req->get_addr(), target, out);
+    return _this->outputs_[out]->req_forward(req);
 }
 
 extern "C" vp::Component *gv_new(vp::ComponentConf &config)
