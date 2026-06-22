@@ -53,6 +53,10 @@ class InsituCacheCore(Component):
             # Multi-lane core port (RTL controller has a 5-wide core port). Default 1 = single 'input'
             # port (backward identical); the structural tile sets this to NrTCDMPortsPerCore.
             'num_input_ports': num_input_ports,
+            # Synchronous-slave (closed-loop) mode + its analytic latency knobs. Default off → async path.
+            'inline_sync_miss': config.inline_sync_miss,
+            'hit_latency_cycles': config.hit_latency_cycles,
+            'write_commit_cycles': config.write_commit_cycles,
         })
 
     def i_INPUT(self, port: int = 0) -> SlaveItf:

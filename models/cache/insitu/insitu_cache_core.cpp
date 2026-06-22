@@ -48,6 +48,7 @@ private:
 
     void schedule_tick(int64_t cycles = 1);
     void stage1_process();                 // decode + FSM + bank write
+    vp::IoReqStatus run_request_sync(vp::IoReq *req);  // synchronous-slave: resolve in-call, inc_latency, OK
     bool process_request(vp::IoReq *req);  // REQ_PROC body; returns true=done, false=stalled (retry)
     bool maybe_install_refill();           // install a ready refill (priority bank op); true if installed
     void install_refill();                 // refill block
@@ -84,6 +85,11 @@ private:
     bool functional_writethrough_;
     int32_t miss_penalty_cycles_, refill_bank_write_cycles_;
     uint32_t retr_fifo_depth_, miss_fifo_depth_, evic_fifo_depth_;
+    // synchronous-slave (closed-loop) mode
+    bool    inline_sync_ = false;
+    int32_t hit_latency_cycles_ = 0;
+    int32_t write_commit_cycles_ = 0;
+    int64_t write_commit_busy_until_ = 0;
 
     // --- state ---
     std::vector<WayMeta> meta_;            // [num_sets*num_ways]
@@ -153,6 +159,13 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
     uint32_t bank_factor = cfg->get_child_int("bank_factor");
     if (bank_factor < 1) bank_factor = 1;
 
+    // Synchronous-slave mode (closed-loop, e.g. the Spatz cluster whose VLSU rejects async resp): resolve
+    // each request in-call and return IO_REQ_OK with the latency folded in, mirroring the calibrated
+    // controller's inline_sync_miss. Default off → the async per-cycle path (open-loop calib) is unchanged.
+    inline_sync_       = cfg->get_child_bool("inline_sync_miss");
+    hit_latency_cycles_= cfg->get_child_int("hit_latency_cycles");
+    write_commit_cycles_= cfg->get_child_int("write_commit_cycles");
+
     geom_.init(cache_line_bytes_, num_ways_, num_sets_, cfg->get_child_bool("use_hash_way_select"), false);
     bank_.init(num_ways_, bank_factor);
 
@@ -220,11 +233,117 @@ bool InsituCacheCore::any_work() const
 vp::IoReqStatus InsituCacheCore::req_handler(vp::Block *__this, vp::IoReq *req)
 {
     InsituCacheCore *_this = static_cast<InsituCacheCore *>(__this);
+    // Synchronous-slave (closed-loop): resolve in-call, return IO_REQ_OK — never PENDING/DENIED, never
+    // resp()/save() (the Spatz VLSU rejects async). The async path below is the open-loop calib path.
+    if (_this->inline_sync_) return _this->run_request_sync(req);
     if (_this->in_q_.size() >= _this->in_q_cap_) return vp::IO_REQ_DENIED;  // accept queue full → backpressure
     req->save();
     _this->in_q_.push_back(req);
     _this->schedule_tick();
     return vp::IO_REQ_PENDING;
+}
+
+// ---------- synchronous-slave (closed-loop) ----------
+// Analytic one-shot, mirroring InsituCacheController::inline_sync_miss (controller.cpp:438-598): decode,
+// serve/install, fold the latency into req->inc_latency(), and return IO_REQ_OK in the same call — NO
+// save(), NO resp(), NO tick/event, NO in_q_/preread_q_/mshr_/FIFOs/refill_*_ async state. At most one
+// request is in flight (the cluster LSU is single-outstanding), so the refill needs no FIFO.
+vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
+{
+    const int64_t now = clock.get_cycles();
+    const uint64_t addr = req->get_addr();
+    const bool is_write = req->get_is_write();
+    const uint32_t set = geom_.set_index(addr);
+    WayMeta *ways = set_ways(set);
+    Decode d = decode_request(geom_, ways, addr, is_write);
+
+    // Write-commit serialization → ADDED latency on an OK (never DENY; the LSU cannot retry).
+    if (is_write && write_commit_cycles_ > 1) {
+        const int64_t accept = (write_commit_busy_until_ > now) ? write_commit_busy_until_ : now;
+        req->inc_latency(accept - now);
+        write_commit_busy_until_ = accept + write_commit_cycles_;
+    }
+
+    // --- HIT ---
+    if (d.is_hit) {
+        if (is_write) {
+            exchange_line_data(req, set, d.way, /*line_to_req=*/false);
+            functional_write_mem(req);
+            CacheStatus st = ways[d.way].status;
+            lru_update(geom_, ways, d.way, st, st);     // MRU bump
+            ways[d.way].dirty = true;
+            cnt_wr_hit_++;
+        } else {
+            exchange_line_data(req, set, d.way, /*line_to_req=*/true);
+            CacheStatus st = ways[d.way].status;
+            lru_update(geom_, ways, d.way, st, st);
+            cnt_rd_hit_++;
+        }
+        req->inc_latency(hit_latency_cycles_);
+        return vp::IO_REQ_OK;
+    }
+
+    // --- MISS (hit-pend/conflict/all-pend collapse to a miss here: single-outstanding, in-call) ---
+    uint32_t vw = d.way;
+    WayMeta &vline = ways[vw];
+    if (vline.status == VALID && vline.dirty) {
+        // copy the victim's bytes BEFORE the refill overwrites the line (controller.cpp:562-564).
+        uint64_t old_line = ((uint64_t)vline.tag << (geom_.off_bits + geom_.depth_bits)) |
+                            ((uint64_t)set << geom_.off_bits);
+        memcpy(evict_data_buf_.data(),
+               &data_[((size_t)set * num_ways_ + vw) * cache_line_bytes_], cache_line_bytes_);
+        if (evict_itf_.is_bound()) {
+            evict_req_.init();
+            evict_req_.set_addr(old_line);
+            evict_req_.set_size(cache_line_bytes_);
+            evict_req_.set_is_write(true);
+            evict_req_.set_data(evict_data_buf_.data());
+            (void)evict_itf_.req(&evict_req_);          // fire-and-forget writeback
+        }
+        cnt_evict_++;
+    }
+    CacheStatus before = vline.status;
+    vline.tag = geom_.tag_of(addr);
+    CacheStatus after = is_write ? WRITE_PEND : READ_PEND;
+    lru_update(geom_, ways, vw, before, after);         // allocate — BEFORE the status write
+    vline.status = after;
+    vline.dirty = false;
+
+    refill_req_.init();
+    refill_req_.set_addr(addr_line(addr));
+    refill_req_.set_size(cache_line_bytes_);
+    refill_req_.set_is_write(false);
+    refill_req_.set_data(refill_data_buf_.data());
+    vp::IoReqStatus rst = refill_itf_.req(&refill_req_);
+    if (rst == vp::IO_REQ_OK) {
+        const int64_t refill_lat = (int64_t)refill_req_.get_full_latency()
+                                   + refill_bank_write_cycles_ + miss_penalty_cycles_;
+        if (refill_req_.get_data() != nullptr)
+            memcpy(&data_[((size_t)set * num_ways_ + vw) * cache_line_bytes_],
+                   refill_req_.get_data(), cache_line_bytes_);
+        CacheStatus before2 = ways[vw].status;
+        lru_update(geom_, ways, vw, before2, VALID);    // complete — BEFORE the status write
+        ways[vw].status = VALID;
+        if (is_write) {
+            exchange_line_data(req, set, vw, /*line_to_req=*/false);
+            functional_write_mem(req);
+            ways[vw].dirty = true;
+            cnt_wr_miss_++;
+        } else {
+            exchange_line_data(req, set, vw, /*line_to_req=*/true);
+            cnt_rd_miss_++;
+        }
+        cnt_refill_++;
+        req->inc_latency(refill_lat);
+        return vp::IO_REQ_OK;
+    }
+    // The cluster L2 (wide_axi → SPM) answers synchronously, so this is not expected. Returning OK with
+    // the data already functionally served keeps the VLSU alive (a DENIED/PENDING would crash/hang it).
+    if (is_write) { exchange_line_data(req, set, vw, false); functional_write_mem(req); ways[vw].dirty = true; }
+    else          { exchange_line_data(req, set, vw, true); }
+    ways[vw].status = VALID;
+    req->inc_latency(refill_bank_write_cycles_ + miss_penalty_cycles_);
+    return vp::IO_REQ_OK;
 }
 
 // ---------- per-cycle tick ----------
