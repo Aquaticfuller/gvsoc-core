@@ -41,6 +41,7 @@ from cache.insitu.insitu_cache_coalescer import InsituCacheCoalescer
 from cache.insitu.insitu_cache_interco import InsituCacheInterco
 from cache.insitu.insitu_cache_par_coalescer import InsituCacheParCoalescer
 from cache.insitu.insitu_cache_xbar import InsituCacheXbar
+from cache.insitu.insitu_cache_cell_coalescer import InsituCacheCellCoalescer
 
 
 class InsituCacheTile(Component):
@@ -180,21 +181,40 @@ class InsituCacheTile(Component):
                 dynamic_offset=dyn_off, addr_width=config.addr_width,
                 enable_rotation=False))   # A1: no MSB rotation (faithful rotation + refill un-rot = A2)
 
-        # Per-core multi-lane cache cells (RTL controller has a 5-wide core port).
+        use_coal = getattr(config, 'cell_coalescer', False)
+        n_vlsu = n_ppc - 1   # lanes 0..n_ppc-2 = Spatz VLSU; the last lane (n_ppc-1) = Snitch/FPU scalar
+
+        # Per-core cache cells. A2 (cell_coalescer): the cell = par_coalescer(4 VLSU lanes) + the scalar
+        # bypass → core's 2 inputs (matches cachepool_cache_ctrl). A1: the core takes all n_ppc lanes
+        # directly (multi-lane port, no merge).
         self._ctrls = []
+        self._cellcoals = []
         for cb in range(n_ctrl):
             self._ctrls.append(InsituCacheCore(
-                self, f'ctrl_{cb}', config=config.controller, num_input_ports=n_ppc))
+                self, f'ctrl_{cb}', config=config.controller,
+                num_input_ports=(2 if use_coal else n_ppc)))
+            if use_coal:
+                self._cellcoals.append(InsituCacheCellCoalescer(
+                    self, f'coal_{cb}', num_inputs=n_vlsu,
+                    cache_line_bytes=config.controller.cache_line_bytes, word_bytes=4))
 
         # Wiring. tile i_INPUT(p) → xbar[p % n_ppc].in_(p // n_ppc)
         # (RTL cache_req[j][cb] = unmerge_req[cb*NrTCDMPortsPerCore + j], tile.sv:541-551).
         for p in range(n_cores * n_ppc):
             self.bind(self, f'in_{p}', self._xbars[p % n_ppc], f'in_{p // n_ppc}')
 
-        # xbar[lane].out_(cb) → core[cb].input_{lane}  (cb < n_ctrl = local banks).
-        for j in range(n_ppc):
-            for cb in range(n_ctrl):
-                self._xbars[j].o_OUTPUT(cb, self._ctrls[cb].i_INPUT(j))
+        # xbar outputs → cells.
+        for cb in range(n_ctrl):
+            if use_coal:
+                # VLSU lanes (xbar 0..n_vlsu-1) → coalescer[cb] → core input 0 (VLSU-aggregate);
+                # scalar lane (xbar n_ppc-1) → core input 1 (bypass).
+                for j in range(n_vlsu):
+                    self._xbars[j].o_OUTPUT(cb, self._cellcoals[cb].i_INPUT(j))
+                self._cellcoals[cb].o_OUTPUT(self._ctrls[cb].i_INPUT(0))
+                self._xbars[n_ppc - 1].o_OUTPUT(cb, self._ctrls[cb].i_INPUT(1))
+            else:
+                for j in range(n_ppc):
+                    self._xbars[j].o_OUTPUT(cb, self._ctrls[cb].i_INPUT(j))
 
         # Refill + eviction (eviction rides the refill path) fan in to the tile's o_L2 master.
         for cb in range(n_ctrl):

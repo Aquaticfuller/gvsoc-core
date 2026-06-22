@@ -406,6 +406,10 @@ class InsituCacheTileConfig:
     # + per-core multi-lane InsituCacheCore cells — instead of the flat single hashed interco. Default
     # False = the flat tile (byte-identical fallback). Implies use_structural_core for the cells.
     structural_tile: bool = False
+    # A2: insert the structural per-cell par_coalescer (4 VLSU lanes merge → 1 wide beat; scalar lane
+    # bypasses to the core's 2nd input), matching cachepool_cache_ctrl. Default False = A1 (the core's
+    # multi-lane port takes all 5 lanes directly, no merge). Only meaningful with structural_tile.
+    cell_coalescer: bool = False
     num_remote_port_core: int = 0   # remote-out/-in slots per port-class (0 = single-tile, no remote)
     num_tiles: int = 1              # NumTiles (for route.hpp partition-mode selection)
     tile_id: int = 0                # this tile's id (stamped for remote routing)
