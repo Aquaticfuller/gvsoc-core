@@ -238,6 +238,18 @@ class InsituCacheTile(Component):
             if n_ctrl > 1:
                 self.bind(self, f'flush_{cb}', self._ctrls[cb], 'flush')
 
+        # Remote ports (cross-tile sharing): per port-class j, the xbar's remote-OUT slot (output index
+        # n_ctrl) leaves the tile toward the group remote xbar; the remote-IN slot (input index n_cores)
+        # receives requests for THIS tile's banks from other tiles. Exposed only when num_remote_port_core>0
+        # (the group wires them); single-tile leaves them unbound (route_request never goes remote).
+        self._n_remote = n_remote
+        if n_remote > 0:
+            for j in range(n_ppc):
+                # remote-out: xbar[j].out_(n_ctrl) → tile master 'remote_out_{j}' (to the group).
+                self.bind(self._xbars[j], f'out_{n_ctrl}', self, f'remote_out_{j}')
+                # remote-in: tile slave 'remote_in_{j}' → xbar[j].in_(n_cores) (from the group).
+                self.bind(self, f'remote_in_{j}', self._xbars[j], f'in_{n_cores}')
+
     # ---------- port factories ----------
 
     def i_INPUT(self, port: int) -> SlaveItf:
@@ -255,6 +267,14 @@ class InsituCacheTile(Component):
     def i_FLUSH(self, ctrl: int) -> SlaveItf:
         """Flush/invalidate trigger for controller ``ctrl`` (a write invalidates its lines)."""
         return SlaveItf(self, f'flush_{ctrl}', signature='io')
+
+    def i_REMOTE_IN(self, port_class: int) -> SlaveItf:
+        """Remote-in slave for port-class ``port_class`` (requests from other tiles to this tile's banks)."""
+        return SlaveItf(self, f'remote_in_{port_class}', signature='io')
+
+    def o_REMOTE_OUT(self, port_class: int, itf: SlaveItf):
+        """Bind this tile's remote-out master for port-class ``port_class`` (cross-tile requests out)."""
+        self.itf_bind(f'remote_out_{port_class}', itf, signature='io')
 
     def o_L2(self, itf: SlaveItf):
         """Bind the tile's L2 output to ``itf``.
