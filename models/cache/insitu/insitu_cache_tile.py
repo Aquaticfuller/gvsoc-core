@@ -42,6 +42,7 @@ from cache.insitu.insitu_cache_interco import InsituCacheInterco
 from cache.insitu.insitu_cache_par_coalescer import InsituCacheParCoalescer
 from cache.insitu.insitu_cache_xbar import InsituCacheXbar
 from cache.insitu.insitu_cache_cell_coalescer import InsituCacheCellCoalescer
+from cache.insitu.insitu_cache_amo_shim import InsituCacheAmo
 
 
 class InsituCacheTile(Component):
@@ -203,18 +204,32 @@ class InsituCacheTile(Component):
         for p in range(n_cores * n_ppc):
             self.bind(self, f'in_{p}', self._xbars[p % n_ppc], f'in_{p // n_ppc}')
 
-        # xbar outputs → cells.
+        # Optional AMO/LR-SC shim on the scalar lane (j=n_ppc-1), one per cell (cachepool_tile.sv:658).
+        use_amo = getattr(config, 'amo_lane', False)
+        self._amos = []
+        if use_amo:
+            for cb in range(n_ctrl):
+                self._amos.append(InsituCacheAmo(self, f'amo_{cb}', word_bytes=4))
+
+        # xbar outputs → cells. The scalar lane (last) is the core's input 1 (with coalescer) or
+        # input n_ppc-1 (A1), routed through the AMO shim when amo_lane is set.
         for cb in range(n_ctrl):
+            scalar_core_in = 1 if use_coal else (n_ppc - 1)
             if use_coal:
-                # VLSU lanes (xbar 0..n_vlsu-1) → coalescer[cb] → core input 0 (VLSU-aggregate);
-                # scalar lane (xbar n_ppc-1) → core input 1 (bypass).
+                # VLSU lanes (xbar 0..n_vlsu-1) → coalescer[cb] → core input 0 (VLSU-aggregate).
                 for j in range(n_vlsu):
                     self._xbars[j].o_OUTPUT(cb, self._cellcoals[cb].i_INPUT(j))
                 self._cellcoals[cb].o_OUTPUT(self._ctrls[cb].i_INPUT(0))
-                self._xbars[n_ppc - 1].o_OUTPUT(cb, self._ctrls[cb].i_INPUT(1))
             else:
-                for j in range(n_ppc):
+                # A1: VLSU lanes → core inputs 0..n_ppc-2 directly (no merge).
+                for j in range(n_ppc - 1):
                     self._xbars[j].o_OUTPUT(cb, self._ctrls[cb].i_INPUT(j))
+            # scalar lane → (AMO shim →) core scalar input.
+            if use_amo:
+                self._xbars[n_ppc - 1].o_OUTPUT(cb, self._amos[cb].i_INPUT())
+                self._amos[cb].o_OUTPUT(self._ctrls[cb].i_INPUT(scalar_core_in))
+            else:
+                self._xbars[n_ppc - 1].o_OUTPUT(cb, self._ctrls[cb].i_INPUT(scalar_core_in))
 
         # Refill + eviction (eviction rides the refill path) fan in to the tile's o_L2 master.
         for cb in range(n_ctrl):

@@ -410,6 +410,10 @@ class InsituCacheTileConfig:
     # bypasses to the core's 2nd input), matching cachepool_cache_ctrl. Default False = A1 (the core's
     # multi-lane port takes all 5 lanes directly, no merge). Only meaningful with structural_tile.
     cell_coalescer: bool = False
+    # A3: insert the spatz_cache_amo / LR-SC shim on the scalar lane (j=n_ppc-1) of each cell, between
+    # the lane crossbar and the core (cachepool_tile.sv:658). READ/WRITE pass through; LR/SC/AMO handled.
+    # Default False. Only meaningful with structural_tile.
+    amo_lane: bool = False
     num_remote_port_core: int = 0   # remote-out/-in slots per port-class (0 = single-tile, no remote)
     num_tiles: int = 1              # NumTiles (for route.hpp partition-mode selection)
     tile_id: int = 0                # this tile's id (stamped for remote routing)
