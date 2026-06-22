@@ -40,6 +40,7 @@ from cache.insitu.insitu_cache_core import InsituCacheCore
 from cache.insitu.insitu_cache_coalescer import InsituCacheCoalescer
 from cache.insitu.insitu_cache_interco import InsituCacheInterco
 from cache.insitu.insitu_cache_par_coalescer import InsituCacheParCoalescer
+from cache.insitu.insitu_cache_xbar import InsituCacheXbar
 
 
 class InsituCacheTile(Component):
@@ -63,6 +64,11 @@ class InsituCacheTile(Component):
         if config is None:
             config = make_cachepool_512_config()
         self._config = config
+
+        # RTL-faithful structural tile: 5 per-port-class crossbars + per-core multi-lane cells.
+        if getattr(config, 'structural_tile', False):
+            self._build_structural_tile(config)
+            return
 
         n_ctrl = config.num_controllers
         n_ports = config.num_tcdm_ports
@@ -147,6 +153,55 @@ class InsituCacheTile(Component):
             # no flush driver, so binding an externally-undriven composite port there is skipped.
             if n_ctrl > 1:
                 self.bind(self, f'flush_{i}', self._ctrls[i], 'flush')
+
+    # ---------- structural tile ----------
+
+    def _build_structural_tile(self, config: InsituCacheTileConfig):
+        """RTL-faithful tile (cachepool_tile.sv): NrTCDMPortsPerCore per-port-class crossbars routing
+        any core's lane-j to any bank by address (shared L1), feeding per-core multi-lane cache cells.
+
+        Phase A1: 5 xbars + N multi-lane InsituCacheCore cells (no rotation, no coalescer/AMO yet — those
+        are A2/A3). Validates the per-port-class shared-L1 routing + end-to-end data correctness.
+        """
+        n_cores  = config.num_cores
+        n_ppc    = config.tcdm_ports_per_core
+        n_ctrl   = config.num_controllers
+        n_remote = config.num_remote_port_core
+        dyn_off  = config.interco.dynamic_offset
+
+        # NrTCDMPortsPerCore per-port-class crossbars (one per lane j). Each: n_cores local lane-j ports
+        # (+ remote-in) × n_ctrl local banks (+ remote-out), routed by address via insitu_cache_route.hpp.
+        self._xbars = []
+        for j in range(n_ppc):
+            self._xbars.append(InsituCacheXbar(
+                self, f'xbar_{j}',
+                num_cores=n_cores, num_cache=n_ctrl, num_remote_port=n_remote,
+                num_tiles=config.num_tiles, tile_id=config.tile_id,
+                dynamic_offset=dyn_off, addr_width=config.addr_width,
+                enable_rotation=False))   # A1: no MSB rotation (faithful rotation + refill un-rot = A2)
+
+        # Per-core multi-lane cache cells (RTL controller has a 5-wide core port).
+        self._ctrls = []
+        for cb in range(n_ctrl):
+            self._ctrls.append(InsituCacheCore(
+                self, f'ctrl_{cb}', config=config.controller, num_input_ports=n_ppc))
+
+        # Wiring. tile i_INPUT(p) → xbar[p % n_ppc].in_(p // n_ppc)
+        # (RTL cache_req[j][cb] = unmerge_req[cb*NrTCDMPortsPerCore + j], tile.sv:541-551).
+        for p in range(n_cores * n_ppc):
+            self.bind(self, f'in_{p}', self._xbars[p % n_ppc], f'in_{p // n_ppc}')
+
+        # xbar[lane].out_(cb) → core[cb].input_{lane}  (cb < n_ctrl = local banks).
+        for j in range(n_ppc):
+            for cb in range(n_ctrl):
+                self._xbars[j].o_OUTPUT(cb, self._ctrls[cb].i_INPUT(j))
+
+        # Refill + eviction (eviction rides the refill path) fan in to the tile's o_L2 master.
+        for cb in range(n_ctrl):
+            self.bind(self._ctrls[cb], 'refill', self, 'l2')
+            self.bind(self._ctrls[cb], 'evict',  self, 'l2')
+            if n_ctrl > 1:
+                self.bind(self, f'flush_{cb}', self._ctrls[cb], 'flush')
 
     # ---------- port factories ----------
 

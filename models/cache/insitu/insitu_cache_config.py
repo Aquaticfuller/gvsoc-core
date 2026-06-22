@@ -401,6 +401,15 @@ class InsituCacheTileConfig:
     # False = the calibrated controller (today). First runnable on the OPEN-LOOP calib tile only
     # (async per-cycle FSM); the cluster keeps the controller until the synchronous-slave mode lands.
     use_structural_core: bool = False
+    # Structural TILE composition (2026-06-21): when True the tile is built RTL-faithfully —
+    # NrTCDMPortsPerCore per-port-class InsituCacheXbar crossbars (shared-L1 any-core→any-bank routing)
+    # + per-core multi-lane InsituCacheCore cells — instead of the flat single hashed interco. Default
+    # False = the flat tile (byte-identical fallback). Implies use_structural_core for the cells.
+    structural_tile: bool = False
+    num_remote_port_core: int = 0   # remote-out/-in slots per port-class (0 = single-tile, no remote)
+    num_tiles: int = 1              # NumTiles (for route.hpp partition-mode selection)
+    tile_id: int = 0                # this tile's id (stamped for remote routing)
+    addr_width: int = 32            # TCDM address width (route.hpp field positions)
     controller: InsituCacheControllerConfig = field(
         default_factory=InsituCacheControllerConfig)
     coalescer: InsituCacheCoalescerConfig = field(
