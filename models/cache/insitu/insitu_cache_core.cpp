@@ -61,7 +61,15 @@ private:
         if (req->get_data() == nullptr) return;
         uint32_t off = (uint32_t)(req->get_addr() & (cache_line_bytes_ - 1));
         uint32_t n = (uint32_t)req->get_size();
-        if (off + n > cache_line_bytes_) n = cache_line_bytes_ - off;
+        if (off + n > cache_line_bytes_) {
+            static int _xl_warns = 0;
+            if (_xl_warns < 12) {
+                fprintf(stderr, "[XLINE] cross-line access addr=0x%lx size=%u off=%u (line=%u) %s -> TRUNCATED\n",
+                        (unsigned long)req->get_addr(), n, off, cache_line_bytes_, line_to_req ? "rd" : "wr");
+                _xl_warns++;
+            }
+            n = cache_line_bytes_ - off;
+        }
         uint8_t *line = &data_[((size_t)set * num_ways_ + (uint32_t)way) * cache_line_bytes_ + off];
         if (line_to_req) memcpy(req->get_data(), line, n);
         else             memcpy(line, req->get_data(), n);
