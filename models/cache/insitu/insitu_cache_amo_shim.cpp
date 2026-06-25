@@ -70,6 +70,13 @@ private:
     // single in-flight AMO/SC transaction (the scalar lane is single-outstanding → atomic).
     enum Phase { IDLE, AMO_READ, AMO_WRITE, SC_WRITE };
     Phase    phase_ = IDLE;
+    // Synchronous-slave cache (cachepool run_request_sync): the sub-read/sub-write to the core complete
+    // in-call (req returns IO_REQ_OK, not PENDING), so the whole RMW/SC resolves INSIDE req_handler. In that
+    // case the shim must return IO_REQ_OK (the result is already written into the upstream req's data) and
+    // must NOT call resp() — calling resp() and then returning PENDING double-completes the request (SIGABRT).
+    // On the async cache (Spatz controller) the sub-ops return PENDING and resp() fires later (PENDING path).
+    bool     in_sync_call_ = false;
+    bool     sync_completed_ = false;
     vp::IoReq *orig_ = nullptr;   // the held upstream AMO/SC request
     uint8_t  amo_op_ = AMO_NONE;
     uint64_t amo_addr_ = 0;
@@ -135,9 +142,11 @@ vp::IoReqStatus InsituCacheAmo::req_handler(vp::Block *__this, vp::IoReq *req)
         _this->scratch_.set_size(req->get_size());
         _this->scratch_.set_is_write(true);
         _this->scratch_.set_data(req->get_data());   // the SC store data
+        _this->in_sync_call_ = true; _this->sync_completed_ = false;
         vp::IoReqStatus st = _this->output_.req(&_this->scratch_);
         if (st == vp::IO_REQ_OK) { resp_handler(_this, &_this->scratch_); }
-        return vp::IO_REQ_PENDING;
+        _this->in_sync_call_ = false;
+        return _this->sync_completed_ ? vp::IO_REQ_OK : vp::IO_REQ_PENDING;
     }
 
     // --- true AMO: read-modify-write ---
@@ -151,9 +160,11 @@ vp::IoReqStatus InsituCacheAmo::req_handler(vp::Block *__this, vp::IoReq *req)
     _this->scratch_.set_size(req->get_size());
     _this->scratch_.set_is_write(false);
     _this->scratch_.set_data(_this->scratch_buf_);
+    _this->in_sync_call_ = true; _this->sync_completed_ = false;
     vp::IoReqStatus st = _this->output_.req(&_this->scratch_);
     if (st == vp::IO_REQ_OK) { resp_handler(_this, &_this->scratch_); }
-    return vp::IO_REQ_PENDING;
+    _this->in_sync_call_ = false;
+    return _this->sync_completed_ ? vp::IO_REQ_OK : vp::IO_REQ_PENDING;
 }
 
 void InsituCacheAmo::resp_handler(vp::Block *__this, vp::IoReq *req)
@@ -184,7 +195,13 @@ void InsituCacheAmo::resp_handler(vp::Block *__this, vp::IoReq *req)
     }
     _this->phase_ = IDLE;
     _this->orig_ = nullptr;
-    if (orig != nullptr) orig->get_resp_port()->resp(orig);
+    if (_this->in_sync_call_) {
+        // resolved inside req_handler (sync cache): tell it to return IO_REQ_OK; do NOT resp() (the result
+        // is already in orig's data buffer). resp()+PENDING would double-complete the upstream request.
+        _this->sync_completed_ = true;
+    } else if (orig != nullptr) {
+        orig->get_resp_port()->resp(orig);
+    }
 }
 
 extern "C" vp::Component *gv_new(vp::ComponentConf &config)
