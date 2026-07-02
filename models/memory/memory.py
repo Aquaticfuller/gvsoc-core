@@ -52,14 +52,6 @@ class Memory(gvsoc.systree.Component):
         should be set to True only if needed.
     latency: int
         Specify extra latency which will be added to any incoming request.
-    memcheck_id: int
-        If this memory is used to track buffer overflow, this gives the global memory check id.
-    memcheck_base: int
-        Absolute base of memory where buffer overflow is tracked.
-    memcheck_virtual_base: int
-        Absolute virtual base of allocated buffers.
-    memcheck_expansion_factor: int
-        Extra size used to track buffer overflow.
     truncate_size: int
         If non-zero, incoming request addresses are masked with (truncate_size - 1)
         before accessing the backing array. Lets the caller wrap or fold the incoming
@@ -68,8 +60,7 @@ class Memory(gvsoc.systree.Component):
     """
     def __init__(self, parent: gvsoc.systree.Component, name: str, size: int=0, width_log2: int=-1,
             stim_file: str=None, power_trigger: bool=False,
-            align: int=0, atomics: bool=False, latency=0, memcheck_id: int=-1, memcheck_base: int=0,
-            memcheck_virtual_base: int=0, memcheck_expansion_factor: int=5, init=True,
+            align: int=0, atomics: bool=False, latency=0, init=True,
             truncate_size: int=0,
             attributes: MemoryConfig | None=None, config: MemoryConfig | None=None):
 
@@ -98,10 +89,6 @@ class Memory(gvsoc.systree.Component):
             'width_bits': width_log2,
             'align': align,
             'latency': latency if attributes is None else attributes.latency,
-            'memcheck_id': memcheck_id,
-            'memcheck_base': memcheck_base,
-            'memcheck_virtual_base': memcheck_virtual_base,
-            'memcheck_expansion_factor': memcheck_expansion_factor,
             'truncate_size': truncate_size,
         })
 

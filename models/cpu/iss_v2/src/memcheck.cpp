@@ -19,61 +19,68 @@
  * Authors: Germain Haugou, GreenWaves Technologies (germain.haugou@greenwaves-technologies.com)
  */
 
-#include "cpu/iss/include/iss.hpp"
+#include "cpu/iss_v2/include/iss.hpp"
 #include "vp/memcheck.hpp"
 
 
-
-Memcheck::Memcheck(IssWrapper &top, Iss &iss)
-: top(top), iss(iss)
+Memcheck::Memcheck(Iss &iss)
+: iss(iss)
 {
-    top.traces.new_trace("memcheck", &this->trace, vp::DEBUG);
+    iss.traces.new_trace("memcheck", &this->trace, vp::DEBUG);
 }
 
 iss_reg_t Memcheck::mem_alloc(iss_reg_t mem_id, iss_reg_t ptr, iss_reg_t size)
 {
-    if (this->iss.top.traces.get_trace_engine()->is_memcheck_enabled())
+    if (this->iss.traces.get_trace_engine()->is_memcheck_enabled())
     {
-        this->trace.msg(vp::Trace::LEVEL_INFO, "Memory alloc (id: %d, ptr: 0x%x, size: 0x%x)\n",
-            mem_id, ptr, size);
+        uint64_t pc = this->iss.exec.current_insn;
+        uint64_t ra = this->iss.regfile.get_reg_untimed(1);
 
-        iss_reg_t virtual_ptr = this->top.get_memcheck()->alloc(mem_id, ptr, size);
+        uint32_t id = this->iss.get_memcheck()->alloc(mem_id, ptr, size, pc, ra);
 
-        if (virtual_ptr == 0)
+        if (id == 0)
         {
-            this->trace.force_warning("Trying to alloc from invalid memory (id: %d)\n", mem_id);
+            this->trace.force_warning(
+                "Allocating from an undeclared memcheck region (mem_id: %d, ptr: 0x%lx)\n",
+                (int)mem_id, (uint64_t)ptr);
             return ptr;
         }
 
-        this->trace.msg(vp::Trace::LEVEL_INFO, "Translated to virtual address (id: %d, virtual_ptr: 0x%x)\n",
-            mem_id, virtual_ptr);
+        this->trace.msg(vp::Trace::LEVEL_INFO,
+            "Memory alloc (mem_id: %d, ptr: 0x%lx, size: 0x%lx, buffer_id: %u)\n",
+            (int)mem_id, (uint64_t)ptr, (uint64_t)size, id);
 
-        return virtual_ptr;
+        // Attach the new buffer to the register receiving the returned pointer
+        this->iss.regfile.memcheck_set_valid(10, true);
+        this->iss.regfile.memcheck_set_id(10, id);
     }
 
     return ptr;
 }
 
-iss_reg_t Memcheck::mem_free(iss_reg_t mem_id, iss_reg_t virtual_ptr, iss_reg_t size)
+iss_reg_t Memcheck::mem_free(iss_reg_t mem_id, iss_reg_t ptr, iss_reg_t size)
 {
-    if (this->iss.top.traces.get_trace_engine()->is_memcheck_enabled())
+    if (this->iss.traces.get_trace_engine()->is_memcheck_enabled())
     {
-        this->trace.msg(vp::Trace::LEVEL_INFO, "Memory free (id: %d, ptr: 0x%x, size: 0x%x)\n",
-            mem_id, virtual_ptr, size);
+        uint64_t pc = this->iss.exec.current_insn;
+        uint64_t ra = this->iss.regfile.get_reg_untimed(1);
 
-        iss_reg_t ptr = this->top.get_memcheck()->free(mem_id, virtual_ptr, size);
+        uint32_t id = this->iss.get_memcheck()->free(mem_id, ptr, size, pc, ra);
 
-        if (ptr == 0)
+        if (id == 0)
         {
-            this->trace.force_warning("Trying to free from invalid memory (id: %d)\n", mem_id);
-            return virtual_ptr;
+            this->trace.force_warning(
+                "Freeing an unknown buffer, double free or invalid free "
+                "(mem_id: %d, ptr: 0x%lx)\n", (int)mem_id, (uint64_t)ptr);
+            return ptr;
         }
 
-        this->trace.msg(vp::Trace::LEVEL_INFO, "Translated to physical address (id: %d, ptr: 0x%x)\n",
-            mem_id, ptr);
+        this->trace.msg(vp::Trace::LEVEL_INFO,
+            "Memory free (mem_id: %d, ptr: 0x%lx, size: 0x%lx, buffer_id: %u)\n",
+            (int)mem_id, (uint64_t)ptr, (uint64_t)size, id);
 
-        return ptr;
+        this->iss.regfile.memcheck_set_valid(10, true);
     }
 
-    return virtual_ptr;
+    return ptr;
 }

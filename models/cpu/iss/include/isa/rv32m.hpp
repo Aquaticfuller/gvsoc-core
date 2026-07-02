@@ -26,8 +26,7 @@ static inline iss_reg_t mul_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
     // Since multiplication can change any bit, mark destination as invalid as soon as input register
     // has 1 bit invalid
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     REG_SET(0, LIB_CALL2(lib_MULU, REG_GET(0), REG_GET(1)));
     #ifdef CONFIG_GVSOC_ISS_SNITCH
@@ -40,8 +39,7 @@ static inline iss_reg_t mulh_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
     // Since multiplication can change any bit, mark destination as invalid as soon as input register
     // has 1 bit invalid
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     REG_SET(0, ((iss_lsim_t)(iss_sim_t)REG_GET(0) * (iss_lsim_t)(iss_sim_t)REG_GET(1)) >> ISS_REG_WIDTH);
     #ifdef CONFIG_GVSOC_ISS_SNITCH
@@ -54,8 +52,7 @@ static inline iss_reg_t mulhsu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
     // Since multiplication can change any bit, mark destination as invalid as soon as input register
     // has 1 bit invalid
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     REG_SET(0, ((iss_lsim_t)(iss_sim_t)REG_GET(0) * (iss_uim_t)REG_GET(1)) >> ISS_REG_WIDTH);
     #ifdef CONFIG_GVSOC_ISS_SNITCH
@@ -68,8 +65,7 @@ static inline iss_reg_t mulhu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
     // Since multiplication can change any bit, mark destination as invalid as soon as input register
     // has 1 bit invalid
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     REG_SET(0, ((iss_luim_t)REG_GET(0) * (iss_luim_t)REG_GET(1)) >> ISS_REG_WIDTH);
     #ifdef CONFIG_GVSOC_ISS_SNITCH
@@ -82,8 +78,7 @@ static inline iss_reg_t div_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
     // Since division can change any bit, mark destination as invalid as soon as input register
     // has 1 bit invalid
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     iss_sim_t divider = REG_GET(1);
     iss_sim_t dividend = REG_GET(0);
@@ -147,8 +142,7 @@ static inline iss_reg_t divu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
     // Since division can change any bit, mark destination as invalid as soon as input register
     // has 1 bit invalid
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     iss_uim_t divider = REG_GET(1);
     iss_uim_t dividend = REG_GET(0);
@@ -189,8 +183,7 @@ static inline iss_reg_t rem_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
     // Since remainder can change any bit, mark destination as invalid as soon as input register
     // has 1 bit invalid
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     iss_sim_t divider = REG_GET(1);
     iss_sim_t dividend = REG_GET(0);
@@ -254,8 +247,7 @@ static inline iss_reg_t remu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
     // Since remainder can change any bit, mark destination as invalid as soon as input register
     // has 1 bit invalid
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     iss_uim_t divider = REG_GET(1);
     iss_uim_t dividend = REG_GET(0);

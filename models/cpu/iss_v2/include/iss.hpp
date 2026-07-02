@@ -27,6 +27,7 @@
 #include <cpu/iss_v2/include/trace.hpp>
 #include <cpu/iss_v2/include/syscalls.hpp>
 #include <cpu/iss_v2/include/gdbserver.hpp>
+#include <cpu/iss_v2/include/memcheck.hpp>
 #ifdef CONFIG_ISS_HAS_VECTOR
 #include <cpu/iss_v2/include/vector.hpp>
 #endif
@@ -64,6 +65,7 @@ public:
     Trace trace;
     Syscalls syscalls;
     Gdbserver gdbserver;
+    Memcheck memcheck;
 #ifdef CONFIG_ISS_HAS_VECTOR
     Vector vector;
 #endif

@@ -403,8 +403,7 @@ static inline iss_reg_t LB_RR_POSTINC_exec(Iss *iss, iss_insn_t *insn, iss_reg_t
     // a memcheck fail
     iss->regfile.memcheck_access_reg(REG_IN(0));
     // Since input register is incremented, whole register becomes invalid if any bit is invalid
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_IN(0), REG_IN(0), REG_IN(1));
 
     iss_reg_t new_val = REG_GET(0) + REG_GET(1);
     if (iss->lsu.load_signed_perf<int8_t>(insn, REG_GET(0), 1, REG_OUT(0)))
@@ -433,8 +432,7 @@ static inline iss_reg_t LH_RR_POSTINC_exec(Iss *iss, iss_insn_t *insn, iss_reg_t
     // a memcheck fail
     iss->regfile.memcheck_access_reg(REG_IN(0));
     // Since input register is incremented, whole register becomes invalid if any bit is invalid
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_IN(0), REG_IN(0), REG_IN(1));
 
     iss_reg_t new_val = REG_GET(0) + REG_GET(1);
     if (iss->lsu.load_signed_perf<int16_t>(insn, REG_GET(0), 2, REG_OUT(0)))
@@ -463,8 +461,7 @@ static inline iss_reg_t LW_RR_POSTINC_exec(Iss *iss, iss_insn_t *insn, iss_reg_t
     // a memcheck fail
     iss->regfile.memcheck_access_reg(REG_IN(0));
     // Since input register is incremented, whole register becomes invalid if any bit is invalid
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_IN(0), REG_IN(0), REG_IN(1));
 
     iss_reg_t new_val = REG_GET(0) + REG_GET(1);
     if (iss->lsu.load_signed_perf<int32_t>(insn, REG_GET(0), 4, REG_OUT(0)))
@@ -493,8 +490,7 @@ static inline iss_reg_t LBU_RR_POSTINC_exec(Iss *iss, iss_insn_t *insn, iss_reg_
     // a memcheck fail
     iss->regfile.memcheck_access_reg(REG_IN(0));
     // Since input register is incremented, whole register becomes invalid if any bit is invalid
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_IN(0), REG_IN(0), REG_IN(1));
 
     iss_reg_t new_val = REG_GET(0) + REG_GET(1);
     iss->lsu.stack_access_check(REG_IN(0), REG_GET(0));
@@ -524,8 +520,7 @@ static inline iss_reg_t LHU_RR_POSTINC_exec(Iss *iss, iss_insn_t *insn, iss_reg_
     // a memcheck fail
     iss->regfile.memcheck_access_reg(REG_IN(0));
     // Since input register is incremented, whole register becomes invalid if any bit is invalid
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_IN(0), REG_IN(0), REG_IN(1));
 
     iss_reg_t new_val = REG_GET(0) + REG_GET(1);
     iss->lsu.stack_access_check(REG_IN(0), REG_GET(0));
@@ -555,8 +550,7 @@ static inline iss_reg_t SB_RR_POSTINC_exec(Iss *iss, iss_insn_t *insn, iss_reg_t
     // a memcheck fail
     iss->regfile.memcheck_access_reg(REG_IN(0));
     // Since input register is incremented, whole register becomes invalid if any bit is invalid
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(2));
+    iss->regfile.memcheck_merge2(REG_IN(0), REG_IN(0), REG_IN(2));
 
     iss_reg_t new_val = REG_GET(0) + REG_GET(2);
     iss->lsu.stack_access_check(REG_OUT(0), REG_GET(0));
@@ -586,8 +580,7 @@ static inline iss_reg_t SH_RR_POSTINC_exec(Iss *iss, iss_insn_t *insn, iss_reg_t
     // a memcheck fail
     iss->regfile.memcheck_access_reg(REG_IN(0));
     // Since input register is incremented, whole register becomes invalid if any bit is invalid
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(2));
+    iss->regfile.memcheck_merge2(REG_IN(0), REG_IN(0), REG_IN(2));
 
     iss_reg_t new_val = REG_GET(0) + REG_GET(2);
     iss->lsu.stack_access_check(REG_OUT(0), REG_GET(0));
@@ -617,8 +610,7 @@ static inline iss_reg_t SW_RR_POSTINC_exec(Iss *iss, iss_insn_t *insn, iss_reg_t
     // a memcheck fail
     iss->regfile.memcheck_access_reg(REG_IN(0));
     // Since input register is incremented, whole register becomes invalid if any bit is invalid
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_IN(0), REG_IN(2));
+    iss->regfile.memcheck_merge2(REG_IN(0), REG_IN(0), REG_IN(2));
 
     iss_reg_t new_val = REG_GET(0) + REG_GET(2);
     iss->lsu.stack_access_check(REG_OUT(0), REG_GET(0));
@@ -656,8 +648,7 @@ static inline iss_reg_t p_sletu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t p_min_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     REG_SET(0, LIB_CALL2(lib_MINS, REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
@@ -665,8 +656,7 @@ static inline iss_reg_t p_min_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t p_minu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     REG_SET(0, LIB_CALL2(lib_MINU, REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
@@ -674,8 +664,7 @@ static inline iss_reg_t p_minu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t p_max_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     REG_SET(0, LIB_CALL2(lib_MAXS, REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
@@ -683,8 +672,7 @@ static inline iss_reg_t p_max_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t p_maxu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     REG_SET(0, LIB_CALL2(lib_MAXU, REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
@@ -1083,6 +1071,9 @@ static inline void iss_handle_elw(Iss *iss, iss_insn_t *insn, iss_reg_t pc, iss_
 
 static inline iss_reg_t p_elw_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
+    // The whole register is checked for validity since any invalid bit can give
+    // a memcheck fail
+    iss->regfile.memcheck_access_reg(REG_IN(0));
 #if defined(CONFIG_GVSOC_ISS_ELW)
     // Event load: a regular load whose park puts the whole core to sleep
     // (clock-gated) until the event unit answers or an interrupt replays
@@ -1111,16 +1102,14 @@ static inline iss_reg_t p_elw_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 #define PV_OP_RS_EXEC(insn_name, lib_name)                                                         \
     static inline iss_reg_t pv_##insn_name##_h_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)                  \
     {                                                                                              \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_int16_t_to_int32_t, REG_GET(0), REG_GET(1)));    \
         return iss_insn_next(iss, insn, pc);                                                                         \
     }                                                                                              \
                                                                                                    \
     static inline iss_reg_t pv_##insn_name##_sc_h_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)               \
     {                                                                                              \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_SC_int16_t_to_int32_t, REG_GET(0), REG_GET(1))); \
         return iss_insn_next(iss, insn, pc);                                                                         \
     }                                                                                              \
@@ -1134,16 +1123,14 @@ static inline iss_reg_t p_elw_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
                                                                                                    \
     static inline iss_reg_t pv_##insn_name##_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)                  \
     {                                                                                              \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_int8_t_to_int32_t, REG_GET(0), REG_GET(1)));     \
         return iss_insn_next(iss, insn, pc);                                                                         \
     }                                                                                              \
                                                                                                    \
     static inline iss_reg_t pv_##insn_name##_sc_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)               \
     {                                                                                              \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_SC_int8_t_to_int32_t, REG_GET(0), REG_GET(1)));  \
         return iss_insn_next(iss, insn, pc);                                                                         \
     }                                                                                              \
@@ -1158,40 +1145,35 @@ static inline iss_reg_t p_elw_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 #define PV_OP_RU_EXEC(insn_name, lib_name)                                                           \
     static inline iss_reg_t pv_##insn_name##_h_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)                    \
     {                                                                                                \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_uint16_t_to_uint32_t, REG_GET(0), REG_GET(1)));    \
         return iss_insn_next(iss, insn, pc);                                                                           \
     }                                                                                                \
                                                                                                      \
     static inline iss_reg_t pv_##insn_name##_sc_h_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)                 \
     {                                                                                                \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_SC_uint16_t_to_uint32_t, REG_GET(0), REG_GET(1))); \
         return iss_insn_next(iss, insn, pc);                                                                           \
     }                                                                                                \
                                                                                                      \
     static inline iss_reg_t pv_##insn_name##_sci_h_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)                \
     {                                                                                                \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_SC_uint16_t_to_uint32_t, REG_GET(0), UIM_GET(0))); \
         return iss_insn_next(iss, insn, pc);                                                                           \
     }                                                                                                \
                                                                                                      \
     static inline iss_reg_t pv_##insn_name##_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)                    \
     {                                                                                                \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_uint8_t_to_uint32_t, REG_GET(0), REG_GET(1)));     \
         return iss_insn_next(iss, insn, pc);                                                                           \
     }                                                                                                \
                                                                                                      \
     static inline iss_reg_t pv_##insn_name##_sc_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)                 \
     {                                                                                                \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_SC_uint8_t_to_uint32_t, REG_GET(0), REG_GET(1)));  \
         return iss_insn_next(iss, insn, pc);                                                                           \
     }                                                                                                \
@@ -1206,16 +1188,14 @@ static inline iss_reg_t p_elw_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 #define PV_OP_RS_EXEC2(insn_name, lib_name)                                           \
     static inline iss_reg_t pv_##insn_name##_h_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)     \
     {                                                                                 \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_16, REG_GET(0), REG_GET(1)));       \
         return iss_insn_next(iss, insn, pc);                                                            \
     }                                                                                 \
                                                                                       \
     static inline iss_reg_t pv_##insn_name##_h_sc_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)  \
     {                                                                                 \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_SC_16, REG_GET(0), REG_GET(1)));    \
         return iss_insn_next(iss, insn, pc);                                                            \
     }                                                                                 \
@@ -1229,16 +1209,14 @@ static inline iss_reg_t p_elw_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
                                                                                       \
     static inline iss_reg_t pv_##insn_name##_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)     \
     {                                                                                 \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_8, REG_GET(0), REG_GET(1)));        \
         return iss_insn_next(iss, insn, pc);                                                            \
     }                                                                                 \
                                                                                       \
     static inline iss_reg_t pv_##insn_name##_b_sc_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)  \
     {                                                                                 \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_SC_8, REG_GET(0), REG_GET(1)));     \
         return iss_insn_next(iss, insn, pc);                                                            \
     }                                                                                 \
@@ -1253,16 +1231,14 @@ static inline iss_reg_t p_elw_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 #define PV_OP_RU_EXEC2(insn_name, lib_name)                                           \
     static inline iss_reg_t pv_##insn_name##_h_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)     \
     {                                                                                 \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_16, REG_GET(0), REG_GET(1)));       \
         return iss_insn_next(iss, insn, pc);                                                            \
     }                                                                                 \
                                                                                       \
     static inline iss_reg_t pv_##insn_name##_h_sc_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)  \
     {                                                                                 \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_SC_16, REG_GET(0), REG_GET(1)));    \
         return iss_insn_next(iss, insn, pc);                                                            \
     }                                                                                 \
@@ -1276,16 +1252,14 @@ static inline iss_reg_t p_elw_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
                                                                                       \
     static inline iss_reg_t pv_##insn_name##_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)     \
     {                                                                                 \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_8, REG_GET(0), REG_GET(1)));        \
         return iss_insn_next(iss, insn, pc);                                                            \
     }                                                                                 \
                                                                                       \
     static inline iss_reg_t pv_##insn_name##_b_sc_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)  \
     {                                                                                 \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL2(lib_VEC_##lib_name##_SC_8, REG_GET(0), REG_GET(1)));     \
         return iss_insn_next(iss, insn, pc);                                                            \
     }                                                                                 \
@@ -1300,52 +1274,42 @@ static inline iss_reg_t p_elw_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 #define PV_OP_RRS_EXEC2(insn_name, lib_name)                                                   \
     static inline iss_reg_t pv_##insn_name##_h_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)              \
     {                                                                                          \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));                                        \
+        iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2)); \
         REG_SET(0, LIB_CALL3(lib_VEC_##lib_name##_16, REG_GET(2), REG_GET(0), REG_GET(1)));    \
         return iss_insn_next(iss, insn, pc);                                                                     \
     }                                                                                          \
                                                                                                \
     static inline iss_reg_t pv_##insn_name##_h_sc_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)           \
     {                                                                                          \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));                                        \
+        iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2)); \
         REG_SET(0, LIB_CALL3(lib_VEC_##lib_name##_SC_16, REG_GET(2), REG_GET(0), REG_GET(1))); \
         return iss_insn_next(iss, insn, pc);                                                                     \
     }                                                                                          \
                                                                                                \
     static inline iss_reg_t pv_##insn_name##_h_sci_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)          \
     {                                                                                          \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL3(lib_VEC_##lib_name##_SC_16, REG_GET(0), REG_GET(1), SIM_GET(0))); \
         return iss_insn_next(iss, insn, pc);                                                                     \
     }                                                                                          \
                                                                                                \
     static inline iss_reg_t pv_##insn_name##_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)              \
     {                                                                                          \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));                                        \
+        iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2)); \
         REG_SET(0, LIB_CALL3(lib_VEC_##lib_name##_8, REG_GET(2), REG_GET(0), REG_GET(1)));     \
         return iss_insn_next(iss, insn, pc);                                                                     \
     }                                                                                          \
                                                                                                \
     static inline iss_reg_t pv_##insn_name##_b_sc_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)           \
     {                                                                                          \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));                                        \
+        iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2)); \
         REG_SET(0, LIB_CALL3(lib_VEC_##lib_name##_SC_8, REG_GET(2), REG_GET(0), REG_GET(1)));  \
         return iss_insn_next(iss, insn, pc);                                                                     \
     }                                                                                          \
                                                                                                \
     static inline iss_reg_t pv_##insn_name##_b_sci_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)          \
     {                                                                                          \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL3(lib_VEC_##lib_name##_SC_8, REG_GET(0), REG_GET(1), SIM_GET(0)));  \
         return iss_insn_next(iss, insn, pc);                                                                     \
     }
@@ -1353,52 +1317,42 @@ static inline iss_reg_t p_elw_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 #define PV_OP_RRU_EXEC2(insn_name, lib_name)                                                   \
     static inline iss_reg_t pv_##insn_name##_h_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)              \
     {                                                                                          \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));                                        \
+        iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2)); \
         REG_SET(0, LIB_CALL3(lib_VEC_##lib_name##_16, REG_GET(2), REG_GET(0), REG_GET(1)));    \
         return iss_insn_next(iss, insn, pc);                                                                     \
     }                                                                                          \
                                                                                                \
     static inline iss_reg_t pv_##insn_name##_h_sc_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)           \
     {                                                                                          \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));                                        \
+        iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2)); \
         REG_SET(0, LIB_CALL3(lib_VEC_##lib_name##_SC_16, REG_GET(2), REG_GET(0), REG_GET(1))); \
         return iss_insn_next(iss, insn, pc);                                                                     \
     }                                                                                          \
                                                                                                \
     static inline iss_reg_t pv_##insn_name##_h_sci_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)          \
     {                                                                                          \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL3(lib_VEC_##lib_name##_SC_16, REG_GET(0), REG_GET(1), UIM_GET(0))); \
         return iss_insn_next(iss, insn, pc);                                                                     \
     }                                                                                          \
                                                                                                \
     static inline iss_reg_t pv_##insn_name##_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)              \
     {                                                                                          \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));                                        \
+        iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2)); \
         REG_SET(0, LIB_CALL3(lib_VEC_##lib_name##_8, REG_GET(2), REG_GET(0), REG_GET(1)));     \
         return iss_insn_next(iss, insn, pc);                                                                     \
     }                                                                                          \
                                                                                                \
     static inline iss_reg_t pv_##insn_name##_b_sc_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)           \
     {                                                                                          \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));                                        \
+        iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2)); \
         REG_SET(0, LIB_CALL3(lib_VEC_##lib_name##_SC_8, REG_GET(2), REG_GET(0), REG_GET(1)));  \
         return iss_insn_next(iss, insn, pc);                                                                     \
     }                                                                                          \
                                                                                                \
     static inline iss_reg_t pv_##insn_name##_b_sci_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)          \
     {                                                                                          \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));                                        \
-        iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));                                        \
+        iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1)); \
         REG_SET(0, LIB_CALL3(lib_VEC_##lib_name##_SC_8, REG_GET(0), REG_GET(1), UIM_GET(0)));  \
         return iss_insn_next(iss, insn, pc);                                                                     \
     }
@@ -1478,16 +1432,14 @@ static inline iss_reg_t pv_extractu_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t
 
 static inline iss_reg_t pv_insert_h_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_VEC_INS_16, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t pv_insert_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_VEC_INS_8, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
@@ -1520,8 +1472,7 @@ static inline iss_reg_t pv_shuffle_h_sci_exec(Iss *iss, iss_insn_t *insn, iss_re
 
 static inline iss_reg_t pv_shuffle_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL2(lib_VEC_SHUFFLE_8, REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
 }
@@ -1556,44 +1507,35 @@ static inline iss_reg_t pv_shufflei3_b_sci_exec(Iss *iss, iss_insn_t *insn, iss_
 
 static inline iss_reg_t pv_shuffle2_h_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_VEC_SHUFFLE2_16, REG_GET(0), REG_GET(1), REG_GET(2)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t pv_shuffle2_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_VEC_SHUFFLE2_8, REG_GET(0), REG_GET(1), REG_GET(2)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t pv_pack_h_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL2(lib_VEC_PACK_SC_16, REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t pv_packhi_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_VEC_PACKHI_SC_8, REG_GET(0), REG_GET(1), REG_GET(2)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t pv_packlo_b_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_VEC_PACKLO_SC_8, REG_GET(0), REG_GET(1), REG_GET(2)));
     return iss_insn_next(iss, insn, pc);
 }
@@ -1686,366 +1628,301 @@ static inline iss_reg_t p_beqimm_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t p_mac_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_MAC, REG_GET(2), REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_msu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_MSU, REG_GET(2), REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_mul_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL2(lib_MULS, REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_muls_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL2(lib_MUL_SL_SL, REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_mulhhs_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL2(lib_MUL_SH_SH, REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_mulsN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_MUL_SL_SL_NR, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_mulhhsN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_MUL_SH_SH_NR, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_mulsNR_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_MUL_SL_SL_NR_R, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_mulhhsNR_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_MUL_SH_SH_NR_R, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_mulu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL2(lib_MUL_ZL_ZL, REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_mulhhu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL2(lib_MUL_ZH_ZH, REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_muluN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_MUL_ZL_ZL_NR, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_mulhhuN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_MUL_ZH_ZH_NR, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_muluNR_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_MUL_ZL_ZL_NR_R, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_mulhhuNR_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_MUL_ZH_ZH_NR_R, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_macs_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_MAC_SL_SL, REG_GET(2), REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_machhs_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_MAC_SH_SH, REG_GET(2), REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_macsN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL4(lib_MAC_SL_SL_NR, REG_GET(2), REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_machhsN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL4(lib_MAC_SH_SH_NR, REG_GET(2), REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_macsNR_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL4(lib_MAC_SL_SL_NR_R, REG_GET(2), REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_machhsNR_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL4(lib_MAC_SH_SH_NR_R, REG_GET(2), REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_macu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_MAC_ZL_ZL, REG_GET(2), REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_machhu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_MAC_ZH_ZH, REG_GET(2), REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_macuN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL4(lib_MAC_ZL_ZL_NR, REG_GET(2), REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_machhuN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL4(lib_MAC_ZH_ZH_NR, REG_GET(2), REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_macuNR_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL4(lib_MAC_ZL_ZL_NR_R, REG_GET(2), REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_machhuNR_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL4(lib_MAC_ZH_ZH_NR_R, REG_GET(2), REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_addNi_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_ADD_NR, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_adduNi_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_ADD_NRU, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_addRNi_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_ADD_NR_R, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_adduRNi_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_ADD_NR_RU, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_subNi_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_SUB_NR, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_subuNi_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_SUB_NRU, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_subRNi_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_SUB_NR_R, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_subuRNi_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     REG_SET(0, LIB_CALL3(lib_SUB_NR_RU, REG_GET(0), REG_GET(1), UIM_GET(0)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_addN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_ADD_NR, REG_GET(0), REG_GET(1), REG_GET(2)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_adduN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_ADD_NRU, REG_GET(0), REG_GET(1), REG_GET(2)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_addRN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_ADD_NR_R, REG_GET(0), REG_GET(1), REG_GET(2)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_adduRN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_ADD_NR_RU, REG_GET(0), REG_GET(1), REG_GET(2)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_subN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_SUB_NR, REG_GET(0), REG_GET(1), REG_GET(2)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_subuN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_SUB_NRU, REG_GET(0), REG_GET(1), REG_GET(2)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_subRN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_SUB_NR_R, REG_GET(0), REG_GET(1), REG_GET(2)));
     return iss_insn_next(iss, insn, pc);
 }
 
 static inline iss_reg_t p_subuRN_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(2));
+    iss->regfile.memcheck_merge3(REG_OUT(0), REG_IN(0), REG_IN(1), REG_IN(2));
     REG_SET(0, LIB_CALL3(lib_SUB_NR_RU, REG_GET(0), REG_GET(1), REG_GET(2)));
     return iss_insn_next(iss, insn, pc);
 }
@@ -2071,8 +1948,7 @@ static inline iss_reg_t p_clipui_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t p_clip_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     int low = -REG_GET(1) - 1;
     int high = REG_GET(1);
     REG_SET(0, LIB_CALL3(lib_CLIP, REG_GET(0), low, high));
@@ -2081,8 +1957,7 @@ static inline iss_reg_t p_clip_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t p_clipu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     int high = REG_GET(1);
     REG_SET(0, LIB_CALL2(lib_CLIPU, REG_GET(0), high));
 
@@ -2129,8 +2004,7 @@ static inline iss_reg_t p_extractui_exec(Iss *iss, iss_insn_t *insn, iss_reg_t p
 
 static inline iss_reg_t p_extract_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     int width = ((REG_GET(1) >> 5) & 0x1f) + 1;
     int shift = REG_GET(1) & 0x1f;
     REG_SET(0, LIB_CALL3(lib_BEXTRACT, REG_GET(0), width, shift));
@@ -2139,8 +2013,7 @@ static inline iss_reg_t p_extract_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t p_extractu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     int width = ((REG_GET(1) >> 5) & 0x1f) + 1;
     int shift = REG_GET(1) & 0x1f;
     REG_SET(0, LIB_CALL3(lib_BEXTRACTU, REG_GET(0), ((1ULL << width) - 1) << shift, shift));
@@ -2158,8 +2031,7 @@ static inline iss_reg_t p_inserti_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t p_insert_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     int width = ((REG_GET(2) >> 5) & 0x1F) + 1;
     int shift = REG_GET(2) & 0x1F;
     REG_SET(0, LIB_CALL4(lib_BINSERT, REG_GET(0), REG_GET(1), ((1ULL << width) - 1) << shift, shift));
@@ -2177,8 +2049,7 @@ static inline iss_reg_t p_bseti_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t p_bset_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
     int width = ((REG_GET(1) >> 5) & 0x1f) + 1;
     int shift = REG_GET(1) & 0x1f;
     REG_SET(0, LIB_CALL2(lib_BSET, REG_GET(0), ((1ULL << (width)) - 1) << shift));

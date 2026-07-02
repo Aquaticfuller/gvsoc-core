@@ -10,6 +10,81 @@
 
 #include <cpu/iss_v2/include/regfile.hpp>
 
+inline bool Regfile::memcheck_reg(int reg)
+{
+#ifdef VP_MEMCHECK_ACTIVE
+    if (this->regs_memcheck[reg] != (iss_reg_t)-1)
+    {
+        if (this->iss.traces.get_trace_engine()->is_memcheck_enabled())
+        {
+            return true;
+        }
+    }
+#endif
+
+    return false;
+}
+
+inline void Regfile::memcheck_branch_reg(int reg)
+{
+#ifdef VP_MEMCHECK_ACTIVE
+    if (this->memcheck_reg(reg))
+    {
+        this->memcheck_reg_fault = true;
+        this->memcheck_reg_fault_id = reg;
+        this->memcheck_reg_fault_message = "Conditional jump depends on uninitialised register";
+    }
+#endif
+}
+
+inline void Regfile::memcheck_access_reg(int reg)
+{
+#ifdef VP_MEMCHECK_ACTIVE
+    if (this->memcheck_reg(reg))
+    {
+        this->memcheck_reg_fault = true;
+        this->memcheck_reg_fault_id = reg;
+        this->memcheck_reg_fault_message = "Access address depends on uninitialised register";
+    }
+
+    // Latch the provenance of the base register so that the LSU attaches it to the
+    // request it is about to send
+    this->iss.lsu.pending_addr_buffer_id = this->regs_memcheck_id[reg];
+#endif
+}
+
+inline void Regfile::memcheck_fault()
+{
+#ifdef VP_MEMCHECK_ACTIVE
+    if (this->memcheck_reg_fault)
+    {
+        // When GDB is connected, throw a message without exiting and notify gdb
+        // since this will do a break, so that user can continue
+        if (this->iss.gdbserver.is_enabled())
+        {
+            this->trace.force_warning_no_error("%s (reg: %d)\n",
+                this->memcheck_reg_fault_message.c_str(), this->memcheck_reg_fault_id);
+
+            this->memcheck_reg_fault = false;
+
+            if (!this->iss.exec.halted.get())
+            {
+                this->iss.exec.retain_inc();
+                this->iss.exec.halted.set(true);
+            }
+            this->iss.gdbserver.gdbserver->signal(&this->iss.gdbserver,
+                vp::Gdbserver_engine::SIGNAL_BUS);
+        }
+        else
+        {
+            this->trace.force_warning("%s (reg: %d)\n",
+                this->memcheck_reg_fault_message.c_str(), this->memcheck_reg_fault_id);
+            this->memcheck_reg_fault = false;
+        }
+    }
+#endif
+}
+
 #ifdef CONFIG_GVSOC_ISS_REGFILE_SCOREBOARD
 inline bool Regfile::scoreboard_insn_check(iss_insn_t *insn)
 {

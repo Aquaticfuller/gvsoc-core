@@ -216,6 +216,16 @@ int Decode::decode_insn(iss_insn_t *insn, iss_reg_t pc, iss_opcode_t opcode, iss
     insn->fast_handler = item->u.insn.fast_handler;
     insn->handler = item->u.insn.handler;
 
+#ifdef VP_MEMCHECK_ACTIVE
+    // The memcheck instrumentation only exists in the perf handlers, force them
+    // when memory checking is enabled so the shadow propagation does not depend
+    // on instruction tracing being active
+    if (this->iss.traces.get_trace_engine()->is_memcheck_enabled())
+    {
+        insn->fast_handler = insn->handler;
+    }
+#endif
+
     this->iss.gdbserver.decode_insn(insn, pc);
 
 // #if defined(CONFIG_GVSOC_ISS_TIMED)

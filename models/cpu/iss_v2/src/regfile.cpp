@@ -50,6 +50,19 @@ void Regfile::reset(bool active)
             this->regs[i] = (iss_reg_t)0x5757575757575757;
         }
 
+#ifdef VP_MEMCHECK_ACTIVE
+        // All registers start uninitialized with no buffer attached, except x0 and
+        // the dummy register which are always valid
+        for (int i = 0; i < ISS_NB_REGS + ISS_NB_FREGS + 1; i++)
+        {
+            this->regs_memcheck[i] = 0;
+            this->regs_memcheck_id[i] = 0;
+        }
+        this->regs_memcheck[0] = (iss_reg_t)-1;
+        this->regs_memcheck[ISS_DUMMY_REG] = (iss_reg_t)-1;
+        this->memcheck_reg_fault = false;
+#endif
+
 #ifdef CONFIG_GVSOC_ISS_REGFILE_SCOREBOARD
         this->sb_reg_invalid = 0;
         this->sb_reason_set_mask = 0;

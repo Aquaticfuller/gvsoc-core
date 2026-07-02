@@ -48,6 +48,7 @@ class LogIcoConfig(Config):
     ))
 
 
+
 class LogIco(Component):
     """Logarithmic (bank-interleaved) crossbar on the io_v2 protocol.
 

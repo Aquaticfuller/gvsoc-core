@@ -84,6 +84,8 @@ public:
     inline bool memcheck_get_valid(int reg);
     inline void memcheck_set_valid(int reg, bool valid);
     inline void memcheck_merge(int out_reg, int in_reg);
+    inline void memcheck_merge2(int out_reg, int in_reg_0, int in_reg_1);
+    inline void memcheck_merge3(int out_reg, int in_reg_0, int in_reg_1, int in_reg_2);
     inline void memcheck_merge64(int out_reg, int in_reg);
     inline void memcheck_copy(int out_reg, int in_reg);
     inline void memcheck_bitwise_and(int out_reg, int in_reg_0, int in_reg_1);

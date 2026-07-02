@@ -30,50 +30,15 @@ Memcheck::Memcheck(IssWrapper &top, Iss &iss)
     top.traces.new_trace("memcheck", &this->trace, vp::DEBUG);
 }
 
+// Buffer tracking is only supported by the v2 ISS. The allocation calls are kept as
+// pass-throughs so that runtimes instrumented for memcheck also run on v1 cores,
+// which then only provide uninitialized-value tracking.
 iss_reg_t Memcheck::mem_alloc(iss_reg_t mem_id, iss_reg_t ptr, iss_reg_t size)
 {
-    if (this->iss.top.traces.get_trace_engine()->is_memcheck_enabled())
-    {
-        this->trace.msg(vp::Trace::LEVEL_INFO, "Memory alloc (id: %d, ptr: 0x%x, size: 0x%x)\n",
-            mem_id, ptr, size);
-
-        iss_reg_t virtual_ptr = this->top.get_memcheck()->alloc(mem_id, ptr, size);
-
-        if (virtual_ptr == 0)
-        {
-            this->trace.force_warning("Trying to alloc from invalid memory (id: %d)\n", mem_id);
-            return ptr;
-        }
-
-        this->trace.msg(vp::Trace::LEVEL_INFO, "Translated to virtual address (id: %d, virtual_ptr: 0x%x)\n",
-            mem_id, virtual_ptr);
-
-        return virtual_ptr;
-    }
-
     return ptr;
 }
 
-iss_reg_t Memcheck::mem_free(iss_reg_t mem_id, iss_reg_t virtual_ptr, iss_reg_t size)
+iss_reg_t Memcheck::mem_free(iss_reg_t mem_id, iss_reg_t ptr, iss_reg_t size)
 {
-    if (this->iss.top.traces.get_trace_engine()->is_memcheck_enabled())
-    {
-        this->trace.msg(vp::Trace::LEVEL_INFO, "Memory free (id: %d, ptr: 0x%x, size: 0x%x)\n",
-            mem_id, virtual_ptr, size);
-
-        iss_reg_t ptr = this->top.get_memcheck()->free(mem_id, virtual_ptr, size);
-
-        if (ptr == 0)
-        {
-            this->trace.force_warning("Trying to free from invalid memory (id: %d)\n", mem_id);
-            return virtual_ptr;
-        }
-
-        this->trace.msg(vp::Trace::LEVEL_INFO, "Translated to physical address (id: %d, ptr: 0x%x)\n",
-            mem_id, ptr);
-
-        return ptr;
-    }
-
-    return virtual_ptr;
+    return ptr;
 }

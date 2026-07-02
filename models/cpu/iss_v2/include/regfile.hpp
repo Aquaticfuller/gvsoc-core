@@ -52,24 +52,33 @@ public:
     inline int get_reg_lid(int reg);
     inline bool is_freg(int reg);
 
-    // These methods are just kepts for compatibility with ISA files. They will be replaced
-    // by the new memcheck implementation at some point.
-    inline bool memcheck_reg(int reg) { return false; }
-    inline void memcheck_branch_reg(int reg) {}
-    inline void memcheck_propagate_1(int out_reg, int in_reg) {}
-    inline void memcheck_access_reg(int reg) {}
-    inline void memcheck_fault() {}
-    inline iss_reg_t memcheck_get(int reg) { return 0; }
-    inline void memcheck_set(int reg, iss_reg_t value) {}
-    inline bool memcheck_get_valid(int reg) { return true; }
-    inline void memcheck_set_valid(int reg, bool valid) {}
-    inline void memcheck_merge(int out_reg, int in_reg) {}
-    inline void memcheck_merge64(int out_reg, int in_reg) {}
-    inline void memcheck_copy(int out_reg, int in_reg) {}
-    inline void memcheck_bitwise_and(int out_reg, int in_reg_0, int in_reg_1) {}
-    inline void memcheck_shift_left(int out_reg, int in_reg, int shift) {}
-    inline void memcheck_shift_right(int out_reg, int in_reg, int shift) {}
-    inline void memcheck_shift_right_signed(int out_reg, int in_reg, int shift) {}
+    // Memcheck register shadow. Each register carries a per-bit validity mask
+    // (uninitialized-value tracking, -1 means fully initialized) and a buffer ID
+    // (pointer provenance, 0 means none). The validity masks follow the v1 ISS
+    // semantics; the IDs are propagated so that a pointer keeps naming its
+    // allocation through moves, pointer arithmetic and alignment masking, and get
+    // dropped by operations that do not produce a pointer.
+    // The checks (memcheck_reg and its callers) are runtime-gated, the shadow
+    // updates are only compiled in debug builds (VP_MEMCHECK_ACTIVE).
+    inline bool memcheck_reg(int reg);
+    inline void memcheck_branch_reg(int reg);
+    inline void memcheck_access_reg(int reg);
+    inline void memcheck_fault();
+    inline iss_reg_t memcheck_get(int reg);
+    inline void memcheck_set(int reg, iss_reg_t value);
+    inline bool memcheck_get_valid(int reg);
+    inline void memcheck_set_valid(int reg, bool valid);
+    inline uint32_t memcheck_get_id(int reg);
+    inline void memcheck_set_id(int reg, uint32_t id);
+    inline void memcheck_merge(int out_reg, int in_reg);
+    inline void memcheck_merge2(int out_reg, int in_reg_0, int in_reg_1);
+    inline void memcheck_merge3(int out_reg, int in_reg_0, int in_reg_1, int in_reg_2);
+    inline void memcheck_merge64(int out_reg, int in_reg);
+    inline void memcheck_copy(int out_reg, int in_reg);
+    inline void memcheck_bitwise_and(int out_reg, int in_reg_0, int in_reg_1);
+    inline void memcheck_shift_left(int out_reg, int in_reg, int shift);
+    inline void memcheck_shift_right(int out_reg, int in_reg, int shift);
+    inline void memcheck_shift_right_signed(int out_reg, int in_reg, int shift);
 
     inline bool scoreboard_insn_check(iss_insn_t *insn);
     inline void scoreboard_insn_clear(iss_insn_t *insn);
@@ -90,9 +99,26 @@ public:
 #endif
 
 private:
+    // Combine the buffer IDs of a 2-input operation: an ID is kept only when it is
+    // unambiguous (exactly one input carries one). Two equal IDs cancel out, which
+    // covers the pointer-difference case.
+    inline uint32_t memcheck_id_combine(int in_reg_0, int in_reg_1);
+
     Iss &iss;
     vp::Trace trace;
     uint64_t regs[ISS_NB_REGS+ISS_NB_FREGS+1];
+
+#ifdef VP_MEMCHECK_ACTIVE
+    // Per-bit validity mask of each register, -1 means fully initialized
+    iss_reg_t regs_memcheck[ISS_NB_REGS+ISS_NB_FREGS+1];
+    // Buffer provenance of each register, 0 means no associated buffer
+    uint32_t regs_memcheck_id[ISS_NB_REGS+ISS_NB_FREGS+1];
+    // Fault flagged by the ISA handlers, consumed once per instruction by
+    // memcheck_fault()
+    bool memcheck_reg_fault;
+    int memcheck_reg_fault_id;
+    std::string memcheck_reg_fault_message;
+#endif
 
 #ifdef CONFIG_GVSOC_ISS_REGFILE_SCOREBOARD
     uint64_t sb_reg_invalid;
@@ -289,3 +315,182 @@ inline void Regfile::scoreboard_insn_clear(iss_insn_t *insn)
 }
 
 #endif
+
+inline iss_reg_t Regfile::memcheck_get(int reg)
+{
+#ifdef VP_MEMCHECK_ACTIVE
+    return this->regs_memcheck[reg];
+#else
+    return 0;
+#endif
+}
+
+inline void Regfile::memcheck_set(int reg, iss_reg_t value)
+{
+    // Setting the mask directly means the value does not derive from a pointer
+    // (constants, PC-derived values), so the provenance is dropped
+#ifdef VP_MEMCHECK_ACTIVE
+    this->regs_memcheck[reg] = value;
+    this->regs_memcheck_id[reg] = 0;
+#endif
+}
+
+inline bool Regfile::memcheck_get_valid(int reg)
+{
+    return this->memcheck_get(reg) == (iss_reg_t)-1;
+}
+
+inline void Regfile::memcheck_set_valid(int reg, bool valid)
+{
+#ifdef VP_MEMCHECK_ACTIVE
+    this->regs_memcheck[reg] = valid ? (iss_reg_t)-1 : 0;
+    this->regs_memcheck_id[reg] = 0;
+#endif
+}
+
+inline uint32_t Regfile::memcheck_get_id(int reg)
+{
+#ifdef VP_MEMCHECK_ACTIVE
+    return this->regs_memcheck_id[reg];
+#else
+    return 0;
+#endif
+}
+
+inline void Regfile::memcheck_set_id(int reg, uint32_t id)
+{
+#ifdef VP_MEMCHECK_ACTIVE
+    this->regs_memcheck_id[reg] = id;
+#endif
+}
+
+inline uint32_t Regfile::memcheck_id_combine(int in_reg_0, int in_reg_1)
+{
+#ifdef VP_MEMCHECK_ACTIVE
+    uint32_t id_0 = this->regs_memcheck_id[in_reg_0];
+    uint32_t id_1 = this->regs_memcheck_id[in_reg_1];
+
+    if (id_1 == 0)
+    {
+        return id_0;
+    }
+    if (id_0 == 0)
+    {
+        return id_1;
+    }
+    // Two pointers to the same buffer combine into a non-pointer (typically a
+    // pointer difference). Two different buffers is undefined behavior in C,
+    // arbitrarily keep the first one.
+    return id_0 == id_1 ? 0 : id_0;
+#else
+    return 0;
+#endif
+}
+
+inline void Regfile::memcheck_merge(int out_reg, int in_reg)
+{
+    // Single-input propagation (mv, addi, ...): this is pointer arithmetic when the
+    // input is a pointer, so the provenance follows. As soon as one bit is invalid,
+    // the whole output is considered invalid.
+#ifdef VP_MEMCHECK_ACTIVE
+    uint32_t id = this->regs_memcheck_id[in_reg];
+    this->memcheck_set_valid(out_reg, this->memcheck_get_valid(in_reg));
+    this->regs_memcheck_id[out_reg] = id;
+#endif
+}
+
+inline void Regfile::memcheck_merge2(int out_reg, int in_reg_0, int in_reg_1)
+{
+    // 2-input propagation (add, sub, ...): the output is valid only if both inputs
+    // are fully valid, and keeps the provenance when it is unambiguous
+#ifdef VP_MEMCHECK_ACTIVE
+    uint32_t id = this->memcheck_id_combine(in_reg_0, in_reg_1);
+    this->memcheck_set_valid(out_reg,
+        this->memcheck_get_valid(in_reg_0) && this->memcheck_get_valid(in_reg_1));
+    this->regs_memcheck_id[out_reg] = id;
+#endif
+}
+
+inline void Regfile::memcheck_merge3(int out_reg, int in_reg_0, int in_reg_1, int in_reg_2)
+{
+    // 3-input propagation (MACs, ...): these do not produce pointers, only the
+    // validity is combined
+#ifdef VP_MEMCHECK_ACTIVE
+    this->memcheck_set_valid(out_reg,
+        this->memcheck_get_valid(in_reg_0) && this->memcheck_get_valid(in_reg_1) &&
+        this->memcheck_get_valid(in_reg_2));
+#endif
+}
+
+inline void Regfile::memcheck_merge64(int out_reg, int in_reg)
+{
+#ifdef VP_MEMCHECK_ACTIVE
+    bool valid = this->memcheck_get_valid(in_reg) && this->memcheck_get_valid(in_reg + 1);
+    this->memcheck_set_valid(out_reg, valid);
+    this->memcheck_set_valid(out_reg + 1, valid);
+#endif
+}
+
+inline void Regfile::memcheck_copy(int out_reg, int in_reg)
+{
+    // Bit-exact copy of the shadow (immediate logical ops): alignment masks like
+    // "p & ~0xf" must keep the provenance
+#ifdef VP_MEMCHECK_ACTIVE
+    this->regs_memcheck[out_reg] = this->regs_memcheck[in_reg];
+    this->regs_memcheck_id[out_reg] = this->regs_memcheck_id[in_reg];
+#endif
+}
+
+inline void Regfile::memcheck_bitwise_and(int out_reg, int in_reg_0, int in_reg_1)
+{
+    // Register logical ops: masking a pointer with a register mask keeps the
+    // provenance when unambiguous
+#ifdef VP_MEMCHECK_ACTIVE
+    this->regs_memcheck[out_reg] =
+        this->regs_memcheck[in_reg_0] & this->regs_memcheck[in_reg_1];
+    this->regs_memcheck_id[out_reg] = this->memcheck_id_combine(in_reg_0, in_reg_1);
+#endif
+}
+
+inline void Regfile::memcheck_shift_left(int out_reg, int in_reg, int shift)
+{
+    // When shifting, keep the valid bit for bits being shifted and introduce
+    // new valid ones from the right. A shifted pointer is not a pointer anymore.
+#ifdef VP_MEMCHECK_ACTIVE
+    iss_reg_t in_reg_valid = this->regs_memcheck[in_reg];
+    in_reg_valid = (in_reg_valid << shift) | (((iss_reg_t)1 << shift) - 1);
+    this->regs_memcheck[out_reg] = in_reg_valid;
+    this->regs_memcheck_id[out_reg] = 0;
+#endif
+}
+
+inline void Regfile::memcheck_shift_right(int out_reg, int in_reg, int shift)
+{
+    // When shifting, keep the valid bit for bits being shifted and introduce
+    // new valid ones from the left
+#ifdef VP_MEMCHECK_ACTIVE
+    iss_reg_t in_reg_valid = this->regs_memcheck[in_reg];
+    in_reg_valid = (in_reg_valid >> shift) |
+        ((((iss_reg_t)1 << shift) - 1) << (sizeof(iss_reg_t) * 8 - shift));
+    this->regs_memcheck[out_reg] = in_reg_valid;
+    this->regs_memcheck_id[out_reg] = 0;
+#endif
+}
+
+inline void Regfile::memcheck_shift_right_signed(int out_reg, int in_reg, int shift)
+{
+    // When shifting, keep the valid bit for bits being shifted
+#ifdef VP_MEMCHECK_ACTIVE
+    iss_reg_t in_reg_valid = this->regs_memcheck[in_reg];
+    iss_reg_t new_in_reg_valid = (in_reg_valid >> shift);
+
+    // Then introduce new valid ones from the left only if sign bit is valid
+    if ((in_reg_valid >> (sizeof(iss_reg_t) * 8 - 1)) & 1)
+    {
+        new_in_reg_valid |= ((((iss_reg_t)1 << shift) - 1) << (sizeof(iss_reg_t) * 8 - shift));
+    }
+
+    this->regs_memcheck[out_reg] = new_in_reg_valid;
+    this->regs_memcheck_id[out_reg] = 0;
+#endif
+}

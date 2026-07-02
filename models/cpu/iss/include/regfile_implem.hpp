@@ -261,6 +261,7 @@ inline void Regfile::memcheck_branch_reg(int reg)
     if (this->memcheck_reg(reg))
     {
         this->memcheck_reg_fault = true;
+        this->memcheck_reg_fault_id = reg;
         this->memcheck_reg_fault_message = "Conditional jump depends on uninitialised register";
     }
 }
@@ -270,6 +271,7 @@ inline void Regfile::memcheck_access_reg(int reg)
     if (this->memcheck_reg(reg))
     {
         this->memcheck_reg_fault = true;
+        this->memcheck_reg_fault_id = reg;
         this->memcheck_reg_fault_message = "Access address depends on uninitialised register";
     }
 }
@@ -337,6 +339,19 @@ inline void Regfile::memcheck_set_valid(int reg, bool valid)
 inline void Regfile::memcheck_merge(int out_reg, int in_reg)
 {
     this->memcheck_set_valid(out_reg, this->memcheck_get_valid(in_reg));
+}
+
+inline void Regfile::memcheck_merge2(int out_reg, int in_reg_0, int in_reg_1)
+{
+    this->memcheck_set_valid(out_reg,
+        this->memcheck_get_valid(in_reg_0) && this->memcheck_get_valid(in_reg_1));
+}
+
+inline void Regfile::memcheck_merge3(int out_reg, int in_reg_0, int in_reg_1, int in_reg_2)
+{
+    this->memcheck_set_valid(out_reg,
+        this->memcheck_get_valid(in_reg_0) && this->memcheck_get_valid(in_reg_1) &&
+        this->memcheck_get_valid(in_reg_2));
 }
 
 inline void Regfile::memcheck_merge64(int out_reg, int in_reg)

@@ -514,6 +514,7 @@ class RiscvCommon(st.Component):
             "cpu/iss_v2/src/decode.cpp",
             "cpu/iss_v2/src/trace.cpp",
             "cpu/iss_v2/src/syscalls.cpp",
+            "cpu/iss_v2/src/memcheck.cpp",
             "cpu/iss_v2/src/htif.cpp",
             "cpu/iss_v2/src/gdbserver.cpp",
         ])

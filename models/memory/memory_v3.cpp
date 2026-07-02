@@ -81,6 +81,12 @@ private:
     vp::IoReqStatus handle_atomic(uint64_t addr, uint64_t size, uint8_t *in_data,
         uint8_t *out_data, vp::IoReqOpcode opcode, void *initiator);
     void log_access(uint64_t addr, uint64_t size, bool is_write);
+#ifdef VP_MEMCHECK_ACTIVE
+    // Buffer check plus shadow maintenance for one request
+    void memcheck_handle_req(vp::IoReq *req, uint64_t offset, uint64_t size);
+    // Mark a range initialized with no attached pointer (writes without shadow)
+    void memcheck_set_range_valid(uint64_t offset, uint64_t size);
+#endif
 
     vp::Trace trace;
     // io_v2 slave port — request callback is attached via the in-class
@@ -91,6 +97,13 @@ private:
 
     uint8_t *mem_data;
     uint8_t *check_mem;
+
+    // Memcheck shadow storage, allocated when memory checking is enabled: per-byte
+    // validity of the stored data (uninitialized-value tracking) and per-4-byte-word
+    // buffer ID (provenance of pointers spilled to memory)
+    bool memcheck_enabled = false;
+    uint8_t *memcheck_shadow = NULL;
+    uint32_t *memcheck_shadow_id = NULL;
 
     vp::WireSlave<bool> power_ctrl_itf;
     vp::WireSlave<void *> meminfo_itf;
@@ -173,6 +186,21 @@ log_is_write(*this, "req_is_write", 1, vp::SignalCommon::ResetKind::HighZ)
     {
         memset(mem_data, 0x57, this->cfg.size);
     }
+
+#ifdef VP_MEMCHECK_ACTIVE
+    this->memcheck_enabled = this->traces.get_trace_engine()->is_memcheck_enabled();
+    if (this->memcheck_enabled)
+    {
+        // The shadow starts all-invalid with no attached buffers
+        this->memcheck_shadow = (uint8_t *)calloc(this->cfg.size, 1);
+        this->memcheck_shadow_id = (uint32_t *)calloc((this->cfg.size + 3) / 4,
+            sizeof(uint32_t));
+        if (this->memcheck_shadow == NULL || this->memcheck_shadow_id == NULL)
+        {
+            throw std::bad_alloc();
+        }
+    }
+#endif
 
     if (this->cfg.stim_file != nullptr && this->cfg.stim_file[0] != '\0')
     {
@@ -281,6 +309,13 @@ vp::IoReqStatus Memory::req(vp::Block *__this, vp::IoReq *req)
         return vp::IO_REQ_DONE;
     }
 
+#ifdef VP_MEMCHECK_ACTIVE
+    if (_this->memcheck_enabled)
+    {
+        _this->memcheck_handle_req(req, offset, size);
+    }
+#endif
+
     if (req->get_opcode() == vp::IoReqOpcode::READ)
     {
         return _this->handle_read(offset, size, data);
@@ -315,6 +350,13 @@ int Memory::debug_mem_access(uint64_t addr, uint8_t *data, uint64_t size, bool i
 
     if (is_write)
     {
+#ifdef VP_MEMCHECK_ACTIVE
+        // Backdoor writes (loader, debugger) initialize the memory
+        if (this->memcheck_enabled)
+        {
+            this->memcheck_set_range_valid(offset, size);
+        }
+#endif
         this->handle_write(offset, size, data);
     }
     else
@@ -324,6 +366,72 @@ int Memory::debug_mem_access(uint64_t addr, uint8_t *data, uint64_t size, bool i
 
     return 0;
 }
+
+#ifdef VP_MEMCHECK_ACTIVE
+
+void Memory::memcheck_set_range_valid(uint64_t offset, uint64_t size)
+{
+    memset(&this->memcheck_shadow[offset], -1, size);
+    for (uint64_t slot = offset >> 2; slot <= (offset + size - 1) >> 2; slot++)
+    {
+        this->memcheck_shadow_id[slot] = 0;
+    }
+}
+
+void Memory::memcheck_handle_req(vp::IoReq *req, uint64_t offset, uint64_t size)
+{
+    // Shadow maintenance: keep the per-byte validity and per-word provenance of
+    // the stored data in sync with the request sideband. The buffer checks
+    // themselves happen in the core models at issue time.
+    if (req->get_opcode() == vp::IoReqOpcode::WRITE)
+    {
+        if (req->get_memcheck_data() != NULL)
+        {
+            memcpy(&this->memcheck_shadow[offset], req->get_memcheck_data(), size);
+        }
+        else
+        {
+            // The initiator has no shadow support, consider the data initialized
+            // to avoid false positives
+            memset(&this->memcheck_shadow[offset], -1, size);
+        }
+
+        if (size == 4 && (offset & 3) == 0)
+        {
+            // Word store: record the provenance of the stored value so pointers
+            // spilled to memory keep naming their buffer
+            this->memcheck_shadow_id[offset >> 2] = req->get_memcheck_data_id();
+        }
+        else
+        {
+            // Partial overwrite, the covered slots do not hold a whole pointer
+            // anymore
+            for (uint64_t slot = offset >> 2; slot <= (offset + size - 1) >> 2; slot++)
+            {
+                this->memcheck_shadow_id[slot] = 0;
+            }
+        }
+    }
+    else if (req->get_opcode() == vp::IoReqOpcode::READ)
+    {
+        if (req->get_memcheck_data() != NULL)
+        {
+            memcpy(req->get_memcheck_data(), &this->memcheck_shadow[offset], size);
+        }
+        if (size == 4 && (offset & 3) == 0)
+        {
+            req->set_memcheck_data_id(this->memcheck_shadow_id[offset >> 2]);
+        }
+    }
+    else
+    {
+        // Atomics read-modify-write the location without shadow transport yet:
+        // consider the result initialized and drop any stored provenance
+        this->memcheck_set_range_valid(offset, size);
+    }
+}
+
+#endif
 
 
 vp::IoReqStatus Memory::handle_write(uint64_t offset, uint64_t size, uint8_t *data)
@@ -449,6 +557,10 @@ void Memory::stop()
     {
         delete[] this->check_mem;
     }
+#ifdef VP_MEMCHECK_ACTIVE
+    free(this->memcheck_shadow);
+    free(this->memcheck_shadow_id);
+#endif
 }
 
 void Memory::reset(bool active)

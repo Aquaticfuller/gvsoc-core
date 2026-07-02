@@ -58,6 +58,9 @@ struct LsuReqEntry
     int        misaligned_size;
     iss_addr_t misaligned_addr;
     int        misaligned_byte_offset;
+
+    // Memcheck shadow of the transferred data (per-byte validity of ``data``)
+    uint8_t  memcheck_data[8];
 };
 
 class LsuV2
@@ -120,6 +123,11 @@ public:
 
     bool fence();
 
+    // Buffer ID of the base register of the access being issued, latched by
+    // Regfile::memcheck_access_reg from the ISA handlers and consumed by the next
+    // data request, which stamps it on the IoReq
+    uint32_t pending_addr_buffer_id;
+
     vp::IoMaster data{&LsuV2::data_retry, &LsuV2::data_response};
 
 protected:
@@ -132,6 +140,27 @@ protected:
 private:
     bool load_req(iss_insn_t *insn, iss_addr_t addr, int size, int reg, bool is_signed);
     static void task_handle(Iss *iss, Task *task);
+#ifdef VP_MEMCHECK_ACTIVE
+    // Check the access against the buffer named by the latched address provenance.
+    // The address is folded to its canonical form first, using the alias windows
+    // declared to the trace engine for watchpoints.
+    void memcheck_check_access(iss_addr_t addr, int size, vp::IoReqOpcode opcode);
+    // Attach the memcheck shadow and address provenance to the request being issued
+    void memcheck_prepare_req(LsuReqEntry *entry, iss_addr_t addr, int size,
+        vp::IoReqOpcode opcode, int reg);
+    // Propagate the loaded shadow and provenance into the destination register
+    void memcheck_handle_load(LsuReqEntry *entry, int size);
+
+    // This core's alias windows, filtered from the trace engine table at reset so
+    // the per-access folding is a couple of compares
+    struct MemcheckAlias
+    {
+        uint64_t local_base;
+        uint64_t global_base;
+        uint64_t size;
+    };
+    std::vector<MemcheckAlias> memcheck_aliases;
+#endif
 
     // io_v2 downstream callbacks. ``retry`` fires without a request
     // argument — it is a pure "ready-again" signal per the v2 protocol.
@@ -167,6 +196,9 @@ protected:
     // live-locks.
     LsuReqEntry *denied_entry;
     bool pending_fence;
+    // True while data_req_misaligned drives data_req_aligned for beat 0, so the
+    // memcheck preparation knows not to attach a data shadow
+    bool issuing_misaligned;
 
     vp::Signal<bool>       stalled;
     vp::Signal<iss_reg_t>  log_addr;

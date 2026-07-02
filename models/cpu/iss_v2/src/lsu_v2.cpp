@@ -12,6 +12,7 @@
 
 #include <vp/vp.hpp>
 #include <vp/signal.hpp>
+#include <vp/memcheck.hpp>
 
 LsuV2::LsuV2(Iss &iss)
     : iss(iss),
@@ -50,6 +51,25 @@ void LsuV2::reset(bool active)
         this->pending_fence = false;
         this->nb_pending_accesses = 0;
         this->next_retire_cycle = 0;
+        this->issuing_misaligned = false;
+        this->pending_addr_buffer_id = 0;
+
+#ifdef VP_MEMCHECK_ACTIVE
+        // Resolve this core's alias windows from the trace engine table (declared
+        // by the platform for watchpoints), so buffer checks fold aliased
+        // addresses to their canonical form. All declaration components have been
+        // built by the time reset is called.
+        this->memcheck_aliases.clear();
+        std::string path = this->iss.get_path();
+        for (auto &alias : this->iss.traces.get_trace_engine()->get_aliases())
+        {
+            if (path.find(alias.master_pattern) != std::string::npos)
+            {
+                this->memcheck_aliases.push_back(
+                    {alias.local_base, alias.global_base, alias.size});
+            }
+        }
+#endif
     }
 }
 
@@ -251,6 +271,10 @@ void LsuV2::handle_req_end(LsuReqEntry *entry)
             }
 
             this->iss.regfile.set_reg(entry->reg, data);
+
+#ifdef VP_MEMCHECK_ACTIVE
+            this->memcheck_handle_load(entry, size);
+#endif
         }
         else if (req->get_opcode() != vp::IoReqOpcode::WRITE)
         {
@@ -263,6 +287,14 @@ void LsuV2::handle_req_end(LsuReqEntry *entry)
             }
 
             this->iss.regfile.set_reg(entry->reg2, data);
+
+#ifdef VP_MEMCHECK_ACTIVE
+            // Atomics do not carry a shadow yet, consider the result initialized
+            if (this->iss.traces.get_trace_engine()->is_memcheck_enabled())
+            {
+                this->iss.regfile.memcheck_set_valid(entry->reg2, true);
+            }
+#endif
         }
     }
 
@@ -333,6 +365,10 @@ bool LsuV2::data_req_aligned(iss_insn_t *insn, iss_addr_t addr, int size,
     // while (async) completing the request.
     req->set_resp_status(vp::IO_RESP_OK);
 
+#ifdef VP_MEMCHECK_ACTIVE
+    this->memcheck_prepare_req(entry, addr, size, opcode, reg);
+#endif
+
     this->log_addr.set_and_release(addr);
     this->log_size.set_and_release(size);
     this->log_is_write.set_and_release(opcode != 0);
@@ -379,6 +415,12 @@ bool LsuV2::data_req_aligned(iss_insn_t *insn, iss_addr_t addr, int size,
 bool LsuV2::data_req(iss_insn_t *insn, iss_addr_t addr, int size,
                      vp::IoReqOpcode opcode, bool is_signed, int reg, int reg2)
 {
+#ifdef VP_MEMCHECK_ACTIVE
+    // Buffer check at issue time, on the full access before any split, while the
+    // address is still in the form the program computed it
+    this->memcheck_check_access(addr, size, opcode);
+#endif
+
     // RI5CY-style misalignment check: only word-boundary crosses split.
     // A halfword that fits entirely inside one 4-byte word goes through
     // the fast path even if `addr & 1 != 0`.
@@ -452,8 +494,10 @@ bool LsuV2::data_req_misaligned(iss_insn_t *insn, iss_addr_t addr, int size,
         full_write_data = this->iss.regfile.get_reg(reg);
     }
 
+    this->issuing_misaligned = true;
     bool stalled = this->data_req_aligned(insn, addr, size0, opcode,
                                           is_signed, reg, reg2);
+    this->issuing_misaligned = false;
 
     if (!stalled && entry != nullptr)
     {
@@ -600,3 +644,142 @@ bool LsuV2::atomic(iss_insn_t *insn, iss_addr_t addr, int size,
 {
     return this->data_req_virtual(insn, addr, size, opcode, true, reg_in, reg_out);
 }
+
+#ifdef VP_MEMCHECK_ACTIVE
+
+void LsuV2::memcheck_check_access(iss_addr_t addr, int size, vp::IoReqOpcode opcode)
+{
+    // The provenance of the base register was latched by the ISA handler through
+    // memcheck_access_reg. Consume it here; an ID can only be attached when memory
+    // checking is enabled, so no runtime gate is needed.
+    uint32_t buffer_id = this->pending_addr_buffer_id;
+    this->pending_addr_buffer_id = 0;
+    if (buffer_id == 0)
+    {
+        return;
+    }
+
+    // Fold master-local aliases to the canonical global address, so the bounds
+    // check compares addresses in the allocator's address space
+    uint64_t folded = addr;
+    for (auto &alias : this->memcheck_aliases)
+    {
+        if (folded >= alias.local_base && folded < alias.local_base + alias.size)
+        {
+            folded = alias.global_base + (folded - alias.local_base);
+            break;
+        }
+    }
+
+    std::string error;
+    if (!this->iss.get_memcheck()->check_access(folded, size, buffer_id,
+        opcode != vp::IoReqOpcode::READ, error))
+    {
+        this->trace.force_warning("%s\n", error.c_str());
+    }
+}
+
+void LsuV2::memcheck_prepare_req(LsuReqEntry *entry, iss_addr_t addr, int size,
+    vp::IoReqOpcode opcode, int reg)
+{
+    if (!this->iss.traces.get_trace_engine()->is_memcheck_enabled())
+    {
+        return;
+    }
+
+    vp::IoReq *req = &entry->req;
+
+    // Misaligned beats carry no data shadow. Writes without shadow are considered
+    // initialized by the target and reads leave the destination register fully
+    // valid, so misalignment can not raise false faults.
+    if (this->issuing_misaligned)
+    {
+        return;
+    }
+
+    if (opcode == vp::IoReqOpcode::READ)
+    {
+        // Preset the shadow as valid so that bytes coming from a target without
+        // shadow support are considered initialized
+        memset(entry->memcheck_data, 0xFF, size);
+        req->set_memcheck_data(entry->memcheck_data);
+    }
+    else if (opcode == vp::IoReqOpcode::WRITE)
+    {
+        // Ship the per-bit validity of the stored register along with the data
+        iss_reg_t mask = this->iss.regfile.memcheck_get(reg);
+        int copy_size = size < (int)sizeof(iss_reg_t) ? size : (int)sizeof(iss_reg_t);
+        memcpy(entry->memcheck_data, &mask, copy_size);
+        if (size > copy_size)
+        {
+            memset(entry->memcheck_data + copy_size, 0xFF, size - copy_size);
+        }
+        req->set_memcheck_data(entry->memcheck_data);
+
+        // Pointer-sized aligned stores also ship the provenance of the stored
+        // value, so that pointers spilled to memory keep their buffer attached
+        if (size == (int)sizeof(iss_reg_t) && (addr & (sizeof(iss_reg_t) - 1)) == 0)
+        {
+            req->set_memcheck_data_id(this->iss.regfile.memcheck_get_id(reg));
+        }
+    }
+}
+
+void LsuV2::memcheck_handle_load(LsuReqEntry *entry, int size)
+{
+    if (!this->iss.traces.get_trace_engine()->is_memcheck_enabled())
+    {
+        return;
+    }
+
+    vp::IoReq *req = &entry->req;
+
+    if (entry->reg == 0)
+    {
+        return;
+    }
+
+    if (req->get_memcheck_data() == NULL)
+    {
+        // No shadow was attached (misaligned access), no information
+        this->iss.regfile.memcheck_set_valid(entry->reg, true);
+        return;
+    }
+
+    // Build the register validity mask from the per-byte shadow, extending the
+    // upper part according to the zero/sign extension of the load
+    iss_reg_t mask;
+    if (size >= (int)sizeof(iss_reg_t))
+    {
+        memcpy(&mask, entry->memcheck_data, sizeof(iss_reg_t));
+    }
+    else
+    {
+        mask = 0;
+        memcpy(&mask, entry->memcheck_data, size);
+        if (entry->is_signed)
+        {
+            // The upper bits replicate the sign bit, they are valid only if it is
+            if ((entry->memcheck_data[size - 1] >> 7) & 1)
+            {
+                mask |= ((iss_reg_t)-1) << (size * 8);
+            }
+        }
+        else
+        {
+            // Zero-extension, the upper bits are architecturally 0 hence valid
+            mask |= ((iss_reg_t)-1) << (size * 8);
+        }
+    }
+    this->iss.regfile.memcheck_set(entry->reg, mask);
+
+    // Pointer-sized aligned loads restore the provenance stored in the accessed
+    // slot, so that pointers reloaded from memory keep naming their buffer
+    if (size == (int)sizeof(iss_reg_t)
+        && (req->get_addr() & (sizeof(iss_reg_t) - 1)) == 0)
+    {
+        this->iss.regfile.memcheck_set_id(entry->reg, req->get_memcheck_data_id());
+    }
+}
+
+#endif

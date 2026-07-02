@@ -421,6 +421,9 @@ static inline iss_reg_t lbu_exec_fast(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t lbu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
+    // The whole register is checked for validity since any invalid bit can give
+    // a memcheck fail
+    iss->regfile.memcheck_access_reg(REG_IN(0));
     iss->lsu.stack_access_check(REG_IN(0), REG_GET_UNTIMED(0) + SIM_GET(0));
     if (iss->lsu.load_perf<uint8_t>(insn, REG_GET(0) + SIM_GET(0), 1, REG_OUT(0)))
     {
@@ -441,6 +444,9 @@ static inline iss_reg_t lhu_exec_fast(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t lhu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
+    // The whole register is checked for validity since any invalid bit can give
+    // a memcheck fail
+    iss->regfile.memcheck_access_reg(REG_IN(0));
     iss->lsu.stack_access_check(REG_IN(0), REG_GET(0) + SIM_GET(0));
     if (iss->lsu.load_perf<uint16_t>(insn, REG_GET(0) + SIM_GET(0), 2, REG_OUT(0)))
     {
@@ -606,8 +612,7 @@ static inline iss_reg_t add_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
     // Since addition can change any bit, mark destination as invalid as soon as input register
     // has 1 bit invalid
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     REG_SET(0, LIB_CALL2(lib_ADD, REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
@@ -617,8 +622,7 @@ static inline iss_reg_t sub_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
     // Since substraction can change any bit, mark destination as invalid as soon as input register
     // has 1 bit invalid
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     REG_SET(0, LIB_CALL2(lib_SUB, REG_GET(0), REG_GET(1)));
     return iss_insn_next(iss, insn, pc);
@@ -644,8 +648,7 @@ static inline iss_reg_t sll_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t slt_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     REG_SET(0, (iss_sim_t)REG_GET(0) < (iss_sim_t)REG_GET(1));
     return iss_insn_next(iss, insn, pc);
@@ -653,8 +656,7 @@ static inline iss_reg_t slt_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 static inline iss_reg_t sltu_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(0));
-    iss->regfile.memcheck_merge(REG_OUT(0), REG_IN(1));
+    iss->regfile.memcheck_merge2(REG_OUT(0), REG_IN(0), REG_IN(1));
 
     REG_SET(0, REG_GET(0) < REG_GET(1));
     return iss_insn_next(iss, insn, pc);

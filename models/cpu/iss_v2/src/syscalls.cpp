@@ -728,23 +728,23 @@ void Syscalls::handle_riscv_ebreak()
         break;
     }
 
-    // case 0x114:
-    // {
-    //     this->iss.regfile.set_reg(10, this->iss.memcheck.mem_alloc(
-    //       this->iss.regfile.get_reg_untimed(11), this->iss.regfile.regs[12],
-    //       this->iss.regfile.get_reg_untimed(13)));
+    case 0x114:
+    {
+        this->iss.regfile.set_reg(10, this->iss.memcheck.mem_alloc(
+            this->iss.regfile.get_reg_untimed(11), this->iss.regfile.get_reg_untimed(12),
+            this->iss.regfile.get_reg_untimed(13)));
 
-    //     break;
-    // }
+        break;
+    }
 
-    // case 0x115:
-    // {
-    //     this->iss.regfile.set_reg(10, this->iss.memcheck.mem_free(this->iss.regfile.get_reg_untimed(11),
-    //       this->iss.regfile.get_reg_untimed(12),
-    //       this->iss.regfile.get_reg_untimed(13)));
+    case 0x115:
+    {
+        this->iss.regfile.set_reg(10, this->iss.memcheck.mem_free(
+            this->iss.regfile.get_reg_untimed(11), this->iss.regfile.get_reg_untimed(12),
+            this->iss.regfile.get_reg_untimed(13)));
 
-    //     break;
-    // }
+        break;
+    }
 
     // case 0x116:
     // {

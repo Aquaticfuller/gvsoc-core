@@ -22,17 +22,27 @@
 #pragma once
 
 #include <vp/vp.hpp>
-#include <cpu/iss/include/types.hpp>
+#include <cpu/iss_v2/include/types.hpp>
 
+/*
+ * ISS-side entry points of the memcheck semihosting calls. The runtime allocator
+ * declares its allocations here; they are registered in the engine-level registry
+ * (vp::MemCheck) which hands back a buffer ID, and the ID gets attached to the
+ * register receiving the pointer (a0) so the regfile and LSU propagate it
+ * alongside the pointer.
+ */
 class Memcheck
 {
 public:
-    Memcheck(IssWrapper &top, Iss &iss);
+    Memcheck(Iss &iss);
+    // Semihosting 0x114: register an allocated buffer, taint a0 with its ID.
+    // The pointer is returned unchanged.
     iss_reg_t mem_alloc(iss_reg_t mem_id, iss_reg_t ptr, iss_reg_t size);
+    // Semihosting 0x115: mark the buffer as freed. The pointer is returned
+    // unchanged.
     iss_reg_t mem_free(iss_reg_t mem_id, iss_reg_t ptr, iss_reg_t size);
 
 private:
-    IssWrapper &top;
     Iss &iss;
     vp::Trace trace;
 };
