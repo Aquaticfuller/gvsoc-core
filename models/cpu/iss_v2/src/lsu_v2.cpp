@@ -675,6 +675,40 @@ void LsuV2::memcheck_check_access(iss_addr_t addr, int size, vp::IoReqOpcode opc
     if (!this->iss.get_memcheck()->check_access(folded, size, buffer_id,
         opcode != vp::IoReqOpcode::READ, error))
     {
+        this->memcheck_fault_report(error);
+    }
+}
+
+void LsuV2::memcheck_fault_report(const std::string &error)
+{
+    // Complete the structured fault record for front-ends
+    vp::MemCheck *mc = this->iss.get_memcheck();
+    mc->fault.time = this->iss.time.get_time();
+    mc->fault.core = this->iss.get_path();
+    mc->fault.pc = this->iss.exec.current_insn;
+
+    if (this->iss.gdbserver.is_enabled())
+    {
+        // Halt the core and notify GDB with a bus error so the fault can be
+        // inspected and execution resumed, like the uninitialized-value faults
+        this->trace.force_warning_no_error("%s\n", error.c_str());
+        if (!this->iss.exec.halted.get())
+        {
+            this->iss.exec.retain_inc();
+            this->iss.exec.halted.set(true);
+        }
+        this->iss.gdbserver.gdbserver->signal(&this->iss.gdbserver,
+            vp::Gdbserver_engine::SIGNAL_BUS);
+    }
+    else if (mc->fault_stop())
+    {
+        // A front-end is attached (GUI or console), the simulation pauses on the
+        // fault like on a watchpoint hit; execution can be resumed from there
+        this->trace.force_warning_no_error("%s\n", error.c_str());
+    }
+    else
+    {
+        // Batch mode: report and apply the werror policy
         this->trace.force_warning("%s\n", error.c_str());
     }
 }

@@ -145,6 +145,9 @@ private:
     // The address is folded to its canonical form first, using the alias windows
     // declared to the trace engine for watchpoints.
     void memcheck_check_access(iss_addr_t addr, int size, vp::IoReqOpcode opcode);
+    // Report a buffer fault: notify GDB (bus error), pause for an attached
+    // front-end, or apply the werror policy in batch mode.
+    void memcheck_fault_report(const std::string &error);
     // Attach the memcheck shadow and address provenance to the request being issued
     void memcheck_prepare_req(LsuReqEntry *entry, iss_addr_t addr, int size,
         vp::IoReqOpcode opcode, int reg);

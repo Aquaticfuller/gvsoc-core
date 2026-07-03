@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cpu/iss_v2/include/regfile.hpp>
+#include <vp/memcheck.hpp>
 
 inline bool Regfile::memcheck_reg(int reg)
 {
@@ -32,6 +33,7 @@ inline void Regfile::memcheck_branch_reg(int reg)
     {
         this->memcheck_reg_fault = true;
         this->memcheck_reg_fault_id = reg;
+        this->memcheck_reg_fault_kind = "uninit-branch";
         this->memcheck_reg_fault_message = "Conditional jump depends on uninitialised register";
     }
 #endif
@@ -44,6 +46,7 @@ inline void Regfile::memcheck_access_reg(int reg)
     {
         this->memcheck_reg_fault = true;
         this->memcheck_reg_fault_id = reg;
+        this->memcheck_reg_fault_kind = "uninit-address";
         this->memcheck_reg_fault_message = "Access address depends on uninitialised register";
     }
 
@@ -58,14 +61,29 @@ inline void Regfile::memcheck_fault()
 #ifdef VP_MEMCHECK_ACTIVE
     if (this->memcheck_reg_fault)
     {
-        // When GDB is connected, throw a message without exiting and notify gdb
-        // since this will do a break, so that user can continue
+        this->memcheck_reg_fault = false;
+
+        std::string message = this->memcheck_reg_fault_message
+            + " (reg: " + std::to_string(this->memcheck_reg_fault_id) + ")";
+
+        // Structured fault record for front-ends
+        vp::MemCheck *mc = this->iss.get_memcheck();
+        mc->fault.valid = true;
+        mc->fault.kind = this->memcheck_reg_fault_kind;
+        mc->fault.addr = 0;
+        mc->fault.size = 0;
+        mc->fault.is_write = false;
+        mc->fault.buffer_id = 0;
+        mc->fault.message = message;
+        mc->fault.time = this->iss.time.get_time();
+        mc->fault.core = this->iss.get_path();
+        mc->fault.pc = this->iss.exec.current_insn;
+
         if (this->iss.gdbserver.is_enabled())
         {
-            this->trace.force_warning_no_error("%s (reg: %d)\n",
-                this->memcheck_reg_fault_message.c_str(), this->memcheck_reg_fault_id);
-
-            this->memcheck_reg_fault = false;
+            // When GDB is connected, throw a message without exiting and notify gdb
+            // since this will do a break, so that user can continue
+            this->trace.force_warning_no_error("%s\n", message.c_str());
 
             if (!this->iss.exec.halted.get())
             {
@@ -75,11 +93,16 @@ inline void Regfile::memcheck_fault()
             this->iss.gdbserver.gdbserver->signal(&this->iss.gdbserver,
                 vp::Gdbserver_engine::SIGNAL_BUS);
         }
+        else if (mc->fault_stop())
+        {
+            // A front-end is attached (GUI or console), the simulation pauses on
+            // the fault like on a watchpoint hit
+            this->trace.force_warning_no_error("%s\n", message.c_str());
+        }
         else
         {
-            this->trace.force_warning("%s (reg: %d)\n",
-                this->memcheck_reg_fault_message.c_str(), this->memcheck_reg_fault_id);
-            this->memcheck_reg_fault = false;
+            // Batch mode: report and apply the werror policy
+            this->trace.force_warning("%s\n", message.c_str());
         }
     }
 #endif

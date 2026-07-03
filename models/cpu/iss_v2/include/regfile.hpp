@@ -117,6 +117,7 @@ private:
     // memcheck_fault()
     bool memcheck_reg_fault;
     int memcheck_reg_fault_id;
+    const char *memcheck_reg_fault_kind;
     std::string memcheck_reg_fault_message;
 #endif
 
