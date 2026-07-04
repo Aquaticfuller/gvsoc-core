@@ -36,12 +36,12 @@
 //     sideband; none of that is reproduced here. v3 is a plain backing
 //     store. Use :class:`memory.memory_v2.Memory` when memcheck
 //     integration is needed.
-//   - Power-source instantiation is dropped. The v2 model pulled
-//     per-access energy tables out of the JSON tree
-//     (``**/read_8`` etc.); in the config-only port those energy
-//     tables would have to be promoted into the struct too, which is
-//     out of scope. The ``power_trigger`` start/stop-capture feature
-//     still works because it only looks at magic payload values.
+//   - Power tables are promoted into the struct: the optional ``power``
+//     list of :class:`MemoryV3Config` (``vp.power_config`` entries named
+//     ``read_8``..``write_32`` and ``background``) feeds the per-access
+//     energy quanta and the background/leakage sources; an empty list
+//     leaves every source inert. The ``power_trigger``
+//     start/stop-capture feature only looks at magic payload values.
 
 #include <stdio.h>
 #include <string.h>
@@ -53,6 +53,7 @@
 #include <vp/itf/wire.hpp>
 #include <vp/debug_mem.hpp>
 #include <memory/memory_v3/memory_v3_config.hpp>
+#include <vp/power/power_table_convert.hpp>
 
 class Memory : public vp::Component, public vp::DebugMemIf
 {
@@ -110,6 +111,15 @@ private:
 
     bool powered_up;
 
+    // Power sources fed from the config 'power' tables (inert when absent)
+    vp::PowerSource read_8_power;
+    vp::PowerSource read_16_power;
+    vp::PowerSource read_32_power;
+    vp::PowerSource write_8_power;
+    vp::PowerSource write_16_power;
+    vp::PowerSource write_32_power;
+    vp::PowerSource background_power;
+
     // LR/SC reservation table. Keyed on ``req->initiator`` (void* in v2).
     std::map<void *, uint64_t> res_table;
 
@@ -156,6 +166,23 @@ log_is_write(*this, "req_is_write", 1, vp::SignalCommon::ResetKind::HighZ)
     this->meminfo_itf.set_sync_back_meth(&Memory::meminfo_sync_back);
     this->meminfo_itf.set_sync_meth(&Memory::meminfo_sync);
     new_slave_port("meminfo", &this->meminfo_itf);
+
+    // Power sources from the config power tables; every source stays inert
+    // when its table is absent (empty 'power' list = no power modeling).
+    vp::new_power_source_from_config(power, "leakage", &background_power,
+        vp::power_source_config_get(this->cfg, "background"));
+    vp::new_power_source_from_config(power, "read_8", &read_8_power,
+        vp::power_source_config_get(this->cfg, "read_8"));
+    vp::new_power_source_from_config(power, "read_16", &read_16_power,
+        vp::power_source_config_get(this->cfg, "read_16"));
+    vp::new_power_source_from_config(power, "read_32", &read_32_power,
+        vp::power_source_config_get(this->cfg, "read_32"));
+    vp::new_power_source_from_config(power, "write_8", &write_8_power,
+        vp::power_source_config_get(this->cfg, "write_8"));
+    vp::new_power_source_from_config(power, "write_16", &write_16_power,
+        vp::power_source_config_get(this->cfg, "write_16"));
+    vp::new_power_source_from_config(power, "write_32", &write_32_power,
+        vp::power_source_config_get(this->cfg, "write_32"));
 
     this->truncate_mask = this->cfg.truncate ? this->cfg.size - 1 : -1;
 
@@ -270,6 +297,28 @@ vp::IoReqStatus Memory::req(vp::Block *__this, vp::IoReq *req)
     }
 
     _this->log_access(offset, size, req->get_is_write());
+
+    if (_this->power.is_enabled())
+    {
+        if (req->get_is_write())
+        {
+            if (size == 1)
+                _this->write_8_power.account_energy_quantum();
+            else if (size == 2)
+                _this->write_16_power.account_energy_quantum();
+            else if (size == 4)
+                _this->write_32_power.account_energy_quantum();
+        }
+        else
+        {
+            if (size == 1)
+                _this->read_8_power.account_energy_quantum();
+            else if (size == 2)
+                _this->read_16_power.account_energy_quantum();
+            else if (size == 4)
+                _this->read_32_power.account_energy_quantum();
+        }
+    }
 
     // Timing annotation. memory_v3 only models a fixed per-request
     // latency; it is read inline by the master under the IoV2Sync
@@ -568,6 +617,9 @@ void Memory::reset(bool active)
     if (active)
     {
         this->powered_up = true;
+
+        this->background_power.leakage_power_start();
+        this->background_power.dynamic_power_start();
     }
 }
 

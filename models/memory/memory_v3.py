@@ -23,6 +23,7 @@ import gvrun.timing
 from config_tree import Config, cfg_field, HasSize
 from gvrun.runtime import Runtime
 from gvsoc.signature import IoV2Sync
+from vp.power_config import PowerSourceConfig
 
 
 class MemoryV3Config(Config, HasSize):
@@ -110,6 +111,12 @@ class MemoryV3Config(Config, HasSize):
 
     power_trigger: bool = cfg_field(default=False, dump=True, desc=(
         "Enable power-capture start/stop triggers on magic writes to offset 0"
+    ))
+
+    power: list[PowerSourceConfig] = cfg_field(default_factory=list, init=False, desc=(
+        "Per-source power tables (read_8..write_32 per-access energy quanta, "
+        "background power/leakage), typically filled with "
+        "vp.power_config.load_power_yaml. Empty = no power modeling."
     ))
 
 

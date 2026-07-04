@@ -16,6 +16,7 @@
 
 
 from config_tree import Config, cfg_field
+from vp.power_config import PowerSourceConfig
 
 class RiscvConfig(Config):
     isa: str = cfg_field(default='rv32imafdc', dump=True, desc=(
@@ -43,4 +44,11 @@ class RiscvConfig(Config):
     ))
     mmu: bool = cfg_field(default=False, dump=True, desc=(
         "True if the ISS should include the MMU."
+    ))
+    power_insn_groups: list[PowerSourceConfig] = cfg_field(default_factory=list, init=False, desc=(
+        "Per-instruction-group dynamic energy tables; the list index matches the isa "
+        "power group set with set_power_group. Empty = per-instruction power off."
+    ))
+    power: list[PowerSourceConfig] = cfg_field(default_factory=list, init=False, desc=(
+        "Named core power sources (stall_first, stall_next, background)."
     ))

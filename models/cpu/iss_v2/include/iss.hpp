@@ -22,6 +22,7 @@
 #pragma once
 
 #include <vp/vp.hpp>
+#include <cpu/iss_v2/riscv_config/riscv_config.hpp>
 #include <cpu/iss_v2/include/insn_cache.hpp>
 #include <cpu/iss_v2/include/decode.hpp>
 #include <cpu/iss_v2/include/trace.hpp>
@@ -59,6 +60,12 @@ public:
 
     std::string handle_command(gv::GvProxy *proxy, FILE *req_file, FILE *reply_file,
         std::vector<std::string> args, std::string req) override;
+
+    // Compiled config struct. The component may be instantiated with a
+    // subclassed config (e.g. Ri5kyConfig); only the RiscvConfig prefix is
+    // copied here, which is safe because dataclass fields are emitted
+    // base-first in the generated structs.
+    RiscvConfig cfg;
 
     InsnCache insn_cache;
     Decode decode;

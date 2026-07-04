@@ -20,6 +20,7 @@
 
 #include <vp/trace/trace.hpp>
 #include <vp/stats/stats_engine.hpp>
+#include <vp/power/power_table_convert.hpp>
 #include <cpu/iss_v2/include/event/event.hpp>
 
 Events::Events(Iss &iss)
@@ -42,25 +43,48 @@ event_rvc(iss, "event_rvc", 1, gv::Vcd_event_type_logical, "Compressed (RVC) ins
 event_misaligned(iss, "event_misaligned", 1, gv::Vcd_event_type_logical, "Misaligned memory accesses. This indicates when the core issues a request which is misaligned, and needs to be handled with multiple requests."),
 active_pc_trace_event(iss, "active_pc", ISS_REG_WIDTH, gv::Vcd_event_type_logical, "Program counter (only when active)")
 {
-    if (this->iss.get_js_config()->get("**/insn_groups"))
+    if (this->iss.cfg.power_insn_groups_count > 0)
     {
-        js::Config *config = this->iss.get_js_config()->get("**/insn_groups");
-        this->insn_groups_power.resize(config->get_size());
-        for (int i = 0; i < config->get_size(); i++)
+        // Struct-based power tables from the compiled config (power_insn_groups
+        // indexed by isa power group + named stall/background sources).
+        this->insn_groups_power.resize(this->iss.cfg.power_insn_groups_count);
+        for (size_t i = 0; i < this->iss.cfg.power_insn_groups_count; i++)
         {
-            this->iss.power.new_power_source("power_insn_" + std::to_string(i), &this->insn_groups_power[i], config->get_elem(i));
+            vp::new_power_source_from_config(this->iss.power, "power_insn_" + std::to_string(i),
+                &this->insn_groups_power[i], &this->iss.cfg.power_insn_groups[i]);
         }
+
+        vp::new_power_source_from_config(this->iss.power, "power_stall_first", &this->power_stall_first,
+            vp::power_source_config_get(this->iss.cfg, "stall_first"));
+        vp::new_power_source_from_config(this->iss.power, "power_stall_next", &this->power_stall_next,
+            vp::power_source_config_get(this->iss.cfg, "stall_next"));
+
+        vp::new_power_source_from_config(this->iss.power, "background", &background_power,
+            vp::power_source_config_get(this->iss.cfg, "background"));
     }
     else
     {
-        this->insn_groups_power.resize(1);
-        this->iss.power.new_power_source("power_insn", &this->insn_groups_power[0], this->iss.get_js_config()->get("**/insn"));
+        // Legacy JSON power tables
+        if (this->iss.get_js_config()->get("**/insn_groups"))
+        {
+            js::Config *config = this->iss.get_js_config()->get("**/insn_groups");
+            this->insn_groups_power.resize(config->get_size());
+            for (int i = 0; i < config->get_size(); i++)
+            {
+                this->iss.power.new_power_source("power_insn_" + std::to_string(i), &this->insn_groups_power[i], config->get_elem(i));
+            }
+        }
+        else
+        {
+            this->insn_groups_power.resize(1);
+            this->iss.power.new_power_source("power_insn", &this->insn_groups_power[0], this->iss.get_js_config()->get("**/insn"));
+        }
+
+        this->iss.power.new_power_source("power_stall_first", &this->power_stall_first, this->iss.get_js_config()->get("**/power_models/stall_first"));
+        this->iss.power.new_power_source("power_stall_next", &this->power_stall_next, this->iss.get_js_config()->get("**/power_models/stall_next"));
+
+        this->iss.power.new_power_source("background", &background_power, this->iss.get_js_config()->get("**/power_models/background"));
     }
-
-    this->iss.power.new_power_source("power_stall_first", &this->power_stall_first, this->iss.get_js_config()->get("**/power_models/stall_first"));
-    this->iss.power.new_power_source("power_stall_next", &this->power_stall_next, this->iss.get_js_config()->get("**/power_models/stall_next"));
-
-    this->iss.power.new_power_source("background", &background_power, this->iss.get_js_config()->get("**/power_models/background"));
 
 #ifdef CONFIG_GVSOC_STATS_ACTIVE
     // Cache whether stats are enabled at runtime (--stats). Skip all work otherwise.

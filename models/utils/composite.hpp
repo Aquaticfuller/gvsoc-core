@@ -34,6 +34,11 @@ namespace vp
     public:
         Composite(vp::ComponentConf &config);
 
+        // Forwarding constructor for composite subclasses using a compiled config
+        // struct (e.g. to declare power sources from generated power tables)
+        template<typename T>
+        Composite(vp::ComponentConf &config, T &cfg) : vp::Component(config, cfg) {}
+
     protected:
         vp::Trace     trace;
     };

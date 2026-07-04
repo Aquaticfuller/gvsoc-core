@@ -105,7 +105,7 @@ void Iss::reset(bool active)
 }
 
 Iss::Iss(vp::ComponentConf &config)
-: vp::Component(config), insn_cache(*this), decode(*this), trace(*this), syscalls(*this), gdbserver(*this),
+: vp::Component(config, this->cfg), insn_cache(*this), decode(*this), trace(*this), syscalls(*this), gdbserver(*this),
 memcheck(*this),
 
 #if defined(CONFIG_ISS_HAS_VECTOR)
