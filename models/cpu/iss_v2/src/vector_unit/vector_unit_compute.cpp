@@ -36,7 +36,7 @@ void VuCompute::reset(bool active)
     if (active)
     {
         uint8_t zero = 0;
-        this->pending_insn = NULL;
+        this->draining.clear();
         this->event_active.event(&zero);
     }
 }
@@ -61,25 +61,34 @@ void VuCompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     VuCompute *_this = (VuCompute *)__this;
 
-    // Check if the pending instruction has finished. Its timestamp was set when instruction
-    // started annd indicates when it must be terminated
-    if (_this->pending_insn)
+    // Release the instructions which finished draining through the FPU
+    // pipeline (plus their completion latency). Their scoreboard entry is
+    // released here; they did not block the issue of the instructions
+    // behind them.
+    for (auto it = _this->draining.begin(); it != _this->draining.end();)
     {
-        if (_this->pending_insn->timestamp <= _this->vu.iss.clock.get_cycles())
+        if ((*it)->timestamp <= _this->vu.iss.clock.get_cycles())
         {
-            // Notify vu so that it removes it from the pending instruction and update scoreboard
-            _this->vu.insn_end(_this->pending_insn);
-            // Clear it to take a new one
-            _this->pending_insn = NULL;
-            _this->event_pc.event_highz();
-            _this->event_label.event_string((char *)1, false);
+            // Notify vu so that it removes it from the pending instructions and updates the
+            // scoreboard
+            _this->vu.insn_end(*it);
+            it = _this->draining.erase(it);
+            if (_this->draining.empty() && _this->insns.empty())
+            {
+                _this->event_pc.event_highz();
+                _this->event_label.event_string((char *)1, false);
+            }
+        }
+        else
+        {
+            ++it;
         }
     }
 
     // Check if a new instruction can starts.
     // Take the first one from the queue and see if its timestamp has passed. This was set during
     // enqueue to make sure the instruction starts at best the cycle after.
-    if (_this->pending_insn == NULL && _this->insns.size() != 0 &&
+    if (_this->insns.size() != 0 &&
         _this->insns.front()->timestamp <= _this->vu.iss.clock.get_cycles())
     {
         PendingInsn *pending_insn = _this->insns.front();
@@ -91,8 +100,12 @@ void VuCompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
         if (ready)
         {
-            int nb_elem_per_cycle = _this->vu.nb_lanes * _this->vu.lane_width /
-                _this->vu.iss.vector.sewb;
+            // Widening/narrowing instructions process elements at half the
+            // nominal rate (elem_rate_shift = 1): the RTL VFU consumes the
+            // operand word over two cycles for widening and halves
+            // nr_elem_word for narrowing.
+            int nb_elem_per_cycle = (_this->vu.nb_lanes * _this->vu.lane_width /
+                _this->vu.iss.vector.sewb) >> insn->desc->elem_rate_shift;
 
             if (pending_insn->nb_bytes_done == 0)
             {
@@ -139,16 +152,26 @@ void VuCompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
             if (pending_insn->nb_bytes_done >= _this->total_size)
             {
-                _this->pending_insn = pending_insn;
-               	_this->insns.pop();
-                _this->pending_insn->timestamp = _this->vu.iss.clock.get_cycles() + insn->latency + 1;
+                // All chunks executed: the instruction completes without
+                // blocking the issue of the next instruction in the block.
+                // The FPU pipeline drain is not added to the scoreboard
+                // release: the release also gates WAW/WAR consumers and the
+                // queue slot retirement, which the RTL frees at commit time
+                // — the drain is only visible to RAW consumers, carried by
+                // the chaining gate through pipeline_latency,
+                // commit_done_cycle and chain_release_cycle.
+                _this->insns.pop();
+                pending_insn->commit_done_cycle = _this->vu.iss.clock.get_cycles();
+                pending_insn->timestamp = _this->vu.iss.clock.get_cycles() +
+                    insn->latency + 1;
+                _this->draining.push_back(pending_insn);
             }
 
         }
     }
 
     // In case nothing is on-going, disable the FSM
-    if (_this->insns.size() == 0 && _this->pending_insn == NULL)
+    if (_this->insns.size() == 0 && _this->draining.empty())
     {
         uint8_t zero = 0;
         _this->event_active.event(&zero);

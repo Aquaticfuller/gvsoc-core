@@ -16,9 +16,12 @@ and is unaffected.
 
 from __future__ import annotations
 
+from typing import Annotated
+
 import gvsoc.systree
 import gvrun.timing
 from config_tree import Config, cfg_field, HasSize
+from gvrun.runtime import Runtime
 from gvsoc.signature import IoV2Sync
 
 
@@ -95,7 +98,12 @@ class MemoryV3Config(Config, HasSize):
         "True to poison the backing buffer with 0x57 bytes at construction"
     ))
 
-    stim_file: str = cfg_field(default="", dump=True, desc=(
+    # Runtime-annotated: the resolved path differs between the build-time
+    # generation (source tree) and the run-time one (installed generators),
+    # so baking it into the compiled tree would make the tree signature
+    # unstable. As a runtime field it is overlaid from the JSON config at
+    # component construction instead.
+    stim_file: Annotated[str, Runtime] = cfg_field(default="", dump=True, desc=(
         "Path to a raw-binary file preloaded into the backing buffer "
         "(empty string means no preload)"
     ))

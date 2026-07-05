@@ -52,6 +52,10 @@ typedef struct
     uint8_t *data;
     vp::Trace tag_event;
     int64_t timestamp;
+    // Line brought in by the sequential prefetcher and not yet demanded.
+    // The first demand hit on it triggers the prefetch of the next line
+    // (tagged prefetching, like the RTL snitch_icache prefetcher).
+    bool prefetched;
 } cache_line_t;
 
 class Cache : public vp::Component
@@ -84,6 +88,8 @@ private:
 
     cache_line_t *refill(int line_index, unsigned int addr, unsigned int tag,
                           vp::IoReq *req, bool *pending);
+    void arm_prefetch(unsigned int addr);
+    void try_prefetch();
     cache_line_t *get_line(vp::IoReq *req, unsigned int *line_index,
                             unsigned int *tag, unsigned int *line_offset);
 
@@ -115,6 +121,16 @@ private:
 
     // Internal refill vehicle (cache owns exactly one — only one refill in flight).
     vp::IoReq refill_req;
+    // Sequential prefetcher state (active when cfg.prefetch). A demand miss
+    // or the first hit on a prefetched line arms the next line; the prefetch
+    // is issued through the refill port when it is otherwise idle, using its
+    // own request vehicle so responses can be told apart.
+    vp::IoReq prefetch_req;
+    bool prefetch_wanted = false;
+    unsigned int prefetch_addr = 0;
+    // The in-flight refill is a prefetch (pending_refill is reused as the
+    // busy flag so the demand path naturally queues behind it).
+    bool pending_is_prefetch = false;
 
     // FIFO of CPU requests that were acknowledged upstream (GRANTED) but not yet
     // served. Two sources feed it:
@@ -204,6 +220,7 @@ Cache::Cache(vp::ComponentConf &config)
             cache_line_t *line = &this->lines[i * this->cfg.ways + j];
             line->timestamp = -1;
             line->tag = -1;
+            line->prefetched = false;
             line->data = new uint8_t[this->cfg.line_size];
             this->traces.new_trace_event(
                 "set_" + std::to_string(j) + "/line_" + std::to_string(i),
@@ -229,6 +246,8 @@ void Cache::reset(bool active)
         this->refill_retry_pending = false;
         this->input_needs_retry = false;
         this->refill_timestamp = -1;
+        this->prefetch_wanted = false;
+        this->pending_is_prefetch = false;
     }
 }
 
@@ -240,6 +259,25 @@ void Cache::reset(bool active)
 vp::IoRespAck Cache::refill_resp(vp::Block *__this, vp::IoReq *req)
 {
     Cache *_this = (Cache *)__this;
+
+    // Asynchronous completion of a prefetch: tag the line and free the refill
+    // port; queued demand requests (if any) drain through check_state. No CPU
+    // request is attached to a prefetch.
+    if (req == &_this->prefetch_req)
+    {
+        if (!req->is_last)
+        {
+            return vp::IO_RESP_ACCEPTED;
+        }
+        cache_line_t *line = _this->refill_line;
+        line->tag = _this->refill_tag;
+        line->prefetched = true;
+        _this->pending_refill.set(0);
+        _this->pending_is_prefetch = false;
+        _this->refill_event.release();
+        _this->check_state();
+        return vp::IO_RESP_ACCEPTED;
+    }
 
     // Bypass path: the cache is disabled and we simply pass upstream requests
     // through. The request we receive here is the CPU's own request (not our
@@ -383,6 +421,107 @@ void Cache::check_state()
             this->event_enqueue(this->fsm_event, 1);
         }
     }
+
+    // The refill port is idle and no demand request is waiting: give the
+    // armed prefetch a chance.
+    if (!this->pending_refill.get() && !this->refill_retry_pending
+        && !this->refill_pending_reqs.has_reqs())
+    {
+        this->try_prefetch();
+    }
+}
+
+
+void Cache::arm_prefetch(unsigned int addr)
+{
+    if (!this->cfg.prefetch)
+    {
+        return;
+    }
+    this->prefetch_wanted = true;
+    this->prefetch_addr = (addr & ~((1U << this->line_size_bits) - 1))
+        + (1U << this->line_size_bits);
+}
+
+
+void Cache::try_prefetch()
+{
+    if (!this->prefetch_wanted || !this->enabled)
+    {
+        return;
+    }
+
+    unsigned int addr = this->prefetch_addr;
+    unsigned int tag = addr >> this->line_size_bits;
+    unsigned int line_index = tag & (this->nb_sets - 1);
+
+    this->prefetch_wanted = false;
+
+    // Already cached: nothing to do.
+    for (unsigned int i = 0; i < this->cfg.ways; i++)
+    {
+        if (this->lines[line_index * this->cfg.ways + i].tag == tag)
+        {
+            return;
+        }
+    }
+
+    unsigned int way = this->step_lru() % this->cfg.ways;
+    cache_line_t *line = &this->lines[line_index * this->cfg.ways + way];
+
+    uint32_t full_addr = ((addr & ~((1U << this->line_size_bits) - 1))
+                          << this->cfg.refill_shift) + this->cfg.refill_offset;
+
+    this->trace.msg(vp::Trace::LEVEL_DEBUG,
+        "Prefetching line (addr: 0x%x, index: %d, way: %d)\n",
+        full_addr, line_index, way);
+
+    line->tag_event.event((uint8_t *)&full_addr);
+
+    vp::IoReq *r = &this->prefetch_req;
+    r->prepare();
+    r->is_first = true;
+    r->is_last = true;
+    r->burst_id = -1;
+    r->set_addr(full_addr);
+    r->set_is_write(false);
+    r->set_size(1U << this->line_size_bits);
+    r->set_data(line->data);
+
+    vp::IoReqStatus st = this->refill_itf.req(r);
+
+    if (st == vp::IO_REQ_GRANTED)
+    {
+        this->refill_line = line;
+        this->refill_tag = tag;
+        this->pending_refill.set(1);
+        this->pending_is_prefetch = true;
+        return;
+    }
+
+    if (st == vp::IO_REQ_DENIED)
+    {
+        // Best effort: drop the prefetch. The downstream will emit a
+        // spurious retry() which refill_retry tolerates.
+        return;
+    }
+
+    // Synchronous completion: the line lands after the accumulated refill
+    // window; demand hits arriving before that pay the remaining time
+    // (this is exactly how the prefetch hides the refill latency), and a
+    // demand miss serialises behind the port occupancy.
+    int64_t now = this->clock.get_cycles();
+    int64_t latency = 0;
+    if (now < this->refill_timestamp)
+    {
+        latency += this->refill_timestamp - now;
+    }
+    latency += r->get_full_latency() + this->cfg.refill_latency;
+
+    this->refill_timestamp = now + latency;
+    line->tag = tag;
+    line->prefetched = true;
+    line->timestamp = now + latency;
 }
 
 
@@ -567,6 +706,7 @@ vp::IoReqStatus Cache::handle_req(vp::IoReq *req)
         this->trace.msg(vp::Trace::LEVEL_DEBUG, "Cache miss\n");
         uint64_t offset = req->get_addr();
         this->refill_event.set(offset);
+        this->arm_prefetch(offset);
         bool pending = false;
         hit_line = this->refill(line_index, offset, tag, req, &pending);
         if (hit_line == nullptr)
@@ -590,6 +730,13 @@ vp::IoReqStatus Cache::handle_req(vp::IoReq *req)
         if (now < hit_line->timestamp)
         {
             req->inc_latency(hit_line->timestamp - now);
+        }
+        // First demand hit on a prefetched line: keep the sequential stream
+        // going by arming the next line (tagged prefetching).
+        if (hit_line->prefetched)
+        {
+            hit_line->prefetched = false;
+            this->arm_prefetch(req->get_addr());
         }
     }
 
@@ -659,6 +806,10 @@ vp::IoReqStatus Cache::input_req(vp::Block *__this, vp::IoReq *req)
         // acked to the master). Propagate DENIED and remember that we owe an
         // input.retry() once the refill port wakes up.
         _this->input_needs_retry = true;
+    }
+    else if (!_this->pending_refill.get() && !_this->refill_retry_pending)
+    {
+        _this->try_prefetch();
     }
     return st;
 }

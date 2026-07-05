@@ -19,6 +19,7 @@
  */
 
  #include <cstdint>
+ #include <cstring>
  #include <vp/stats/stats_engine.hpp>
  #include <cpu/iss_v2/include/cores/vector_unit/vector_unit.hpp>
 
@@ -131,10 +132,12 @@ PendingInsn *Vu::pending_insn_alloc(InsnEntry *entry)
     pending_insn->nb_bytes_done = 0;
 
     iss_insn_t *insn = this->iss.exec.get_insn(entry);
-    pending_insn->in_can_be_chained = insn->decoder_item->u.insn.block_id != Vu::vslide_id &&
-        insn->desc->chaining_factor != 0.0f;
-    pending_insn->out_can_be_chained = insn->decoder_item->u.insn.block_id != Vu::vslide_id &&
-        insn->desc->out_chaining_factor != 0.0f;
+    // Chaining is controlled per instruction through the chaining factors:
+    // the RTL prevents chaining only for the slide-up family and the
+    // strided/indexed memory accesses (their factors are set to 0 by the
+    // ISA setup); slide-down and vmv chain like any other instruction.
+    pending_insn->in_can_be_chained = insn->desc->chaining_factor != 0.0f;
+    pending_insn->out_can_be_chained = insn->desc->out_chaining_factor != 0.0f;
 
     return pending_insn;
 }
@@ -155,12 +158,36 @@ void Vu::insn_enqueue(InsnEntry *entry)
     pending_insn->chaining_factor = insn->desc->chaining_factor;
     pending_insn->out_chaining_factor = insn->desc->out_chaining_factor;
 
+    // Derive the FPU pipeline depth from the instruction class and the
+    // effective element width (the fpnew per-format register stages of the
+    // spatz timing configuration: fp64: 2, fp32: 1, fp16/fp8: 0,
+    // non-computational: 1, conversions: 2). Widening instructions compute
+    // at the destination width (elem_rate_shift doubles it).
+    pending_insn->pipeline_latency = 0;
+    switch (insn->desc->fpu_lat_class)
+    {
+        case 1:
+        {
+            int sewb_eff = this->iss.vector.sewb << insn->desc->elem_rate_shift;
+            pending_insn->pipeline_latency = sewb_eff >= 8 ? 2 : sewb_eff == 4 ? 1 : 0;
+            break;
+        }
+        case 2:
+            pending_insn->pipeline_latency = 1;
+            break;
+        case 3:
+            pending_insn->pipeline_latency = 2;
+            break;
+    }
+
     // Mark the instruction to be handled in the next cycle in case the FSM is already active
     // to prevent it from handling it in the next cycle
     pending_insn->timestamp = this->iss.clock.get_cycles() + 1;
 
     // Not yet executing in any block; set by the block at its real start.
     pending_insn->exec_start_cycle = -1;
+    pending_insn->commit_done_cycle = -1;
+    pending_insn->chain_release_cycle = 0;
 
     // Copy the CVA6 register since we will use it later and it will probably change before that
     int reg = insn->in_regs[0];
@@ -445,6 +472,14 @@ bool Vu::insn_ready(PendingInsn *insn)
         return false;
     }
 
+    // Trailing drain of already-released input dependencies: their
+    // scoreboard entry is gone but their results were only written
+    // pipeline_latency cycles after the last operand word entered the unit.
+    if (this->iss.clock.get_cycles() < insn->chain_release_cycle)
+    {
+        return false;
+    }
+
     uint64_t deps_mask = this->insns_in_deps[insn->id];
 
     if (deps_mask == 0) return true;
@@ -460,13 +495,65 @@ bool Vu::insn_ready(PendingInsn *insn)
 
             int chunk_size = this->nb_lanes * this->lane_width;
 
-            if (!dep_insn->out_can_be_chained || dep_insn->nb_bytes_done * dep_insn->out_chaining_factor <
-                    (insn->nb_bytes_done + chunk_size) * insn->chaining_factor)
+            if (!dep_insn->out_can_be_chained)
                 return false;
+
+            // A chained consumer trails the producer by one chunk plus the
+            // producer's FPU pipeline depth: the producer's result word is
+            // only written pipeline_latency cycles after its operands
+            // entered the unit (one chunk is processed per cycle, so the
+            // extra trailing distance is expressed in chunks).
+            if (dep_insn->nb_bytes_done * dep_insn->out_chaining_factor <
+                    (insn->nb_bytes_done + chunk_size * (1 + dep_insn->pipeline_latency)) * insn->chaining_factor)
+            {
+                // The producer cannot progress any further once fully
+                // committed; its remaining results become available as it
+                // drains through the pipeline, one word per cycle counted
+                // from the commit time (plus one cycle to consume the
+                // written word). Without this the consumer's trailing
+                // chunks would wait for the producer's scoreboard release,
+                // overcharging tight accumulation chains where the RTL
+                // trails word by word.
+                if (dep_insn->pipeline_latency == 0 || dep_insn->commit_done_cycle < 0)
+                    return false;
+
+                float out_factor = dep_insn->out_chaining_factor != 0.0f ?
+                    dep_insn->out_chaining_factor : 1.0f;
+                float base_needed = (insn->nb_bytes_done + chunk_size) *
+                    insn->chaining_factor / out_factor;
+                float avail = dep_insn->nb_bytes_done;
+                if (base_needed > avail)
+                    base_needed = avail;
+                int64_t t_needed = dep_insn->commit_done_cycle -
+                    (int64_t)((avail - base_needed) / chunk_size);
+                if (this->iss.clock.get_cycles() < t_needed + dep_insn->pipeline_latency + 1)
+                    return false;
+            }
 
             deps_mask &= ~(1 << dep_insn_id);
         }
         return true;
+    }
+
+    // Non-chainable consumer: blocked until its dependencies are released
+    // from the scoreboard. The producer's pipeline drain outlives that
+    // release, so remember the drain horizon on the consumer — it keeps
+    // gating it (chain_release_cycle above) after the mask has cleared.
+    while (deps_mask)
+    {
+        int dep_insn_id = __builtin_ctzll(deps_mask);
+        PendingInsn *dep_insn = &this->pending_insns[dep_insn_id];
+
+        if (dep_insn->pipeline_latency > 0 && dep_insn->commit_done_cycle >= 0)
+        {
+            int64_t release = dep_insn->commit_done_cycle + dep_insn->pipeline_latency + 1;
+            if (release > insn->chain_release_cycle)
+            {
+                insn->chain_release_cycle = release;
+            }
+        }
+
+        deps_mask &= ~(1 << dep_insn_id);
     }
 
     this->trace.msg(vp::Trace::LEVEL_TRACE, "Instruction input dependency (id: %d, deps: 0x%x)\n",
@@ -504,12 +591,67 @@ void Vu::insn_commit(PendingInsn *pending_insn)
     this->iss.exec.insn_terminate(pending_insn->entry);
 }
 
+// A vsetvli executes its functional effect (csr.vtype / csr.vl update)
+// immediately at issue, before the instructions still queued ahead of it
+// are handled. Those queued ops read the vector configuration live when
+// they run, so a vsetvli that changes vtype or vl must wait for the queue
+// to drain first, or it would corrupt them. A vsetvli that re-selects the
+// SAME configuration is harmless and, like the RTL, must not stall — this
+// is the common case in stripmined loops (a constant `vsetvli` per
+// iteration) and dominates the dp-fdotp cycle-count gap.
+//
+// Returns true if the queue must be drained before this instruction. Only
+// the immediate `vsetvli` form is analysed; any other config-setting
+// instruction conservatively drains.
+static bool vsetvli_needs_drain(Iss *iss, iss_insn_t *insn)
+{
+    if (strcmp(insn->desc->label, "vsetvli") != 0)
+    {
+        return true;
+    }
+
+    // uim[2] is the vtype immediate. A different vtype changes SEW/LMUL
+    // (and hence VLMAX), so the queued ops must drain first.
+    if ((iss_reg_t)insn->uim[2] != iss->csr.vtype.value)
+    {
+        return true;
+    }
+
+    // vtype unchanged => SEW/LMUL/VLMAX unchanged. Compute the vl this
+    // vsetvli would set and drain only if it differs from the current vl.
+    int vlmax = (int)((float)CONFIG_ISS_VLEN / (iss->vector.sewb * 8)
+                      * iss->vector.lmul);
+    int idx_rs1 = insn->in_regs[0];
+    int idx_rd  = insn->out_regs[0];
+    iss_reg_t new_vl;
+    if (idx_rs1)
+    {
+        iss_reg_t avl = iss->regfile.get_reg_untimed(idx_rs1);
+        new_vl = avl < (iss_reg_t)vlmax ? avl : (iss_reg_t)vlmax;
+    }
+    else if (idx_rd)
+    {
+        new_vl = vlmax;
+    }
+    else
+    {
+        new_vl = iss->csr.vl.value;
+    }
+
+    return new_vl != iss->csr.vl.value;
+}
+
 iss_reg_t Vu::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    // We stall the instruction if ara queue is full or if the instruction is vsetvli and
-    // the queue is nto empty to avoid issues with different vreg config
+    // We stall the instruction if the ara queue is full, or if it is a
+    // config-changing vsetvli and the queue is not empty (see
+    // vsetvli_needs_drain): the vsetvli's csr update lands immediately and
+    // would otherwise corrupt the queued ops that still read the old
+    // configuration.
     if (iss->arch.vu.queue_is_full() ||
-        insn->decoder_item->u.insn.block_id == -1 && !iss->arch.vu.queue_is_empty())
+        (insn->decoder_item->u.insn.block_id == -1
+         && !iss->arch.vu.queue_is_empty()
+         && vsetvli_needs_drain(iss, insn)))
     {
         iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "%s queue is full (pc: 0x%lx)\n",
             iss->arch.vu.queue_is_full() ? "Ara" : "Core", pc);

@@ -17,6 +17,7 @@ from typing_extensions import override
 
 from config_tree import Config, cfg_field
 from gvsoc.systree import Component, SlaveItf
+from gvsoc.signature import IoV2BigPacket
 from gvsoc.gui import Signal
 
 
@@ -69,6 +70,13 @@ class CacheConfig(Config):
 
     refill_latency: int = cfg_field(default=0, dump=True, desc=(
         "Latency in cycles for a refill request to the next memory level"
+    ))
+
+    prefetch: bool = cfg_field(default=False, dump=True, desc=(
+        "Enable the sequential next-line prefetcher: a demand miss (or the "
+        "first hit on a prefetched line) prefetches the following line "
+        "through the refill port when it is otherwise idle, hiding the "
+        "refill latency of streaming code (RTL snitch_icache prefetcher)"
     ))
 
 
@@ -369,8 +377,14 @@ class Cache(Component):
 
         The address sent downstream is transformed according to the
         configured ``refill_shift`` and ``refill_offset``.
+
+        The refill master routes responses by request identity, so it is
+        declared :class:`IoV2BigPacket`: against a beat slave (e.g. a
+        ``router_v2`` beat crossbar) the framework auto-inserts the
+        collapse adapter instead of letting the per-beat response stream
+        reach the cache directly.
         """
-        self.itf_bind('refill', itf, signature='io_v2')
+        self.itf_bind('refill', itf, signature=IoV2BigPacket())
 
     @override
     def gen_gui(self, parent_signal: Signal):

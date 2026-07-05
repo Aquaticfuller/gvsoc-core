@@ -355,6 +355,21 @@ typedef struct iss_decoder_insn_s
 #if defined(CONFIG_ISS_HAS_VECTOR)
     float chaining_factor = 1.0f;
     float out_chaining_factor = 1.0f;
+    // Right-shift applied to the vector unit's per-cycle element rate.
+    // Widening and narrowing instructions process elements at half the
+    // nominal SEW rate (the RTL VFU consumes the operand word over two
+    // cycles for widening — widening_upper mux — and halves nr_elem_word
+    // for narrowing), so they set this to 1.
+    int elem_rate_shift = 0;
+    // FPU pipeline class, used to derive the fpnew pipeline depth (the
+    // per-format register stages of the spatz timing configuration).
+    // 0: not an FPU op (or covered by its own timing model, e.g.
+    //    reductions), no pipeline latency
+    // 1: computational op (add/sub/mul/fma families) — format-dependent
+    //    depth (fp64: 2, fp32: 1, fp16/fp8: 0)
+    // 2: non-computational op (min/max/sgnj/compare/class) — 1 stage
+    // 3: conversion — 2 stages
+    int fpu_lat_class = 0;
 #endif
 } iss_decoder_insn_t;
 

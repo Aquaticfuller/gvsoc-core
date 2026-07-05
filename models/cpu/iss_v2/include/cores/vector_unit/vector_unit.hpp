@@ -55,7 +55,26 @@ public:
     // instruction (not when it was enqueued/queued). -1 until then. Used to
     // measure per-label execution duration up to Vu::insn_end.
     int64_t exec_start_cycle;
-
+    // FPU pipeline depth of this instruction (cycles between an operand
+    // word entering the unit and its result word being written), derived
+    // at issue time from the fpu_lat_class and the effective element
+    // width. Dependent instructions trail this many extra cycles behind
+    // (chaining gate) and the scoreboard entry is released this many
+    // cycles after the last chunk, without blocking the issue of the
+    // next instruction in the block.
+    int pipeline_latency;
+    // Cycle at which the last chunk of this instruction was executed
+    // (all bytes committed), -1 while still executing. Used by the
+    // chaining gate to time the consumer's trailing chunks against the
+    // producer's pipeline drain instead of its scoreboard release.
+    int64_t commit_done_cycle;
+    // Earliest cycle at which this instruction may execute its next chunk,
+    // accumulated from the pipeline drain of its (possibly already
+    // released) input dependencies. Carried on the consumer because the
+    // scoreboard entry of the producer is released before its pipeline has
+    // drained (the release also gates WAW/WAR, which the RTL frees
+    // per-word).
+    int64_t chain_release_cycle;
 };
 
 // This represents a generic HW block where vector instructions can be forwarded
@@ -99,8 +118,11 @@ private:
     // Queue of pending instructions to be processed by this block
     // The block process them in-order
     std::queue<PendingInsn *> insns;
-    // Current instruction being processed
-    PendingInsn *pending_insn;
+    // Instructions whose chunks have all been executed but which are still
+    // draining through the FPU pipeline (plus their completion latency).
+    // They do not block the issue of the next instruction; their
+    // scoreboard entry is released once their timestamp has passed.
+    std::vector<PendingInsn *> draining;
     // When the instruction is chained, this indicates the minimum cyclestamp where the instruction
     // can finished, based on operation duration.
     int64_t end_cyclestamp;
@@ -111,6 +133,11 @@ private:
 
 class VuLsuPendingInsn
 {
+public:
+    // Cycle at which the instruction entered the block queue. Used to
+    // discount the dispatch latency already absorbed while waiting
+    // behind the previous instruction's request stream.
+    int64_t enqueue_cycle = 0;
 public:
     PendingInsn *insn;
     // Number of pending bursts. This is used to detect when the instruction is fully done.
@@ -130,6 +157,16 @@ public:
 // status codes are ``IO_REQ_DONE``/``GRANTED``/``DENIED``, error reporting
 // rides on the response status (``IO_RESP_OK``/``IO_RESP_INVALID``), and the
 // retry/resp callbacks are mandatory (passed at port construction time).
+//
+// All three downstream forms are supported, so the VLSU ports can face a
+// deny/retry arbiter such as ``interco.log_ico_v2``:
+//   - DONE: completion is scheduled ``get_full_latency()`` cycles later
+//     through the delayed-bursts priority queue.
+//   - GRANTED: completion arrives through the resp() callback.
+//   - DENIED: the request is parked on its port and re-issued synchronously
+//     inside the retry() callback (mandatory io_v2 contract — the log ico
+//     keeps its accept window open only for the duration of the retry call).
+//     Only the denied port stalls; the other ports keep streaming.
 class VuLsu : public VuBlock
 {
 public:
@@ -157,6 +194,14 @@ private:
     // and response notification on resp.
     static void port_retry_muxed(vp::Block *__this, int id, vp::IoRetryChannel);
     static vp::IoRespAck port_resp_muxed(vp::Block *__this, vp::IoReq *req, int id);
+
+    // Called when a request has been accepted with DONE: either complete it
+    // now or push it to the delayed-bursts queue for get_full_latency()
+    // cycles.
+    void handle_done(vp::IoReq *req);
+    // Terminate one burst: commit its elements to the VRF (chaining) and
+    // retire it from the per-port in-order ROB.
+    void burst_done(vp::IoReq *req);
 
     // Number of instruction that can be enqueued at the same time
     static constexpr int queue_size = 4;
@@ -192,6 +237,9 @@ private:
     std::vector<vp::Queue *> req_queues;
     // Whole list of requests for all ports
     std::vector<vp::IoReq> requests;
+    // Per-port request denied by the downstream and waiting for its retry()
+    // signal. A port with a parked request issues nothing else.
+    std::vector<vp::IoReq *> denied_reqs;
     int nb_ports;
     iss_reg_t stride;
     bool strided;
@@ -206,6 +254,61 @@ private:
 
     // Ongoing instruction
     int insn_ongoing;
+
+    // Bursts which have been handled synchronously with a delay. They are
+    // held here until their delay has elapsed.
+    struct DelayedBurst
+    {
+        vp::IoReq *req;
+        uint64_t timestamp;
+    };
+
+    struct DelayedBurstCompare
+    {
+        bool operator()(const DelayedBurst &a, const DelayedBurst &b) const
+        {
+            return a.timestamp > b.timestamp;
+        }
+    };
+
+    std::priority_queue<DelayedBurst, std::vector<DelayedBurst>, DelayedBurstCompare> delayed_bursts;
+
+    // Per-port in-order reorder buffer entry. The request keeps a pointer to
+    // its entry in ``initiator`` (io_v2 has no arg stack).
+    struct VlsuRobEntry
+    {
+        // Port and id
+        int port = 0;
+        int rob_id = 0;
+
+        // If the entry is allocated to a request
+        bool allocated = false;
+
+        // If the response is valid
+        bool valid = false;
+
+        // Request itself
+        vp::IoReq *req = nullptr;
+
+        // Instruction slot which issued the request
+        VuLsuPendingInsn *slot = nullptr;
+
+        // Vector register
+        int vreg = 0;
+
+        int elem_size = 0;
+        int vstart = 0;
+        int size = 0;
+    };
+
+    // Reorder buffer
+    std::vector<std::vector<VlsuRobEntry>> rob;
+    // Next available entry in the ROB for each port
+    std::vector<int> rob_next;
+    // The first entry in the ROB which is waiting for response for each port
+    std::vector<int> rob_first;
+    // Number of allocated entries in the ROB for each port
+    std::vector<int> rob_count;
 };
 
 #else
