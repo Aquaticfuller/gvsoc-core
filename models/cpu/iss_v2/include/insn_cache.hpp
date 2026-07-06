@@ -48,6 +48,11 @@ public:
     inline void insn_init(iss_insn_t *insn, iss_addr_t addr);
     InsnPage *page_get(iss_reg_t paddr);
 
+    // Bumped on every flush (full or mode flush). Consumers caching
+    // pointers into the pages (e.g. the DBT translation cache) compare
+    // it to detect that their cached state went stale.
+    int generation = 0;
+
 
 private:
     InsnPage *current_insn_page;

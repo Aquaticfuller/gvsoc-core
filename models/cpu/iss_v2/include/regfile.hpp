@@ -84,6 +84,15 @@ public:
     inline void scoreboard_insn_clear(iss_insn_t *insn);
     inline void scoreboard_insn_start(iss_insn_t *insn);
     inline void scoreboard_insn_end(iss_insn_t *insn);
+    // True when no register is in flight (always true without a
+    // scoreboard). Used by the DBT dispatch to enter translated code
+    // only from a clean state.
+    inline bool scoreboard_is_clean();
+
+    // Host address of the raw register array (64-bit slots, x0 writes
+    // land in the trailing dummy slot). Used by the DBT backend to
+    // access registers directly from translated code.
+    inline uint64_t *dbt_regs() { return this->regs; }
 
 #ifdef CONFIG_GVSOC_ISS_REGFILE_SCOREBOARD
     inline void sb_reg_invalid_set(int reg);
@@ -297,6 +306,11 @@ inline void Regfile::scoreboard_insn_end(iss_insn_t *insn)
 {
     this->sb_reg_invalid_clear_mask(insn->sb_out_reg_mask);
 }
+
+inline bool Regfile::scoreboard_is_clean()
+{
+    return this->sb_reg_invalid == 0;
+}
 #else
 inline bool Regfile::scoreboard_insn_check(iss_insn_t *insn)
 {
@@ -313,6 +327,11 @@ inline void Regfile::scoreboard_insn_end(iss_insn_t *insn)
 
 inline void Regfile::scoreboard_insn_clear(iss_insn_t *insn)
 {
+}
+
+inline bool Regfile::scoreboard_is_clean()
+{
+    return true;
 }
 
 #endif

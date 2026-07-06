@@ -89,6 +89,11 @@ public:
     // Called when the external IRQ unit receives a new interrupt state.
     inline void irq_req_hook(int irq, bool irq_enabled) {}
 
+    // Number of accesses in flight (held instructions or deferred
+    // completions). Used by the DBT dispatch to enter translated code
+    // only from a clean state.
+    inline int get_nb_pending_accesses() { return this->nb_pending_accesses; }
+
     template<typename T>
     inline bool store(iss_insn_t *insn, iss_addr_t addr, int size, int reg);
 

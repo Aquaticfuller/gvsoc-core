@@ -83,6 +83,10 @@ public:
 
     virtual inline bool can_switch_to_fast_mode();
     inline void switch_to_full_mode();
+    // Installs the fast dispatch callback once can_switch_to_fast_mode()
+    // allowed it. Virtual so an exec variant with its own fast dispatch
+    // (e.g. the DBT block executor) can substitute its own callback.
+    virtual void switch_to_fast_mode();
 
     inline void enqueue_task(Task *task);
 
@@ -179,8 +183,19 @@ public:
 protected:
     Iss &iss;
 
+    // Reflects retained transitions on the dispatch event. Virtual so an
+    // exec variant driving its event in enqueued mode (DBT) can
+    // substitute cancel/enqueue for the disable/enable done here.
+    virtual void retain_check();
+    inline bool handle_tasks();
+
+    bool is_insn_stalled;
+    bool is_insn_hold;
+    Task *first_task;
+    int stall_cycles;
+    vp::Trace asm_trace_event;
+
 private:
-    void retain_check();
     static void flush_cache_ack_sync(vp::Block *_this, bool active);
     static void clock_sync(vp::Block *_this, bool active);
     static void bootaddr_sync(vp::Block *_this, uint32_t value);
@@ -188,7 +203,6 @@ private:
     void bootaddr_apply(uint32_t value);
     inline InsnEntry *get_entry();
     inline void release_entry(InsnEntry *entry);
-    inline bool handle_tasks();
 
     vp::WireMaster<bool> busy_itf;
     vp::WireMaster<bool> flush_cache_req_itf;
@@ -199,14 +213,8 @@ private:
 
     bool clock_active;
 
-    vp::Trace asm_trace_event;
-
-    bool is_insn_stalled;
-    bool is_insn_hold;
     InsnEntry *first_entry = NULL;
-    Task *first_task;
     InsnEntry *wfi_entry;
-    int stall_cycles;
 
 #ifdef CONFIG_GVSOC_ISS_EXEC_INORDER_COMMIT
 public:

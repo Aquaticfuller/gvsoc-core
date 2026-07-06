@@ -279,7 +279,7 @@ void ExecInOrder::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
     // if HW counters are disabled as they are checked with the slow handler
     if (_this->can_switch_to_fast_mode())
     {
-        _this->instr_event.set_callback(&ExecInOrder::exec_instr);
+        _this->switch_to_fast_mode();
     }
 
     if (!_this->skip_irq_check)
@@ -552,6 +552,11 @@ void ExecInOrder::clock_sync(vp::Block *__this, bool active)
     _this->clock_active = active;
 }
 
+
+void ExecInOrder::switch_to_fast_mode()
+{
+    this->instr_event.set_callback(&ExecInOrder::exec_instr);
+}
 
 void ExecInOrder::retain_check()
 {

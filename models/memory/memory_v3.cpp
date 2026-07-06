@@ -66,6 +66,7 @@ public:
     vp::DebugMemIf *debug_mem_if() override { return this; }
     int debug_mem_access(uint64_t addr, uint8_t *data, uint64_t size,
         bool is_write) override;
+    uint8_t *debug_mem_hostptr(uint64_t addr, uint64_t size) override;
 
     MemoryV3Config cfg;
 
@@ -387,6 +388,30 @@ vp::IoReqStatus Memory::req(vp::Block *__this, vp::IoReq *req)
 }
 
 
+
+uint8_t *Memory::debug_mem_hostptr(uint64_t addr, uint64_t size)
+{
+    // Direct accesses bypass integrity checking and the memcheck
+    // shadow; refuse the window when either is active so those
+    // features keep seeing every access.
+    if (this->check_mem != NULL)
+    {
+        return NULL;
+    }
+#ifdef VP_MEMCHECK_ACTIVE
+    if (this->memcheck_enabled)
+    {
+        return NULL;
+    }
+#endif
+
+    if (addr + size > (uint64_t)this->cfg.size)
+    {
+        return NULL;
+    }
+
+    return this->mem_data + addr;
+}
 
 int Memory::debug_mem_access(uint64_t addr, uint8_t *data, uint64_t size, bool is_write)
 {

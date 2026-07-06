@@ -65,6 +65,8 @@ void InsnCache::flush()
 
 void InsnCache::mode_flush()
 {
+    // Covers full flushes as well: flush() calls mode_flush().
+    this->generation++;
     this->current_insn_page_base = -INSN_PAGE_SIZE*2;
 }
 
