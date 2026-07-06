@@ -29,18 +29,29 @@ class TrafficReceiverConfig
 public:
     bool is_start = false;
     int bandwidth;
+    // Pacing rate is <bandwidth> bytes per <bandwidth_period> cycles, so
+    // sub-byte-per-cycle and fractional rates are expressible (e.g. one 8-byte
+    // beat every 3.5 cycles is bandwidth=16, bandwidth_period=7). The v2
+    // receiver accumulates the remainder across requests instead of rounding
+    // per request.
+    int bandwidth_period = 1;
+    // Fixed response delay in cycles, applied to every request on top of the
+    // pacing. Pipelined: delays the response without holding back the pacing
+    // of the following requests.
+    int latency = 0;
 };
 
 
 class TrafficReceiverConfigMaster : public vp::WireMaster<TrafficReceiverConfig>
 {
 public:
-    inline void start(int bandwidth);
+    inline void start(int bandwidth, int bandwidth_period=1, int latency=0);
 };
 
 
-inline void TrafficReceiverConfigMaster::start(int bandwidth)
+inline void TrafficReceiverConfigMaster::start(int bandwidth, int bandwidth_period, int latency)
 {
-    TrafficReceiverConfig config = { .is_start=true, .bandwidth=bandwidth };
+    TrafficReceiverConfig config = { .is_start=true, .bandwidth=bandwidth,
+        .bandwidth_period=bandwidth_period, .latency=latency };
     this->sync(config);
 }

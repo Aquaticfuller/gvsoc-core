@@ -264,6 +264,11 @@ void GeneratorV2::handle_step()
             if (!this->sync_step2_done)
             {
                 this->sync_step2_done = true;
+                // Capture the duration at THIS generator's own completion.
+                // The post-transfer hook below only runs once every generator
+                // reached the barrier, which would report the slowest flow's
+                // time for all of them and mask any unfairness between flows.
+                this->duration = this->clock.get_cycles() - this->start_cycles;
                 this->sync->nb_transfers_done++;
                 if (this->sync->nb_transfers_done == this->sync->generators.size())
                 {
@@ -324,8 +329,6 @@ void GeneratorV2::handle_transfer()
 
 void GeneratorV2::handle_post_transfer()
 {
-    this->duration = this->clock.get_cycles() - this->start_cycles;
-
     if (this->check && this->check_write)
     {
         this->close_transfer();

@@ -22,6 +22,7 @@
  * master holds and resends them per the v2 protocol).
  */
 
+#include <algorithm>
 #include <queue>
 #include <vp/vp.hpp>
 #include <vp/signal.hpp>
@@ -51,6 +52,13 @@ private:
     vp::Queue ready_reqs;
     int64_t ready_timestamp = -1;
     int bandwidth = 0;
+    // Pacing rate is <bandwidth> bytes per <bandwidth_period> cycles; the
+    // division remainder is carried over to the next request so the average
+    // rate is exact even when requests are smaller than the rate quantum.
+    int bandwidth_period = 1;
+    int64_t pace_rem = 0;
+    // Fixed pipelined response delay, on top of the pacing.
+    int latency = 0;
     int max_pending_reqs = 4;
     vp::Signal<bool> stalled;
     // v2 deny/retry: true when a master was denied and is owed a retry() once
@@ -164,8 +172,12 @@ void ReceiverV2::log_access(uint64_t addr, uint64_t size, bool is_write)
 void ReceiverV2::control_sync(vp::Block *__this, TrafficReceiverConfig config)
 {
     ReceiverV2 *_this = (ReceiverV2 *)__this;
-    _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Start (bw: %d)\n", config.bandwidth);
+    _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Start (bw: %d per %d cycles, latency: %d)\n",
+        config.bandwidth, config.bandwidth_period, config.latency);
     _this->bandwidth = config.bandwidth;
+    _this->bandwidth_period = config.bandwidth_period;
+    _this->latency = config.latency;
+    _this->pace_rem = 0;
 }
 
 void ReceiverV2::pending_fsm_handler(vp::Block *__this, vp::ClockEvent *event)
@@ -178,13 +190,16 @@ void ReceiverV2::pending_fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
         if (_this->bandwidth > 0)
         {
-            int64_t cycles = (req->get_size() + _this->bandwidth - 1) / _this->bandwidth;
+            int64_t num = (int64_t)req->get_size() * _this->bandwidth_period + _this->pace_rem;
+            int64_t cycles = num / _this->bandwidth;
+            _this->pace_rem = num % _this->bandwidth;
             _this->ready_timestamp = _this->clock.get_cycles() + cycles;
-            _this->ready_reqs.push_back(req, cycles - 1);
+            _this->ready_reqs.push_back(req,
+                std::max((int64_t)0, cycles - 1 + _this->latency));
         }
         else
         {
-            _this->ready_reqs.push_back(req, 0);
+            _this->ready_reqs.push_back(req, _this->latency);
         }
     }
 
