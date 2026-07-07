@@ -384,7 +384,11 @@ void RouterBandwidth::drain_queue(InputPort *in)
 {
     while (!in->queue.empty())
     {
-        QueuedReq &q = in->queue.front();
+        // Copy, do NOT take a reference: pop_front() below can release the
+        // deque chunk the front element lives in, and the DENIED path still
+        // reads q.output_id to re-queue the request — a use-after-free that
+        // shows up as a garbage output_id and a permanently stalled input.
+        QueuedReq q = in->queue.front();
         OutputPort *out = this->entries[q.output_id];
         if (out->stalled) return;   // another DENY on this or later forward
 

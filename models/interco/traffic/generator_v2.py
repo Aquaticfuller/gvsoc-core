@@ -20,11 +20,15 @@ import gvsoc.systree
 class GeneratorV2(gvsoc.systree.Component):
     """v2 traffic generator (io_v2 output)."""
 
-    def __init__(self, parent, name, nb_pending_reqs=64):
+    def __init__(self, parent, name, nb_pending_reqs=64, max_burst_size=0):
 
         super().__init__(parent, name)
 
         self.add_property('nb_pending_reqs', nb_pending_reqs)
+        # Legalize generated bursts like an AXI DMA: no burst exceeds
+        # max_burst_size or crosses a max_burst_size boundary (the 4KB rule).
+        # 0 (default) keeps the raw packet_size chunking.
+        self.add_property('max_burst_size', max_burst_size)
 
         self.add_sources(['interco/traffic/generator_v2.cpp'])
 

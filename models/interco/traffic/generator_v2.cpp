@@ -92,6 +92,8 @@ private:
     uint64_t config_size;
     uint64_t config_address;
     size_t packet_size;
+    // Burst legalization boundary (AXI 4KB rule); 0 disables it.
+    uint64_t max_burst_size;
 
     // v2: the slave only sends retry() (no req argument) — the master must
     // hold the request that was denied and re-send it.
@@ -128,6 +130,7 @@ GeneratorV2::GeneratorV2(vp::ComponentConf &config)
     this->new_slave_port("control", &this->control_itf);
 
     this->nb_pending_reqs = this->get_js_config()->get_int("nb_pending_reqs");
+    this->max_burst_size = this->get_js_config()->get_uint("max_burst_size");
 }
 
 GeneratorV2::~GeneratorV2()
@@ -413,17 +416,30 @@ void GeneratorV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
         req->prepare();
 
-        req->set_size(_this->current_transfer->packet_size);
+        // Burst legalization, like an AXI DMA (iDMA HardwareLegalizer): a burst
+        // may not exceed max_burst_size nor cross a max_burst_size boundary (the
+        // AXI 4KB rule), so it always lands in a single target. Cap the chunk to
+        // the requested packet_size, the bytes left before the next boundary,
+        // and the bytes left in the transfer.
+        uint64_t chunk = _this->current_transfer->packet_size;
+        if (_this->max_burst_size > 0)
+        {
+            uint64_t to_boundary = _this->max_burst_size - (_this->address % _this->max_burst_size);
+            if (chunk > to_boundary) chunk = to_boundary;
+        }
+        if (chunk > _this->size.get()) chunk = _this->size.get();
+
+        req->set_size(chunk);
         req->set_addr(_this->address);
         req->set_data(_this->data);
         req->set_is_write(_this->current_transfer->do_write);
 
         _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Sending request (req: %p, address: 0x%llx, size: 0x%llx, packet_size: 0x%llx)\n",
-            req, _this->address, _this->current_transfer->packet_size, _this->current_transfer->packet_size);
+            req, _this->address, chunk, _this->current_transfer->packet_size);
 
-        _this->address += _this->current_transfer->packet_size;
-        _this->data += _this->current_transfer->packet_size;
-        _this->size -= _this->current_transfer->packet_size;
+        _this->address += chunk;
+        _this->data += chunk;
+        _this->size -= chunk;
 
         _this->try_send(req);
     }
