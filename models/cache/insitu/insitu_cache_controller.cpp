@@ -469,7 +469,7 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
     // `result[]` array (0x800037c8, 256 floats). Writes print their value immediately
     // (already in req->get_data() at entry); reads are printed after the value is resolved,
     // at each exchange_line_data(..., line_to_req=true) call site below.
-    if (addr >= 0x800037c8 && addr < 0x800037c8 + 0x400 && is_write && req->get_data() != nullptr)
+    if (addr >= 0x80003ac8 && addr < 0x80003ac8 + 0x900 && is_write && req->get_data() != nullptr)
     {
         fprintf(stderr, "[RESULT_DBG %s] cycle=%lld addr=0x%lx WRITE val=%f initiator=%d\n",
             this->get_path().c_str(), (long long)now, (unsigned long)addr,
@@ -572,7 +572,7 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
             if (write_through_mode_) issue_write_through(req);
         } else {
             if (carry_data_) exchange_line_data(req, set, way, /*line_to_req=*/true);  // serve read
-            if (addr >= 0x800037c8 && addr < 0x800037c8 + 0x400 && req->get_data() != nullptr)
+            if (addr >= 0x80003ac8 && addr < 0x80003ac8 + 0x900 && req->get_data() != nullptr)
             {
                 fprintf(stderr, "[RESULT_DBG %s] cycle=%lld addr=0x%lx READ_HIT val=%f initiator=%d\n",
                     this->get_path().c_str(), (long long)now, (unsigned long)addr,
@@ -677,7 +677,7 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
                 vline.dirty = true;
             } else {
                 exchange_line_data(req, set, victim_way, /*line_to_req=*/true);
-                if (addr >= 0x800037c8 && addr < 0x800037c8 + 0x400 && req->get_data() != nullptr)
+                if (addr >= 0x80003ac8 && addr < 0x80003ac8 + 0x900 && req->get_data() != nullptr)
                 {
                     fprintf(stderr, "[RESULT_DBG %s] cycle=%lld addr=0x%lx READ_MISS val=%f initiator=%d\n",
                         this->get_path().c_str(), (long long)now, (unsigned long)addr,
@@ -955,7 +955,7 @@ void InsituCacheController::fsm_drain_mshr(uint32_t set)
             if (write_through_mode_) issue_write_through(req);
         } else if (carry_data_ && line != nullptr) {
             exchange_line_data(req, s, way, /*line_to_req=*/true);   // serve deferred read
-            if (addr >= 0x800037c8 && addr < 0x800037c8 + 0x400 && req->get_data() != nullptr)
+            if (addr >= 0x80003ac8 && addr < 0x80003ac8 + 0x900 && req->get_data() != nullptr)
             {
                 fprintf(stderr, "[RESULT_DBG %s] cycle=%lld addr=0x%lx READ_DEFERRED val=%f initiator=%d\n",
                     this->get_path().c_str(), (long long)this->clock.get_cycles(),
