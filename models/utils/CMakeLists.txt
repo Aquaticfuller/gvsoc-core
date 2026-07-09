@@ -60,6 +60,19 @@ vp_model(NAME utils.io_v2_beat_to_single_req_adapter
     INCLUDES "${CMAKE_BINARY_DIR}/gvsoc/engine"
 )
 
+# ---------------------------------------------------------------------------
+# IoV2BeatWidthAdapter — dedicated adapter for the IoV2Beat master <-> IoV2Beat
+# slave case with DIFFERING beat widths. Pure width conversion: repacks the
+# per-beat streams in both directions (N narrow beats <-> one wide beat) so
+# each side runs at its own beat width and shows its own per-cycle occupancy.
+# Reads its parameters from the generated config tree
+# (IoV2BeatWidthAdapterConfig), hence the engine binary-dir include.
+# ---------------------------------------------------------------------------
+vp_model(NAME utils.io_v2_beat_width_adapter
+    SOURCES "io_v2_beat_width_adapter.cpp"
+    INCLUDES "${CMAKE_BINARY_DIR}/gvsoc/engine"
+)
+
 add_subdirectory(loader)
 
 # ---------------------------------------------------------------------------
