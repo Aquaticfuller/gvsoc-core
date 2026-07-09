@@ -43,6 +43,7 @@
  */
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 #include <vp/vp.hpp>
 #include <vp/itf/io_v2.hpp>
@@ -237,6 +238,9 @@ void Limiter::event_handler(vp::Block *__this, vp::ClockEvent *event)
     sub->set_data(_this->pending_data);
     sub->set_opcode(_this->pending_req->get_opcode());
     sub->set_resp_status(vp::IO_RESP_OK);
+    // Fill cursor for distinct response beats (see finish_chunk). Unused by
+    // the parent-side aggregation, which rides on the parent's own field.
+    sub->remaining_size = 0;
 
     _this->pending_addr += chunk;
     _this->pending_data += chunk;
@@ -303,7 +307,17 @@ void Limiter::finish_chunk(vp::IoReq *resp)
     bool last = resp->is_last;
     if (resp != sub)
     {
-        delete resp;            // distinct response beat — we own/free it
+        // Distinct allocator-backed response beat: its payload carries the
+        // read data (our sub aliases the parent's buffer, and read requests
+        // are data-less on the beat side) — copy it in at the sub's fill
+        // cursor, then return the beat to its pool.
+        if (!sub->get_is_write() && resp->get_size() > 0)
+        {
+            memcpy(sub->get_data() + sub->remaining_size, resp->get_data(),
+                   resp->get_size());
+            sub->remaining_size += resp->get_size();
+        }
+        resp->free();
     }
     if (last)
     {

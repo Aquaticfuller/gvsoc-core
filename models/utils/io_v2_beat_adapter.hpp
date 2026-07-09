@@ -20,10 +20,12 @@
  *   - For each accepted submission, the upstream master receives exactly
  *     ceil(total_size / beat_width) resp() calls in cumulative byte order,
  *     with is_first=true on the first call, is_last=true on the last, and
- *     req->size / req->data / req->addr / req->burst_id / req->status mutated
- *     per beat. addr is set to the per-beat start address (= burst_addr +
- *     cumulative emitted bytes); see the io_v2.hpp contract note about
- *     per-beat addr.
+ *     size / addr / burst_id / status set per beat. Read beats are distinct
+ *     allocator-backed objects whose co-allocated payload carries the beat's
+ *     data (the burst request itself is data-less); the master copies the
+ *     payload out and frees each beat. addr is set to the per-beat start
+ *     address (= burst_addr + cumulative emitted bytes); see the io_v2.hpp
+ *     contract note about per-beat addr.
  *   - Per-beat ready cycle honours the slave's req->latency annotation. A
  *     sync DONE / async big resp covering M beats spreads them at
  *     now+latency, now+latency+1, … so the LAST beat lands at now+latency
@@ -81,6 +83,10 @@ private:
         vp::IoRespStatus status;
         // burst_id snapshot — see file header.
         int64_t  burst_id;
+        // Read path only: the allocator-backed sub-read object, forwarded
+        // upstream as the response beat (its co-allocated payload holds the
+        // read data). nullptr on the write path (writes round-trip req).
+        vp::IoReq *beat = nullptr;
     };
 
     // Per-in-flight-request progress. Keyed by the upstream IoReq*; alive
@@ -104,7 +110,6 @@ private:
         uint64_t   offset;        // cumulative byte offset within the burst
         uint64_t   beat_bytes;    // min(beat_width, remaining) — short final beat ok
         uint64_t   addr;          // burst_addr + offset
-        uint8_t   *data;          // master_data + offset (initiator buffer slice)
         bool       is_first;      // offset == 0
         bool       is_last;       // offset + beat_bytes == total_size
         int64_t    burst_id;      // snapshot of up_req->burst_id
@@ -128,10 +133,14 @@ private:
     void issue_sub_read(const SubReadJob &job);
     void issue_pending_sub_reads();
     void drain_completed_sub_reads();
-    void complete_sub_read(const SubReadJob &job, vp::IoRespStatus status,
-                           int64_t latency_cycles);
+    void complete_sub_read(const SubReadJob &job, vp::IoReq *beat,
+                           vp::IoRespStatus status, int64_t latency_cycles);
 
     int beat_width;
+    // Shared pool serving beat-sized requests with their payload co-allocated.
+    // Sub-reads are drawn from it and forwarded upstream as the response
+    // beats; the terminal master frees them back with req->free().
+    vp::IoReqAllocator *beat_allocator;
     vp::IoSlave in;
     vp::IoMaster out;
     vp::ClockEvent fsm_event;
@@ -165,8 +174,9 @@ private:
     std::deque<SubReadJob> read_jobs;
 
     // One in-flight (or just-completed-but-not-yet-drained) downstream
-    // sub-read. Each carries its own heap req object so several can be
-    // outstanding. Responses may arrive out of order (multi-bank shared L2),
+    // sub-read. Each carries its own allocator-backed req object (payload
+    // co-allocated) so several can be outstanding. Responses may arrive out
+    // of order (multi-bank shared L2),
     // so completed entries are buffered and drained to the upstream beat
     // stream strictly in issue/offset order — the upstream master needs
     // is_last to be the genuine last beat.
@@ -177,6 +187,10 @@ private:
         bool              completed = false;
         vp::IoRespStatus  status    = vp::IO_RESP_OK;
         int64_t           latency   = 0;
+        // Fill cursor when the downstream is itself a beat slave answering
+        // this sub-read with distinct payload-carrying beats (form 3): bytes
+        // of the sub-read's payload filled so far.
+        uint64_t          filled    = 0;
     };
     std::deque<InflightSubRead> sub_inflight;
     // Outstanding-window depth. With one-per-cycle issuance the window must be

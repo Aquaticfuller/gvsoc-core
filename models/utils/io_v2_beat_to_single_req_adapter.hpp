@@ -51,8 +51,9 @@
  *   - For each accepted submission, the upstream master receives exactly
  *     ceil(total_size / beat_width) resp() calls in cumulative byte order,
  *     with is_first=true on the first call, is_last=true on the last, and
- *     req->size / req->data / req->addr / req->burst_id / req->status set per
- *     beat. addr is the per-beat start address (burst_addr + cumulative bytes).
+ *     size / addr / burst_id / status set per beat. Read beats carry their data
+ *     in their allocator-provided payload (the burst request is data-less).
+ *     addr is the per-beat start address (burst_addr + cumulative bytes).
  *   - Per-beat ready cycle honours the slave's req->get_full_latency(): the LAST
  *     beat lands at now+latency so a bandwidth annotation is not double-counted
  *     by the per-beat spread.
@@ -60,7 +61,8 @@
  * Ownership (initiator-owned request convention): the upstream master owns its
  * burst request for the whole transaction and frees it itself (typically on the
  * last response); the adapter NEVER frees it. Each read beat delivered upstream is
- * a distinct adapter-allocated object the master frees as it consumes it — the
+ * a distinct allocator-backed object (IoReqAllocator, payload co-allocated) that
+ * the master copies out of and frees with req->free() as it consumes it — the
  * master's request is never round-tripped as a read beat, even for a single-beat
  * read. (Writes still round-trip the master's own request as the single ack, which
  * the master frees/recycles as its own object.) Correlation back to the master's
@@ -142,9 +144,8 @@ private:
     // the running cursors for issuing downstream and forwarding upstream.
     struct ReadBurst
     {
-        vp::IoReq *up_req;        // master burst req (freed on the last beat)
+        vp::IoReq *up_req;        // master burst req (initiator-owned, data-less)
         uint64_t   base_addr;     // snapshot of req->addr at submit time
-        uint8_t   *base_data;     // snapshot of req->data (initiator buffer)
         uint64_t   total_size;
         int64_t    burst_id;      // snapshot of req->burst_id
         int        nb_beats;      // total==0 ? 1 : ceil(total/beat_width)
@@ -194,6 +195,10 @@ private:
     IoV2BeatToSingleReqAdapterConfig cfg;
 
     int beat_width;
+    // Shared pool serving beat-sized requests with their payload co-allocated.
+    // Sub-reads are drawn from it and forwarded upstream as the response beats;
+    // the terminal master frees them back with req->free().
+    vp::IoReqAllocator *beat_allocator;
     vp::IoSlave in;
     vp::IoMaster out;
     vp::ClockEvent fsm_event;

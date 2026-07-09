@@ -88,11 +88,18 @@ public:
 private:
     // One in-flight whole-burst request (read or write). The master submits one
     // request with the full size; the wrapper drains its DRAM transactions from
-    // Ramulator and streams the response back beat by beat.
+    // Ramulator and streams the response back beat by beat. A read burst is
+    // data-less (beat protocol): its functional data is snapshot into the
+    // read_data staging buffer at submit and travels upstream inside distinct
+    // allocator-backed beats; the master's request is never touched (req /
+    // master_data are only used on the write-ack path, which round-trips the
+    // master's own request).
     struct Inflight
     {
         vp::IoReq *req;
-        uint8_t *master_data;   // snapshot of req->get_data() at submit
+        uint8_t *master_data;   // snapshot of req->get_data() at submit (writes)
+        std::vector<uint8_t> read_data; // staging for read bursts
+        void *initiator;        // snapshot of req->initiator at submit
         uint64_t total_size;    // snapshot of req->get_size() at submit
         uint64_t burst_addr;    // snapshot of req->get_addr() at submit
         uint64_t aligned_start; // tx-aligned base address of the burst
@@ -152,6 +159,9 @@ private:
     int tx_bytes = 0;
     int tx_align_log2 = 0;
     int beat_width = 0;   // == tx_bytes
+    // Shared pool serving beat-sized requests with their payload co-allocated;
+    // read response beats are drawn from it and freed by the terminal master.
+    vp::IoReqAllocator *beat_allocator = nullptr;
 
     // Back-pressure is entirely Ramulator's: a request is DENIED only when
     // Ramulator's controller buffer can't accept a transaction, and retried when
@@ -233,6 +243,7 @@ RamulatorModel::RamulatorModel(vp::ComponentConf &config)
         return;
     }
     this->beat_width = this->tx_bytes;
+    this->beat_allocator = vp::IoReqAllocator::get(this->beat_width);
     if (cfg_beat_width != this->tx_bytes)
     {
         this->trace.fatal(
@@ -374,7 +385,8 @@ vp::IoReqStatus RamulatorModel::req_handler(vp::Block *__this, vp::IoReq *req)
                                     : Ramulator::Request::Type::Read;
 
     Inflight *infl = new Inflight{
-        req, data, req_size, req->get_addr(), aligned_start, req->burst_id, type,
+        req, data, {}, req->initiator,
+        req_size, req->get_addr(), aligned_start, req->burst_id, type,
         /*bytes_filled=*/0, /*bytes_emitted=*/0,
         /*tx_total=*/num_tx, /*tx_injected=*/0, /*tx_done=*/0, /*emitted_done=*/false,
     };
@@ -389,14 +401,19 @@ vp::IoReqStatus RamulatorModel::req_handler(vp::Block *__this, vp::IoReq *req)
         return vp::IO_REQ_DENIED;
     }
 
-    // Accepted. Move the functional data now (Ramulator only times the access);
-    // the read request is queued so its data beats can stream back over the next
-    // cycles, and its remaining transactions are injected by the tick handler as
-    // Ramulator's buffer drains.
-    if (data)
+    // Accepted. Move the functional data now (Ramulator only times the access):
+    // a write carries its payload in the request; a read burst is data-less, so
+    // its data is snapshot into the staging buffer and streamed back inside
+    // allocator-backed beats over the next cycles. Remaining transactions are
+    // injected by the tick handler as Ramulator's buffer drains.
+    if (req->get_is_write())
     {
-        if (req->get_is_write()) memcpy(&_this->mem_data[offset], data, req_size);
-        else                     memcpy(data, &_this->mem_data[offset], req_size);
+        if (data) memcpy(&_this->mem_data[offset], data, req_size);
+    }
+    else
+    {
+        infl->read_data.resize(req_size);
+        memcpy(infl->read_data.data(), &_this->mem_data[offset], req_size);
     }
     _this->inflight_queue.push_back(infl);
 
@@ -479,14 +496,36 @@ void RamulatorModel::emit_one_beat()
     bool is_first = (infl->bytes_emitted == 0);
     bool is_last = (infl->bytes_emitted + beat_size == infl->total_size);
 
-    vp::IoReq *req = infl->req;
-    req->addr = infl->burst_addr + infl->bytes_emitted;
-    req->data = infl->master_data + infl->bytes_emitted;
-    req->size = beat_size;
-    req->burst_id = infl->burst_id;
-    req->is_first = is_first;
-    req->is_last = is_last;
-    req->status = vp::IO_RESP_OK;
+    vp::IoReq *req;
+    if (infl->type == Ramulator::Request::Type::Write)
+    {
+        // Write ack: round-trip the master's own request, mutated per beat.
+        req = infl->req;
+        req->addr = infl->burst_addr + infl->bytes_emitted;
+        req->data = infl->master_data + infl->bytes_emitted;
+        req->size = beat_size;
+        req->burst_id = infl->burst_id;
+        req->is_first = is_first;
+        req->is_last = is_last;
+        req->status = vp::IO_RESP_OK;
+    }
+    else
+    {
+        // Read beat: distinct allocator-backed object whose co-allocated
+        // payload carries the data slice; the terminal master copies it out
+        // and frees it. The master's data-less burst request is never touched.
+        req = this->beat_allocator->alloc();
+        req->prepare();
+        req->set_addr(infl->burst_addr + infl->bytes_emitted);
+        req->set_size(beat_size);
+        req->set_is_write(false);
+        memcpy(req->get_data(), infl->read_data.data() + infl->bytes_emitted,
+               beat_size);
+        req->burst_id = infl->burst_id;
+        req->is_first = is_first;
+        req->is_last = is_last;
+        req->initiator = infl->initiator;
+    }
 
     this->trace.msg("Beat RESP addr=0x%llx burst_id=%lld size=%llu first=%d last=%d (%llu/%llu)\n",
         (unsigned long long)req->addr, (long long)infl->burst_id,

@@ -90,18 +90,21 @@ public:
     void reset(bool active) override;
 
 private:
-    // Per-in-flight read. Master submits ONE req with the full burst size;
-    // wrapper drains DRAMSys bytes into the master's data buffer via a
-    // mask queue (1 = copy, 0 = drop misalignment/slack) and emits beats
-    // back to the master via beat_handler, one per GVSoC cycle.
+    // Per-in-flight read. Master submits ONE data-less req with the full burst
+    // size (beat protocol: read burst requests carry no data); the wrapper
+    // drains DRAMSys bytes into its own staging buffer via a mask queue
+    // (1 = copy, 0 = drop misalignment/slack) and emits distinct
+    // allocator-backed beats — payload copied from the staging buffer — via
+    // beat_handler, one per GVSoC cycle. The master's request is never
+    // touched: it is initiator-owned; beats correlate back via initiator.
     struct ReadInflight {
-        vp::IoReq *req;
-        uint8_t  *master_data;     // snapshot of req->data on submit
+        void     *initiator;       // snapshot of req->initiator on submit
+        std::vector<uint8_t> data; // staging buffer, total_size bytes
         uint64_t total_size;       // snapshot of req->size on submit
         uint64_t burst_addr;       // snapshot of req->addr on submit (burst start)
         int64_t  burst_id;         // snapshot of req->burst_id on submit
         std::queue<int> mask_q;    // one entry per aligned-DRAMSys byte
-        uint64_t bytes_filled;     // bytes copied into master_data so far
+        uint64_t bytes_filled;     // bytes copied into the staging buffer so far
         uint64_t bytes_emitted;    // bytes emitted as beats so far
     };
 
@@ -144,6 +147,9 @@ private:
     GvsocMemspec memspec{};
     uint  access_size_clog = 0;
     int   beat_width = 0;       // = memspec.access_size
+    // Shared pool serving beat-sized requests with their payload co-allocated;
+    // read response beats are drawn from it and freed by the terminal master.
+    vp::IoReqAllocator *beat_allocator = nullptr;
 
     int  (*add_dram)(char *, char *, GvsocMemspec *)              = nullptr;
     void (*close_dram)(int)                                       = nullptr;
@@ -205,6 +211,7 @@ ddr_v2::ddr_v2(vp::ComponentConf &config)
     dram_id = add_dram((char *)resources_path.c_str(), (char *)simulationJson_path.c_str(), &memspec);
     access_size_clog = log2(memspec.access_size);
     beat_width = memspec.access_size;
+    beat_allocator = vp::IoReqAllocator::get(beat_width);
     dram_register_async_callback(dram_id, (CallbackInstance_t)this,
         (AsynCallbackResp_Meth *)&ddr_v2::rspCallback,
         (AsynCallbackUpdateReq_Meth *)&ddr_v2::reqCallback);
@@ -255,16 +262,17 @@ void ddr_v2::handle_read(vp::IoReq *req)
 {
     uint64_t addr  = req->get_addr();
     uint64_t size  = req->get_size();
-    uint8_t *data  = req->get_data();
     int64_t  bid   = req->burst_id;
 
     uint64_t aligned_start = (addr >> access_size_clog) << access_size_clog;
     uint64_t num_chunks    = 1 + (((addr + size - 1) - aligned_start) >> access_size_clog);
     uint64_t aligned_total = num_chunks * memspec.access_size;
 
+    // The burst request is data-less: DRAMSys bytes drain into our own
+    // staging buffer, then travel upstream inside allocator-backed beats.
     auto *infl = new ReadInflight{
-        /*req=*/req,
-        /*master_data=*/data,
+        /*initiator=*/req->initiator,
+        /*data=*/std::vector<uint8_t>(size),
         /*total_size=*/size,
         /*burst_addr=*/addr,
         /*burst_id=*/bid,
@@ -403,7 +411,7 @@ void ddr_v2::drain_read_rsp()
         int mask = infl->mask_q.front();
         infl->mask_q.pop();
         if (mask) {
-            infl->master_data[infl->bytes_filled++] = (uint8_t)byte;
+            infl->data[infl->bytes_filled++] = (uint8_t)byte;
             bool boundary = (infl->bytes_filled % (uint64_t)this->beat_width == 0) ||
                             (infl->bytes_filled == infl->total_size);
             if (boundary) need_beat_event = true;
@@ -435,24 +443,26 @@ void ddr_v2::emit_one_beat()
     bool is_first = (infl->bytes_emitted == 0);
     bool is_last  = (infl->bytes_emitted + beat_size == infl->total_size);
 
-    vp::IoReq *req = infl->req;
-    // Mutate addr to this beat's start address (= burst_addr +
-    // cumulative emitted bytes). The v2 contract does not strictly
-    // require the slave to update addr per beat (AXI doesn't either),
-    // but doing so is a cheap convenience for tracing/debugging and
-    // matches the dramsys_v2 convention.
-    req->addr     = infl->burst_addr + infl->bytes_emitted;
-    req->data     = infl->master_data + infl->bytes_emitted;
-    req->size     = beat_size;
-    req->burst_id = infl->burst_id;
-    req->is_first = is_first;
-    req->is_last  = is_last;
-    req->status   = vp::IO_RESP_OK;
+    // Distinct allocator-backed beat: its co-allocated payload carries the
+    // data slice; the terminal master copies it out and frees the beat.
+    // addr is set to this beat's start address (= burst_addr + cumulative
+    // emitted bytes) — a cheap convenience for tracing/debugging (the v2
+    // contract lets masters tolerate either convention).
+    vp::IoReq *beat = beat_allocator->alloc();
+    beat->prepare();
+    beat->set_addr(infl->burst_addr + infl->bytes_emitted);
+    beat->set_size(beat_size);
+    beat->set_is_write(false);
+    memcpy(beat->get_data(), infl->data.data() + infl->bytes_emitted, beat_size);
+    beat->burst_id  = infl->burst_id;
+    beat->is_first  = is_first;
+    beat->is_last   = is_last;
+    beat->initiator = infl->initiator;
 
     trace.msg("Beat RESP addr=0x%lx burst_id=%ld size=%lu is_first=%d is_last=%d (emitted %lu of %lu)\n",
-              req->addr, infl->burst_id, beat_size, is_first, is_last,
+              beat->addr, infl->burst_id, beat_size, is_first, is_last,
               infl->bytes_emitted + beat_size, infl->total_size);
-    in_itf.resp(req);
+    in_itf.resp(beat);
     infl->bytes_emitted += beat_size;
 
     if (is_last) {

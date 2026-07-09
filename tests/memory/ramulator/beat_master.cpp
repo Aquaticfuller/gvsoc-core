@@ -166,16 +166,22 @@ void BeatMaster::send_burst(Entry *entry)
     bs->beats_seen = 0;
     bs->last_resp_cycle = -1;
 
-    uint64_t buf_size = entry->size == 0 ? 1 : entry->size;
-    bs->buffer = new uint8_t[buf_size];
-    for (uint64_t i = 0; i < entry->size; i++)
+    // Writes: preload payload (data_hex, else addr-derived). Reads are
+    // data-less (beat protocol): the data comes back inside the
+    // allocator-backed response beats.
+    if (entry->is_write)
     {
-        // Writes: preload payload (data_hex, else addr-derived); reads: zero.
-        if (entry->is_write)
+        uint64_t buf_size = entry->size == 0 ? 1 : entry->size;
+        bs->buffer = new uint8_t[buf_size];
+        for (uint64_t i = 0; i < entry->size; i++)
+        {
             bs->buffer[i] = (entry->data_hex_buf && i < entry->data_hex_len)
                 ? entry->data_hex_buf[i] : (uint8_t)((entry->addr + i) & 0xff);
-        else
-            bs->buffer[i] = 0;
+        }
+    }
+    else
+    {
+        bs->buffer = nullptr;
     }
 
     bs->req = new vp::IoReq(entry->addr, bs->buffer, entry->size, entry->is_write);
@@ -309,13 +315,19 @@ vp::IoRespAck BeatMaster::resp_handler(vp::Block *__this, vp::IoReq *req)
     bs->beats_seen++;
     bool last = req->is_last;
 
+    // Read beats are distinct allocator-backed objects — free each back to
+    // its pool. Write acks round-trip our own descriptor (req == bs->req),
+    // which we free once on the last ack below (initiator-owned convention).
+    if (req != bs->req)
+    {
+        req->free();
+    }
+
     if (last)
     {
         if (!_this->quiet)
             _this->traces.assert(bs->beats_seen == bs->expected_beats,
                 "got %d beats, expected %d", bs->beats_seen, bs->expected_beats);
-        // The wrapper reuses our single descriptor for every beat, so free it
-        // once here (not per beat).
         delete bs->req;
         delete[] bs->buffer;
         delete bs;

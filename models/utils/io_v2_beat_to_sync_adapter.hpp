@@ -11,20 +11,24 @@
  *
  * It is a specialisation of IoV2BeatAdapter for the case where the downstream
  * slave honours the *sync* contract: every request completes inline with
- * IO_REQ_DONE (never IO_REQ_GRANTED + resp(), never IO_REQ_DENIED + retry()),
- * and any access size is served in one call. That lets the adapter be trivial:
- * each incoming burst is forwarded to the slave immediately (inline DONE), the
- * response is pushed onto a queue, and an FSM streams it back upstream as one
- * resp() beat per cycle. No per-beat sub-reads, no async/deny bookkeeping, no
- * latency-spread maths.
+ * IO_REQ_DONE (never IO_REQ_GRANTED + resp(), never IO_REQ_DENIED + retry()).
+ * That lets the adapter be trivial: a write burst is forwarded to the slave
+ * whole (inline DONE); a read burst — which carries no data under the beat
+ * protocol — is served inline at submit time as beat-sized sub-reads, each
+ * into a distinct allocator-backed beat whose co-allocated payload receives
+ * the data. Either way every upstream beat is fully determined at submit and
+ * pushed onto one flat queue; an FSM streams them back upstream at one resp()
+ * per cycle. No async/deny bookkeeping, no latency-spread maths.
  *
  * Wire-protocol invariants preserved (identical to the general adapter for the
  * sync case):
  *   - The input port's req callback returns IO_REQ_GRANTED — never IO_REQ_DONE.
  *   - For each submission the upstream master receives exactly
  *     ceil(total_size / beat_width) resp() calls in byte order, is_first on the
- *     first, is_last on the last, with size/data/addr/burst_id/status set per
- *     beat. addr is the per-beat start address (burst_addr + emitted).
+ *     first, is_last on the last, with size/addr/burst_id/status set per beat.
+ *     addr is the per-beat start address (burst_addr + emitted). Read beats are
+ *     distinct allocator-backed objects the terminal master copies out of and
+ *     frees; write acks round-trip the master's own request.
  *   - The first beat is delayed by the slave's get_full_latency(); beats then
  *     stream at one per cycle.
  *
@@ -70,40 +74,45 @@ private:
     static void            resp_retry_in_handler(vp::Block *__this, vp::IoRetryChannel channel);
     static void            fsm_handler(vp::Block *__this, vp::ClockEvent *event);
 
-    // Emit one beat of the active response (cur_*) at the current cur_offset.
-    // Returns false if the upstream master back-pressured the beat (held for
-    // re-send); the caller must then not advance the cursor.
-    bool emit_beat(bool is_first, bool is_last, uint64_t beat);
+    // One queued upstream beat, fully determined at submit time. Read beats
+    // are distinct allocator-backed objects whose payload was filled inline
+    // at submit (beat != nullptr; the other fields are unused — the object
+    // already carries them). Write acks round-trip the master's own request
+    // (wreq), mutated per entry at emit time.
+    struct StreamEntry
+    {
+        vp::IoReq *beat;
+        vp::IoReq *wreq;
+        uint64_t addr;
+        uint8_t *data;      // master's buffer + offset
+        uint64_t size;
+        bool is_first;
+        bool is_last;
+        int64_t burst_id;
+        vp::IoRespStatus status;
+    };
+
+    // Emit one entry. Returns false if the upstream master back-pressured the
+    // beat (held for re-send from resp_retry_in_handler).
+    bool emit_entry(const StreamEntry &e);
 
     int beat_width;
+    // Shared pool serving beat-sized requests with their payload co-allocated;
+    // read beats are drawn from it and freed by the terminal master.
+    vp::IoReqAllocator *beat_allocator;
     vp::IoSlave in;
     vp::IoMaster out;
     vp::ClockEvent fsm_event;
 
-    // Responses awaiting beat streaming. Just the request pointers: a queued
-    // response is never mutated until it becomes the active one, so nothing else
-    // needs storing.
-    std::deque<vp::IoReq *> pending;
-
-    // Snapshot of the response currently being streamed (cur_req == nullptr ⇒
-    // idle). Snapshotted on activation because the write / single-beat emit
-    // round-trips and mutates cur_req in place.
-    vp::IoReq        *cur_req = nullptr;
-    uint8_t          *cur_data = nullptr;
-    uint64_t          cur_size = 0;
-    uint64_t          cur_offset = 0;
-    uint64_t          cur_addr = 0;
-    int64_t           cur_burst_id = -1;
-    vp::IoRespStatus  cur_status = vp::IO_RESP_OK;
+    // Beats awaiting upstream delivery, in submission/byte order, drained at
+    // one per cycle.
+    std::deque<StreamEntry> entries;
 
     // Response-path back-pressure: the upstream master refused the beat we just
     // emitted. We hold that exact object and re-send it from
-    // resp_retry_in_handler; the cursor is not advanced until it is accepted.
-    // held_beat snapshots its size (read before the master takes ownership, as a
-    // round-tripped write/last object may be reused once accepted).
+    // resp_retry_in_handler; nothing else is emitted until it is accepted.
     bool      resp_held = false;
     vp::IoReq *held_req = nullptr;
-    uint64_t  held_beat = 0;
 
     vp::Trace trace;
 };

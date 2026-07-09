@@ -159,13 +159,21 @@ void StubMaster::send_burst(BurstEntry *entry)
     bs->deny_remaining = std::set<int>(entry->deny_beats.begin(),
                                        entry->deny_beats.end());
 
-    uint64_t buf_size = entry->size == 0 ? 1 : entry->size;
-    bs->buffer = new uint8_t[buf_size];
-    // For a write, preload the buffer with the addr-derived pattern (the sync
-    // target may check it). For a read, zero it; the target fills it.
-    for (uint64_t i = 0; i < entry->size; i++)
+    // For a write, preload a buffer with the addr-derived pattern (the sync
+    // target may check it). A read burst is data-less (beat protocol): the
+    // data comes back inside the allocator-backed response beats.
+    if (entry->is_write)
     {
-        bs->buffer[i] = entry->is_write ? (uint8_t)((entry->base_addr + i) & 0xff) : 0;
+        uint64_t buf_size = entry->size == 0 ? 1 : entry->size;
+        bs->buffer = new uint8_t[buf_size];
+        for (uint64_t i = 0; i < entry->size; i++)
+        {
+            bs->buffer[i] = (uint8_t)((entry->base_addr + i) & 0xff);
+        }
+    }
+    else
+    {
+        bs->buffer = nullptr;
     }
 
     bs->req = new vp::IoReq(entry->base_addr, bs->buffer, entry->size, entry->is_write);
@@ -279,20 +287,29 @@ vp::IoRespAck StubMaster::resp_handler(vp::Block *__this, vp::IoReq *req)
     bool last = req->is_last;
 
     // ---- Ownership: free every object we receive ----
-    // The adapter returns our own descriptor (bs->req) as the last beat of any
-    // read/write (and on every write ack); only non-last read beats are distinct
-    // adapter-allocated objects. So free any beat that isn't our descriptor now,
-    // and free the descriptor (plus our buffer/state) once on the last beat.
+    // Read beats — ALL of them, including the last — are distinct
+    // allocator-backed objects: free each back to its pool (req->free()). Our
+    // own descriptor is never round-tripped as a read beat. Write acks DO
+    // round-trip our descriptor (every ack), so there is nothing to free per
+    // ack. On the last beat, free our descriptor/buffer/state ourselves
+    // (initiator-owned request convention).
     if (req != bs->req)
     {
-        delete req;     // a distinct non-last read-beat object
+        _this->traces.assert(!e->is_write,
+            "write ack must round-trip our own descriptor");
+        req->free();
+    }
+    else
+    {
+        _this->traces.assert(e->is_write,
+            "our descriptor must never be round-tripped as a read beat");
     }
 
     if (last)
     {
         _this->traces.assert(bs->beats_seen == bs->expected_beats,
             "got %d beats, expected %d", bs->beats_seen, bs->expected_beats);
-        delete bs->req;       // our descriptor (returned as last read beat / write ack)
+        delete bs->req;       // our descriptor (initiator-owned)
         delete[] bs->buffer;
         delete bs;
         _this->outstanding--;

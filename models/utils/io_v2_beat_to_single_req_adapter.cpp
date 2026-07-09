@@ -57,6 +57,8 @@ IoV2BeatToSingleReqAdapter::IoV2BeatToSingleReqAdapter(vp::ComponentConf &config
                           this->beat_width);
     }
 
+    this->beat_allocator = vp::IoReqAllocator::get(this->beat_width);
+
     if (this->cfg.max_read_bursts > 0)
     {
         this->max_read_bursts = (int)this->cfg.max_read_bursts;
@@ -104,8 +106,10 @@ vp::IoReqStatus IoV2BeatToSingleReqAdapter::req_handler(vp::Block *__this, vp::I
         self->outstanding_read_bursts++;
         int nb_beats = size == 0 ? 1
             : (int)((size + self->beat_width - 1) / self->beat_width);
+        // The burst request is data-less: each sub-read's allocator-provided
+        // payload receives one beat of data and travels upstream inside it.
         self->issue_bursts.push_back(ReadBurst{
-            req, req->get_addr(), req->get_data(), size, req->burst_id,
+            req, req->get_addr(), size, req->burst_id,
             nb_beats, 0, 0});
         self->issue_pending_sub_reads();
         self->reschedule_fsm();
@@ -234,13 +238,15 @@ bool IoV2BeatToSingleReqAdapter::issue_one_sub_read()
         ? std::min<uint64_t>(b.total_size - offset, (uint64_t)this->beat_width)
         : 0;
 
-    // One heap object per sub-read, sent downstream as a single-beat request.
+    // One allocator-backed object per sub-read, sent downstream as a single-beat
+    // request; the downstream target fills its co-allocated payload directly.
     // Once its response lands, the SAME object is forwarded upstream as the beat
-    // (no second allocation); the terminal master frees it.
-    vp::IoReq *r = new vp::IoReq();
+    // (no second allocation); the terminal master copies the payload out and
+    // frees it back to the pool. data is the allocator's payload and is never
+    // repointed.
+    vp::IoReq *r = this->beat_allocator->alloc();
     r->prepare();
     r->set_addr(b.base_addr + offset);
-    r->set_data(b.base_data + offset);
     r->set_size(beat);
     r->set_is_write(false);
     r->is_first = true;       // single-beat to the slave
@@ -255,7 +261,7 @@ bool IoV2BeatToSingleReqAdapter::issue_one_sub_read()
         // Downstream full: drop this object and re-issue on retry. issued_beats is
         // NOT advanced, so the retry regenerates the exact same beat.
         this->sub_read_denied = true;
-        delete r;
+        r->free();
         return false;
     }
 
@@ -730,21 +736,27 @@ void IoV2BeatToSingleReqAdapter::reset(bool active)
         this->outstanding_read_bursts = 0;
         this->read_blocked = false;
         // Sub-reads still owned by the adapter (issued downstream or completed
-        // and awaiting upstream emit) are freed; the master-owned burst requests
-        // are not (freed at teardown elsewhere).
+        // and awaiting upstream emit) go back to their pool; the master-owned
+        // burst requests are not ours to free.
         for (auto *r : this->issued)
         {
-            delete r;
+            r->free();
         }
         this->issued.clear();
         // Scheduled-but-not-yet-emitted read beats are sub-reads the adapter still
-        // owns (not yet handed to the consumer), so free them here.
+        // owns (not yet handed to the consumer), so free them here too.
         for (auto &rb : this->read_pending)
         {
-            delete rb.beat;
+            rb.beat->free();
         }
         this->read_pending.clear();
         this->sub_read_denied = false;
+        // A held (back-pressured) read beat is allocator-backed and ours —
+        // free it; a held write ack is the master's own request, left alone.
+        if (this->resp_held && !this->held_write && this->held_req != nullptr)
+        {
+            this->held_req->free();
+        }
         this->resp_held = false;
         this->held_req = nullptr;
         this->held_read_last = false;

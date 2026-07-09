@@ -24,6 +24,8 @@ IoV2BeatToSyncAdapter::IoV2BeatToSyncAdapter(vp::ComponentConf &config)
                           this->beat_width);
     }
 
+    this->beat_allocator = vp::IoReqAllocator::get(this->beat_width);
+
     this->new_slave_port("input", &this->in);
     this->new_master_port("output", &this->out);
 }
@@ -38,20 +40,84 @@ vp::IoReqStatus IoV2BeatToSyncAdapter::req_handler(vp::Block *__this, vp::IoReq 
         req, req->get_addr(), req->get_size(), req->get_is_write() ? 1 : 0,
         (long)req->burst_id);
 
-    // Forward the whole burst to the sync slave. By the IoV2Sync contract it
-    // serves any size inline and must complete with IO_REQ_DONE (never
-    // GRANTED/DENIED). Assert it honoured the contract (asserts/debug builds).
-    vp::IoReqStatus st = self->out.req(req);
-    self->traces.assert(st == vp::IO_REQ_DONE,
-        "sync slave must reply IO_REQ_DONE inline (got %d)", (int)st);
+    uint64_t burst_addr = req->get_addr();
+    uint64_t total      = req->get_size();
+    int64_t  burst_id   = req->burst_id;
+    int64_t  latency    = 0;
 
-    // Queue the response; the FSM streams it back as one resp() beat per cycle.
-    self->pending.push_back(req);
+    if (req->get_is_write())
+    {
+        // Forward the whole write burst to the sync slave (the request carries
+        // the full payload). By the IoV2Sync contract it serves any size inline
+        // and must complete with IO_REQ_DONE (never GRANTED/DENIED). Assert it
+        // honoured the contract (asserts/debug builds). Then queue one ack
+        // entry per beat, each round-tripping the master's own request.
+        vp::IoReqStatus st = self->out.req(req);
+        self->traces.assert(st == vp::IO_REQ_DONE,
+            "sync slave must reply IO_REQ_DONE inline (got %d)", (int)st);
+
+        latency = req->get_full_latency();
+        vp::IoRespStatus status = req->get_resp_status();
+        uint8_t *data = req->get_data();
+        uint64_t offset = 0;
+        do
+        {
+            // A zero-size burst still gets a single zero-size ack.
+            uint64_t beat = std::min<uint64_t>(total - offset,
+                                               (uint64_t)self->beat_width);
+            self->entries.push_back(StreamEntry{nullptr, req,
+                burst_addr + offset, data + offset, beat,
+                offset == 0, offset + beat >= total, burst_id, status});
+            offset += beat;
+        } while (offset < total);
+    }
+    else
+    {
+        // Read burst requests carry no data: serve each beat inline, at submit
+        // time, into a distinct allocator-backed object whose co-allocated
+        // payload receives the beat's data (the sync slave fills it directly).
+        // The whole burst is read in this cycle — exactly when the previous
+        // whole-burst forward read it — so data snapshot and timing are
+        // unchanged; the objects then just stream upstream one per cycle. The
+        // terminal master copies each payload out and frees the beat.
+        uint64_t offset = 0;
+        do
+        {
+            // A zero-size burst still gets a single zero-size completion beat.
+            uint64_t beat = std::min<uint64_t>(total - offset,
+                                               (uint64_t)self->beat_width);
+            vp::IoReq *b = self->beat_allocator->alloc();
+            b->prepare();
+            b->set_addr(burst_addr + offset);
+            b->set_size(beat);
+            b->set_is_write(false);
+            // Single-beat framing downstream (each sync call is an
+            // independent request); the upstream burst framing is applied
+            // after the call.
+            b->is_first = true;
+            b->is_last  = true;
+            b->burst_id = -1;
+
+            vp::IoReqStatus st = self->out.req(b);
+            self->traces.assert(st == vp::IO_REQ_DONE,
+                "sync slave must reply IO_REQ_DONE inline (got %d)", (int)st);
+            latency = std::max(latency, b->get_full_latency());
+
+            b->is_first = offset == 0;
+            b->is_last  = offset + beat >= total;
+            b->burst_id = burst_id;
+            b->initiator = req->initiator;
+
+            self->entries.push_back(StreamEntry{b, nullptr, 0, nullptr, 0,
+                false, false, -1, vp::IO_RESP_OK});
+            offset += beat;
+        } while (offset < total);
+    }
 
     // Start the FSM after the head latency. enqueue() keeps the earliest pending
     // cycle, so while already streaming (enqueued at +1) this is a no-op and the
-    // queued response just drains continuously behind the active one.
-    self->fsm_event.enqueue(std::max((int64_t)1, req->get_full_latency()));
+    // queued beats just drain continuously behind the active ones.
+    self->fsm_event.enqueue(std::max((int64_t)1, latency));
 
     return vp::IO_REQ_GRANTED;
 }
@@ -74,48 +140,44 @@ void IoV2BeatToSyncAdapter::retry_handler(vp::Block *__this, vp::IoRetryChannel)
 }
 
 
-bool IoV2BeatToSyncAdapter::emit_beat(bool is_first, bool is_last, uint64_t beat)
+bool IoV2BeatToSyncAdapter::emit_entry(const StreamEntry &e)
 {
-    // Deliver on the master's own request for a write (every ack) and for the
-    // LAST beat of any read (which covers a single-beat read): once a beat is the
-    // last, no sibling beat can alias it, and many masters key completion on
-    // getting that exact object back. Earlier read beats each need a distinct
-    // object — a downstream that queues responses (e.g. a clock bridge) must not
-    // alias a reused one. The terminal master frees every object it receives, so
-    // the adapter itself never allocates a separate descriptor to free.
     vp::IoReq *r;
-    if (this->cur_req->get_is_write() || is_last)
+    if (e.beat != nullptr)
     {
-        r = this->cur_req;
+        // Read beat: distinct allocator-backed object, fully prepared at
+        // submit time (payload already holds the data). The terminal master
+        // copies it out and frees it — the master's burst request is never
+        // round-tripped as a read beat (initiator-owned convention).
+        r = e.beat;
     }
     else
     {
-        r = new vp::IoReq();
-        r->set_is_write(false);
-        r->initiator = this->cur_req->initiator;
+        // Write ack: round-trip the master's own request object, mutated per
+        // beat. Its data may point into the master's own buffer — writes are
+        // exempt from the data-less rule since nobody else frees them.
+        r = e.wreq;
+        r->set_addr(e.addr);
+        r->set_data(e.data);
+        r->set_size(e.size);
+        r->burst_id = e.burst_id;
+        r->is_first = e.is_first;
+        r->is_last = e.is_last;
+        r->set_resp_status(e.status);
     }
 
-    r->set_addr(this->cur_addr + this->cur_offset);
-    r->set_data(this->cur_data + this->cur_offset);
-    r->set_size(beat);
-    r->burst_id = this->cur_burst_id;
-    r->is_first = is_first;
-    r->is_last = is_last;
-    r->set_resp_status(this->cur_status);
-
     this->trace.msg(vp::Trace::LEVEL_TRACE,
-        "Emit beat (req=%p, offset=%lu, size=%lu, first=%d, last=%d, write=%d)\n",
-        r, this->cur_offset, beat, is_first ? 1 : 0, is_last ? 1 : 0,
-        this->cur_req->get_is_write() ? 1 : 0);
+        "Emit beat (req=%p, addr=0x%lx, size=%lu, first=%d, last=%d, write=%d)\n",
+        r, r->get_addr(), r->get_size(), r->is_first ? 1 : 0, r->is_last ? 1 : 0,
+        r->get_is_write() ? 1 : 0);
 
     if (this->in.resp(r) == vp::IO_RESP_DENIED)
     {
-        // Upstream back-pressure: hold this object and its beat size (read now,
-        // before the master can take ownership and reuse it) and re-send on
-        // resp_retry. The caller must not advance the cursor.
+        // Upstream back-pressure: hold this exact object and re-send on
+        // resp_retry. The entry was already popped by the caller, so nothing
+        // else advances until the held beat is accepted.
         this->resp_held = true;
         this->held_req = r;
-        this->held_beat = beat;
         return false;
     }
     return true;
@@ -135,17 +197,9 @@ void IoV2BeatToSyncAdapter::resp_retry_in_handler(vp::Block *__this,
     {
         return;   // still busy; keep holding
     }
-    // Accepted: advance the cursor that fsm_handler left pending, then resume.
-    uint64_t beat = self->held_beat;
     self->resp_held = false;
     self->held_req = nullptr;
-    self->held_beat = 0;
-    self->cur_offset += beat;
-    if (self->cur_offset >= self->cur_size)
-    {
-        self->cur_req = nullptr;   // burst fully streamed
-    }
-    if (self->cur_req != nullptr || !self->pending.empty())
+    if (!self->entries.empty())
     {
         self->fsm_event.enqueue(1);
     }
@@ -163,45 +217,23 @@ void IoV2BeatToSyncAdapter::fsm_handler(vp::Block *__this, vp::ClockEvent *)
         return;
     }
 
-    // Activate the next queued response if idle.
-    if (self->cur_req == nullptr)
+    if (self->entries.empty())
     {
-        if (self->pending.empty())
-        {
-            return;
-        }
-        vp::IoReq *req = self->pending.front();
-        self->pending.pop_front();
-        self->cur_req      = req;
-        self->cur_data     = req->get_data();
-        self->cur_size     = req->get_size();
-        self->cur_addr     = req->get_addr();
-        self->cur_burst_id = req->burst_id;
-        self->cur_status   = req->get_resp_status();
-        self->cur_offset   = 0;
-    }
-
-    // Carve and send one beat (zero-size response → a single zero-size beat).
-    uint64_t beat = std::min<uint64_t>(self->cur_size - self->cur_offset,
-                                       (uint64_t)self->beat_width);
-    bool is_first = (self->cur_offset == 0);
-    bool is_last  = (self->cur_offset + beat >= self->cur_size);
-
-    if (!self->emit_beat(is_first, is_last, beat))
-    {
-        // Held on upstream back-pressure; resp_retry_in_handler advances the
-        // cursor and resumes once the master accepts.
         return;
     }
 
-    self->cur_offset += beat;
-    if (self->cur_offset >= self->cur_size)
+    StreamEntry e = self->entries.front();
+    self->entries.pop_front();
+
+    if (!self->emit_entry(e))
     {
-        self->cur_req = nullptr;   // burst fully streamed
+        // Held on upstream back-pressure; resp_retry_in_handler resumes once
+        // the master accepts.
+        return;
     }
 
-    // More to do (this burst or a queued one)? Tick again next cycle.
-    if (self->cur_req != nullptr || !self->pending.empty())
+    // More queued beats? Tick again next cycle.
+    if (!self->entries.empty())
     {
         self->fsm_event.enqueue(1);
     }
@@ -247,12 +279,26 @@ void IoV2BeatToSyncAdapter::reset(bool active)
 {
     if (active)
     {
-        this->pending.clear();
-        this->cur_req = nullptr;
-        this->cur_offset = 0;
+        // Queued read beats are ours (allocator-backed) — return them to their
+        // pool. Write entries reference the master's own request, not ours to
+        // free.
+        for (auto &e : this->entries)
+        {
+            if (e.beat != nullptr)
+            {
+                e.beat->free();
+            }
+        }
+        this->entries.clear();
+        // Same for a held (back-pressured) beat: free it if it is a read beat,
+        // leave it alone if it is the master's round-tripped write ack.
+        if (this->resp_held && this->held_req != nullptr
+            && !this->held_req->get_is_write())
+        {
+            this->held_req->free();
+        }
         this->resp_held = false;
         this->held_req = nullptr;
-        this->held_beat = 0;
         this->fsm_event.cancel();   // safe even if not enqueued
     }
 }

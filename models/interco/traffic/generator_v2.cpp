@@ -24,6 +24,7 @@
 
 #include <cstring>
 #include <stdexcept>
+#include <unordered_map>
 #include <vp/vp.hpp>
 #include <vp/signal.hpp>
 #include <vp/itf/io_v2.hpp>
@@ -81,6 +82,9 @@ private:
     int64_t last_req_cyclestamp = 0;
 
     int nb_pending_reqs;
+    // Per-in-flight-request fill cursor for distinct read response beats
+    // (initiator-owned convention). Keyed by our own request object.
+    std::unordered_map<vp::IoReq *, uint64_t> fill_offset;
     vp::Queue free_reqs;
     std::queue<TransferV2 *> transfers;
     TransferV2 *current_transfer = NULL;
@@ -164,6 +168,37 @@ vp::IoRespAck GeneratorV2::response(vp::Block *__this, vp::IoReq *req)
 {
     GeneratorV2 *_this = (GeneratorV2 *)__this;
     _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Received response (req: %p)\n", req);
+
+    // Big-packet master contract: tolerate all three response forms. A beat
+    // slave bound directly (e.g. the FlooNoC NI) answers a read with DISTINCT
+    // allocator-backed beats whose payload carries the data (initiator-owned
+    // convention); our own request comes back only for write acks and
+    // big-packet responses. Correlate by req->initiator (set at issue), copy
+    // each beat's payload into our buffer at the running fill cursor, free
+    // the beat, and complete our request on its last beat.
+    vp::IoReq *own = (vp::IoReq *)req->initiator;
+    if (own != req)
+    {
+        // The fill cursor lives in our own map: remaining_size on the request
+        // is NOT ours to use — a slave (e.g. the FlooNoC NI) may use it for
+        // its own per-burst accounting on the very same object.
+        uint64_t &filled = _this->fill_offset[own];
+        if (!own->get_is_write() && req->get_size() > 0)
+        {
+            memcpy(own->get_data() + filled, req->get_data(), req->get_size());
+        }
+        filled += req->get_size();
+        bool last = req->is_last;
+        int64_t latency = req->get_latency();
+        req->free();
+        if (last)
+        {
+            _this->fill_offset.erase(own);
+            _this->handle_req_end(own, latency);
+        }
+        return vp::IO_RESP_ACCEPTED;
+    }
+
     _this->handle_req_end(req, req->get_latency());
     return vp::IO_RESP_ACCEPTED;
 }
@@ -433,6 +468,15 @@ void GeneratorV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         req->set_addr(_this->address);
         req->set_data(_this->data);
         req->set_is_write(_this->current_transfer->do_write);
+        // Back-reference for the initiator-owned convention: a beat slave
+        // answers a read with distinct beat objects carrying this pointer in
+        // req->initiator; the fill cursor lives in fill_offset (remaining_size
+        // is not ours to use — slaves may claim it on the same object).
+        req->initiator = req;
+        _this->fill_offset[req] = 0;
+        req->is_first = true;
+        req->is_last = true;
+        req->burst_id = -1;
 
         _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Sending request (req: %p, address: 0x%llx, size: 0x%llx, packet_size: 0x%llx)\n",
             req, _this->address, chunk, _this->current_transfer->packet_size);

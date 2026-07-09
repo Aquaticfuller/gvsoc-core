@@ -7,6 +7,7 @@
 #include "io_v2_beat_adapter.hpp"
 
 #include <algorithm>
+#include <cstring>
 
 
 IoV2BeatAdapter::IoV2BeatAdapter(vp::ComponentConf &config)
@@ -23,6 +24,8 @@ IoV2BeatAdapter::IoV2BeatAdapter(vp::ComponentConf &config)
         this->trace.fatal("IoV2BeatAdapter requires beat_width > 0 (got %d)\n",
                           this->beat_width);
     }
+
+    this->beat_allocator = vp::IoReqAllocator::get(this->beat_width);
 
     this->new_slave_port("input", &this->in);
     this->new_master_port("output", &this->out);
@@ -97,6 +100,12 @@ vp::IoRespAck IoV2BeatAdapter::resp_handler(vp::Block *__this, vp::IoReq *req)
     // Async completion of one of our in-flight read sub-reads? Mark it done,
     // drain any now-contiguous completed beats in order, and refill the
     // pipeline. (Searching is cheap: max_sub_outstanding is small.)
+    // A big-packet / single-req / sync downstream rounds-trip the sub-read
+    // object itself (identity match). A BEAT downstream instead answers with
+    // DISTINCT allocator-backed beats whose payload carries the data,
+    // correlated back to our sub-read via req->initiator (set at issue) —
+    // copy each payload slice into the sub-read's own payload at the fill
+    // cursor, free the beat, and complete on its last beat.
     for (auto &e : self->sub_inflight)
     {
         if (e.req == req)
@@ -108,6 +117,38 @@ vp::IoRespAck IoV2BeatAdapter::resp_handler(vp::Block *__this, vp::IoReq *req)
             self->issue_pending_sub_reads();
             self->reschedule_fsm();
             return vp::IO_RESP_ACCEPTED;
+        }
+    }
+    if (req->initiator != nullptr && req->initiator != req)
+    {
+        vp::IoReq *own = (vp::IoReq *)req->initiator;
+        for (auto &e : self->sub_inflight)
+        {
+            if (e.req == own)
+            {
+                if (req->get_size() > 0)
+                {
+                    memcpy(own->get_data() + e.filled, req->get_data(),
+                           req->get_size());
+                    e.filled += req->get_size();
+                }
+                if (req->get_resp_status() == vp::IO_RESP_INVALID)
+                {
+                    e.status = vp::IO_RESP_INVALID;
+                }
+                bool last = req->is_last;
+                int64_t latency = req->get_full_latency();
+                req->free();
+                if (last)
+                {
+                    e.completed = true;
+                    e.latency   = latency;
+                    self->drain_completed_sub_reads();
+                    self->issue_pending_sub_reads();
+                    self->reschedule_fsm();
+                }
+                return vp::IO_RESP_ACCEPTED;
+            }
         }
     }
 
@@ -140,8 +181,10 @@ void IoV2BeatAdapter::retry_handler(vp::Block *__this, vp::IoRetryChannel channe
 
 void IoV2BeatAdapter::enqueue_read_burst(vp::IoReq *req)
 {
+    // Read burst requests carry no data (data == NULL): each sub-read's
+    // allocator-provided payload holds one beat of read data and travels
+    // upstream inside the response beat.
     uint64_t burst_addr = req->get_addr();
-    uint8_t *data       = req->get_data();
     uint64_t total      = req->get_size();
     int64_t  burst_id   = req->burst_id;
 
@@ -150,7 +193,7 @@ void IoV2BeatAdapter::enqueue_read_burst(vp::IoReq *req)
         // Degenerate empty read: emit a single zero-size completion beat so the
         // upstream master still sees is_first=is_last on its burst.
         this->read_jobs.push_back(SubReadJob{
-            req, 0, 0, burst_addr, data, true, true, burst_id});
+            req, 0, 0, burst_addr, true, true, burst_id});
         return;
     }
 
@@ -159,7 +202,7 @@ void IoV2BeatAdapter::enqueue_read_burst(vp::IoReq *req)
         uint64_t beat = std::min<uint64_t>(total - offset,
                                            (uint64_t)this->beat_width);
         this->read_jobs.push_back(SubReadJob{
-            req, offset, beat, burst_addr + offset, data + offset,
+            req, offset, beat, burst_addr + offset,
             offset == 0, offset + beat == total, burst_id});
     }
 }
@@ -168,16 +211,23 @@ void IoV2BeatAdapter::enqueue_read_burst(vp::IoReq *req)
 void IoV2BeatAdapter::issue_sub_read(const SubReadJob &job)
 {
     // Each in-flight sub-read needs its own object so several can coexist
-    // downstream. Freed when the entry is drained (in issue/offset order).
-    vp::IoReq *r = new vp::IoReq();
+    // downstream. Drawn from the beat allocator: its co-allocated payload
+    // receives the read data (the downstream target fills it directly) and
+    // the same object is then forwarded upstream as the response beat, where
+    // the terminal master frees it. data is the allocator's payload and is
+    // never repointed.
+    vp::IoReq *r = this->beat_allocator->alloc();
     r->prepare();
     r->set_addr(job.addr);
-    r->set_data(job.data);
     r->set_size(job.beat_bytes);
     r->set_is_write(false);
     r->is_first = true;
     r->is_last  = true;
     r->burst_id = -1;
+    // Self-correlator for a BEAT downstream (form 3), whose distinct response
+    // beats reference this sub-read via initiator. Overwritten with the
+    // upstream master's initiator at emit time (emit_beat).
+    r->initiator = r;
 
     vp::IoReqStatus st = this->out.req(r);
 
@@ -188,7 +238,7 @@ void IoV2BeatAdapter::issue_sub_read(const SubReadJob &job)
         // so it lives in denied_job now and is not lost.
         this->sub_read_denied = true;
         this->denied_job = job;
-        delete r;
+        r->free();
         return;
     }
 
@@ -239,18 +289,19 @@ void IoV2BeatAdapter::drain_completed_sub_reads()
 {
     // Emit beats strictly in issue (offset) order: only the head, and only
     // once it has completed, so a later sub-read that finished early cannot
-    // make is_last reach the upstream master before earlier beats.
+    // make is_last reach the upstream master before earlier beats. The
+    // sub-read object itself is handed over to the pending queue: it carries
+    // the read data in its payload and goes upstream as the response beat.
     while (!this->sub_inflight.empty() && this->sub_inflight.front().completed)
     {
         InflightSubRead e = this->sub_inflight.front();
         this->sub_inflight.pop_front();
-        this->complete_sub_read(e.job, e.status, e.latency);
-        delete e.req;
+        this->complete_sub_read(e.job, e.req, e.status, e.latency);
     }
 }
 
 
-void IoV2BeatAdapter::complete_sub_read(const SubReadJob &job,
+void IoV2BeatAdapter::complete_sub_read(const SubReadJob &job, vp::IoReq *beat,
                                         vp::IoRespStatus status,
                                         int64_t latency_cycles)
 {
@@ -265,7 +316,7 @@ void IoV2BeatAdapter::complete_sub_read(const SubReadJob &job,
 
     this->pending.push_back(PendingBeat{
         job.up_req,
-        job.data,
+        nullptr,
         job.beat_bytes,
         job.offset,
         job.addr,
@@ -274,6 +325,7 @@ void IoV2BeatAdapter::complete_sub_read(const SubReadJob &job,
         job.is_last,
         status == vp::IO_RESP_INVALID ? vp::IO_RESP_INVALID : vp::IO_RESP_OK,
         job.burst_id,
+        beat,
     });
 
     this->trace.msg(vp::Trace::LEVEL_TRACE,
@@ -405,14 +457,15 @@ void IoV2BeatAdapter::emit_beat(const PendingBeat &ev)
     }
 
     // Read response beat (initiator-owned request convention): every read beat —
-    // single- or multi-beat — is a distinct heap object the terminal master frees
-    // as it consumes it. The master's burst request is NEVER round-tripped as a
-    // read beat and is NEVER freed by the adapter: the initiator owns it and frees
-    // it on the last response, correlating each beat back to its request by
-    // req->initiator (copied below), not by object identity.
-    vp::IoReq *beat = new vp::IoReq();
+    // single- or multi-beat — is a distinct allocator-backed object the terminal
+    // master frees (req->free()) as it consumes it, after copying the payload out
+    // of beat->data. The master's burst request is NEVER round-tripped as a read
+    // beat and is NEVER freed by the adapter: the initiator owns it and frees it
+    // on the last response, correlating each beat back to its request by
+    // req->initiator (copied below), not by object identity. The object is the
+    // completed sub-read itself — its payload already holds the read data.
+    vp::IoReq *beat = ev.beat;
     beat->set_addr(ev.addr);
-    beat->set_data(ev.data);
     beat->set_size(ev.size);
     beat->set_is_write(false);
     beat->burst_id = ev.burst_id;
@@ -555,18 +608,33 @@ void IoV2BeatAdapter::reset(bool active)
 {
     if (active)
     {
+        // Read beats waiting in the pending queue are ours (allocator-backed
+        // sub-reads) — return them to their pool. Write entries reference the
+        // master's own request, which is not ours to free.
+        for (auto &ev : this->pending)
+        {
+            if (ev.beat != nullptr)
+            {
+                ev.beat->free();
+            }
+        }
         this->pending.clear();
         this->in_flight.clear();
         this->read_jobs.clear();
         for (auto &e : this->sub_inflight)
         {
-            delete e.req;
+            e.req->free();
         }
         this->sub_inflight.clear();
         this->sub_read_denied = false;
-        // Drop any held (back-pressured) beat. Like pending/read_jobs above, the
-        // upstream-side objects are not freed here (they are owned by the master
-        // / freed at teardown elsewhere); just clear the held state.
+        // Drop any held (back-pressured) beat. A held read beat is
+        // allocator-backed and ours — free it; a held write ack is the
+        // master's own request and is left alone.
+        if (this->resp_held && this->held_req != nullptr
+            && !this->held_req->get_is_write())
+        {
+            this->held_req->free();
+        }
         this->resp_held = false;
         this->held_req = nullptr;
         this->read_last_sched_cycle = -1;
