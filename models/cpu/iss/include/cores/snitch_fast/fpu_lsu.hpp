@@ -24,6 +24,8 @@
 
 #include "cpu/iss/include/types.hpp"
 
+class Lsu;
+
 class FpuLsu : public vp::Block
 {
 public:
@@ -69,6 +71,7 @@ public:
 private:
     static void load_float_resume(FpuLsu *lsu, vp::IoReq *req);
     static void store_resume(FpuLsu *lsu, vp::IoReq *req);
+    static void lsu_stall_trampoline(Lsu *lsu, vp::IoReq *req);
 
     int64_t pending_latency;
 };

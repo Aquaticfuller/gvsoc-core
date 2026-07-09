@@ -457,6 +457,25 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
     const bool is_scalar = (scalar_bypass_port_ >= 0) &&
                            (req->get_initiator() == scalar_bypass_port_);
 
+    // Unconditional (no address filter): every WRITE seen by ANY controller, to correlate
+    // against the SCALAR_PC_DBG cycles where the fdotp reduction's `fsw` instructions fire.
+    if (is_write)
+    {
+        fprintf(stderr, "[RESULT_SCAN_DBG %s] cycle=%lld addr=0x%lx is_write=%d\n",
+            this->get_path().c_str(), (long long)now, (unsigned long)addr, (int)is_write);
+    }
+
+    // [RESULT_DBG] fdotp §13.1 reduction investigation: trace every access to the fdotp
+    // `result[]` array (0x800037c8, 256 floats). Writes print their value immediately
+    // (already in req->get_data() at entry); reads are printed after the value is resolved,
+    // at each exchange_line_data(..., line_to_req=true) call site below.
+    if (addr >= 0x800037c8 && addr < 0x800037c8 + 0x400 && is_write && req->get_data() != nullptr)
+    {
+        fprintf(stderr, "[RESULT_DBG %s] cycle=%lld addr=0x%lx WRITE val=%f initiator=%d\n",
+            this->get_path().c_str(), (long long)now, (unsigned long)addr,
+            (double)*(float *)req->get_data(), req->get_initiator());
+    }
+
     // Write-commit backpressure: the RTL write path serializes through the write-info
     // FIFO + per-way commit, so writes accept at most once per write_commit_cycles_.
     if (is_write && write_commit_cycles_ > 1) {
@@ -553,6 +572,12 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
             if (write_through_mode_) issue_write_through(req);
         } else {
             if (carry_data_) exchange_line_data(req, set, way, /*line_to_req=*/true);  // serve read
+            if (addr >= 0x800037c8 && addr < 0x800037c8 + 0x400 && req->get_data() != nullptr)
+            {
+                fprintf(stderr, "[RESULT_DBG %s] cycle=%lld addr=0x%lx READ_HIT val=%f initiator=%d\n",
+                    this->get_path().c_str(), (long long)now, (unsigned long)addr,
+                    (double)*(float *)req->get_data(), req->get_initiator());
+            }
             cnt_rd_hit_++;
             // A read hit keeps the hit pipeline's decoupling registers occupied; the next
             // read hit within the fill window inherits the streaming latency.
@@ -652,6 +677,12 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
                 vline.dirty = true;
             } else {
                 exchange_line_data(req, set, victim_way, /*line_to_req=*/true);
+                if (addr >= 0x800037c8 && addr < 0x800037c8 + 0x400 && req->get_data() != nullptr)
+                {
+                    fprintf(stderr, "[RESULT_DBG %s] cycle=%lld addr=0x%lx READ_MISS val=%f initiator=%d\n",
+                        this->get_path().c_str(), (long long)now, (unsigned long)addr,
+                        (double)*(float *)req->get_data(), req->get_initiator());
+                }
             }
             req->inc_latency(refill_lat);
             return vp::IO_REQ_OK;
@@ -924,6 +955,12 @@ void InsituCacheController::fsm_drain_mshr(uint32_t set)
             if (write_through_mode_) issue_write_through(req);
         } else if (carry_data_ && line != nullptr) {
             exchange_line_data(req, s, way, /*line_to_req=*/true);   // serve deferred read
+            if (addr >= 0x800037c8 && addr < 0x800037c8 + 0x400 && req->get_data() != nullptr)
+            {
+                fprintf(stderr, "[RESULT_DBG %s] cycle=%lld addr=0x%lx READ_DEFERRED val=%f initiator=%d\n",
+                    this->get_path().c_str(), (long long)this->clock.get_cycles(),
+                    (unsigned long)addr, (double)*(float *)req->get_data(), req->get_initiator());
+            }
         }
 
         req->get_resp_port()->resp(req);

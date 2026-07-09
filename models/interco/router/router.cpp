@@ -272,6 +272,12 @@ vp::IoReqStatus Router::handle_req(vp::IoReq *req, int port)
             this->get_path().c_str(), (unsigned long long)offset,
             mapping ? mapping->name.c_str() : "NULL");
     }
+    if (offset >= 0x800037c8 && offset < 0x800037c8 + 0x400)
+    {
+        fprintf(stderr, "[RESULT_ROUTER_DBG %s] offset=0x%llx size=0x%llx is_write=%d mapping=%s\n",
+            this->get_path().c_str(), (unsigned long long)offset, (unsigned long long)size,
+            (int)is_write, mapping ? mapping->name.c_str() : "NULL");
+    }
 
     // In case no mapping was found, or we hit the error mapping, return an error
     if (!mapping || mapping->id == this->error_id)

@@ -20,6 +20,7 @@
 
  #include "cpu/iss/include/iss.hpp"
  #include ISS_CORE_INC(class.hpp)
+ #include <cstring>
 
 FpuLsu::FpuLsu(IssWrapper &top, Iss &iss)
 : vp::Block(&top, "fpu_lsu"), iss(iss)
@@ -123,6 +124,13 @@ bool FpuLsu::store_float(iss_insn_t *insn, iss_addr_t addr, int size, int reg)
     iss_addr_t phys_addr = addr;
     bool use_mem_array;
 
+    if (size == 4 && strstr(this->iss.top.get_path().c_str(), "group_0_0/tile_0/pe0") != nullptr)
+    {
+        fprintf(stderr, "[FPU_LSU_DBG %s] cycle=%lld STORE_FLOAT_ENTRY addr=0x%lx size=%d\n",
+            this->iss.top.get_path().c_str(), (long long)this->iss.top.clock.get_cycles(),
+            (unsigned long)addr, size);
+    }
+
 #ifdef CONFIG_GVSOC_ISS_MEMORY
 
     if (use_mem_array)
@@ -223,9 +231,28 @@ template bool FpuLsu::store_float_perf<uint64_t>(iss_insn_t *insn, iss_addr_t ad
 
 void FpuLsu::store_resume(FpuLsu *lsu, vp::IoReq *req)
 {
+    if (req->get_addr() >= 0x800037c8 && req->get_addr() < 0x800037c8 + 0x400)
+    {
+        fprintf(stderr, "[FPU_LSU_DBG %s] cycle=%lld STORE_RESUME addr=0x%lx\n",
+            lsu->iss.top.get_path().c_str(), (long long)lsu->iss.top.clock.get_cycles(),
+            (unsigned long)req->get_addr());
+    }
     // For now we don't have to do anything as the register was written directly
     // by the request but we cold support sign-extended loads here;
     lsu->iss.exec.insn_terminate();
+}
+
+void FpuLsu::lsu_stall_trampoline(Lsu *lsu, vp::IoReq *req)
+{
+    FpuLsu *fpu_lsu = &lsu->iss.fpu_lsu;
+    if (req->get_addr() >= 0x800037c8 && req->get_addr() < 0x800037c8 + 0x400)
+    {
+        fprintf(stderr, "[FPU_LSU_DBG %s] cycle=%lld TRAMPOLINE addr=0x%lx\n",
+            fpu_lsu->iss.top.get_path().c_str(), (long long)fpu_lsu->iss.top.clock.get_cycles(),
+            (unsigned long)req->get_addr());
+    }
+    fpu_lsu->pending_latency = req->get_latency() + 1;
+    fpu_lsu->stall_callback(fpu_lsu, req);
 }
 
 void FpuLsu::load_float_resume(FpuLsu *lsu, vp::IoReq *req)
@@ -270,7 +297,24 @@ int FpuLsu::data_req_aligned(iss_addr_t addr, uint8_t *data_ptr, uint8_t *memche
     }
     req->set_memcheck_data(memcheck_data);
 #endif
+    this->iss.lsu.stall_callback = &FpuLsu::lsu_stall_trampoline;
+    if (is_write && size == 4 &&
+        strstr(this->iss.top.get_path().c_str(), "group_0_0/tile_0/pe0") != nullptr)
+    {
+        fprintf(stderr, "[FPU_LSU_DBG %s] cycle=%lld ENTER addr=0x%lx size=%d is_write=%d "
+            "data_ptr=%p val=%f\n",
+            this->iss.top.get_path().c_str(),
+            (long long)this->iss.top.clock.get_cycles(), (unsigned long)addr, size,
+            (int)is_write, (void *)data_ptr, is_write ? (double)*(float *)data_ptr : 0.0);
+    }
     int err = this->iss.lsu.data.req(req);
+    if (is_write && size == 4 &&
+        strstr(this->iss.top.get_path().c_str(), "group_0_0/tile_0/pe0") != nullptr)
+    {
+        fprintf(stderr, "[FPU_LSU_DBG %s] cycle=%lld REQ_RESULT addr=0x%lx err=%d\n",
+            this->iss.top.get_path().c_str(),
+            (long long)this->iss.top.clock.get_cycles(), (unsigned long)addr, err);
+    }
 
     if (err == vp::IO_REQ_OK)
     {
@@ -318,10 +362,7 @@ int FpuLsu::data_req_aligned(iss_addr_t addr, uint8_t *data_ptr, uint8_t *memche
         return err;
     }
 
-    this->trace.msg(vp::Trace::LEVEL_TRACE, "Waiting for asynchronous response\n");
-    // TODO stall FPU SS instead of core
-    this->trace.fatal("Unimplemented asynchronous response\n");
-    // this->iss.exec.insn_stall();
+    this->iss.exec.insn_stall();
     return err;
 }
 

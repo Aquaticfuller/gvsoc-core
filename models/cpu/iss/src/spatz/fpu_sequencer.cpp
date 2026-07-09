@@ -22,6 +22,8 @@
 
  #include <cpu/iss/include/cores/spatz/fpu_sequencer.hpp>
 #include <cstdint>
+#include <cstring>
+#include <dlfcn.h>
  #include "cpu/iss/include/iss.hpp"
  #include ISS_CORE_INC(class.hpp)
 
@@ -95,6 +97,27 @@ iss_reg_t Sequencer::float_handler(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
     iss->sequencer.trace.msg(vp::Trace::LEVEL_TRACE, "Checking float instructions register dependencies\n");
 
+    bool dbg = (pc == 0x800009a0 || pc == 0x800009e8 || pc == 0x800009d0) &&
+        strstr(iss->top.get_path().c_str(), "group_0_0/tile_0/pe0") != nullptr;
+    if (dbg)
+    {
+        Dl_info dlinfo;
+        const char *symname = "?";
+        const char *fname = "?";
+        void *fbase = nullptr;
+        if (dladdr((void *)insn->stub_handler, &dlinfo))
+        {
+            if (dlinfo.dli_sname) symname = dlinfo.dli_sname;
+            if (dlinfo.dli_fname) fname = dlinfo.dli_fname;
+            fbase = dlinfo.dli_fbase;
+        }
+        fprintf(stderr, "[SEQ_DBG %s] cycle=%lld ENTER pc=0x%lx stub_handler=%p sym=%s "
+            "file=%s offset=0x%lx nb_in_reg=%d\n",
+            iss->top.get_path().c_str(), (long long)iss->top.clock.get_cycles(),
+            (unsigned long)pc, (void *)insn->stub_handler, symname, fname,
+            (unsigned long)((char *)insn->stub_handler - (char *)fbase), insn->nb_in_reg);
+    }
+
     int64_t cycles = iss->top.clock.get_cycles();
     // Block the instruction until all float input registers are available, since some vector
     // instructions having them as output may still be pending
@@ -104,9 +127,29 @@ iss_reg_t Sequencer::float_handler(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
             iss->sequencer.scoreboard_freg_timestamp[insn->in_regs[i]] > cycles)
         {
             iss->sequencer.trace.msg(vp::Trace::LEVEL_TRACE, "Stalling due to register dependency (reg: %d)\n", insn->in_regs[i]);
+            if (dbg)
+            {
+                fprintf(stderr, "[SEQ_DBG %s] cycle=%lld STALL pc=0x%lx reg=%d ts=%lld\n",
+                    iss->top.get_path().c_str(), (long long)cycles, (unsigned long)pc,
+                    insn->in_regs[i],
+                    (long long)iss->sequencer.scoreboard_freg_timestamp[insn->in_regs[i]]);
+            }
             return pc;
         }
     }
 
-    return insn->stub_handler(iss, insn, pc);
+    if (dbg)
+    {
+        fprintf(stderr, "[SEQ_DBG %s] cycle=%lld CALLING_STUB pc=0x%lx stub_handler=%p\n",
+            iss->top.get_path().c_str(), (long long)cycles, (unsigned long)pc,
+            (void *)insn->stub_handler);
+    }
+    iss_reg_t ret = insn->stub_handler(iss, insn, pc);
+    if (dbg)
+    {
+        fprintf(stderr, "[SEQ_DBG %s] cycle=%lld STUB_RETURNED pc=0x%lx ret=0x%lx\n",
+            iss->top.get_path().c_str(), (long long)iss->top.clock.get_cycles(),
+            (unsigned long)pc, (unsigned long)ret);
+    }
+    return ret;
 }
