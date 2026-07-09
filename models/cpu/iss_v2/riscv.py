@@ -456,6 +456,12 @@ class RiscvCommon(st.Component):
         if zdinx or isa.has_extension('zdinx'):
             self.add_c_flags(['-DCONFIG_GVSOC_ISS_ZDINX=1'])
 
+        if stack_checker:
+            # Runtime-declared stack bounds (SEMIHOSTING_GV_STACK_SET): SP
+            # writes are checked against them and the stack usage is dumped as
+            # a real trace event. See Regfile::stack_set.
+            self.add_c_flags(['-DCONFIG_GVSOC_ISS_STACK_CHECKER=1'])
+
         fp_size = fp_width if fp_width is not None else  64 if isa.has_isa('rvd') else 32
         self.add_c_flags([f'-DCONFIG_GVSOC_ISS_FP_WIDTH={fp_size}'])
 
@@ -772,6 +778,12 @@ class RiscvCommon(st.Component):
             required_traces=['static_power_trace', 'dyn_power_trace'], display=gvsoc.gui.DisplayAnalog())
         gvsoc.gui.Signal(self, power_signal, name='dynamic', path='dyn_power_trace', groups='power')
         gvsoc.gui.Signal(self, power_signal, name='static', path='static_power_trace', groups='power')
+
+        # Stack usage curve, dumped by the ISS stack checker when the runtime
+        # declares its stacks (gv_stack_set). Max aggregation so short usage
+        # peaks stay visible when zoomed out.
+        gvsoc.gui.Signal(self, active, name='stack_usage', path='stack_usage',
+            groups=['core'], display=gvsoc.gui.DisplayAnalog(aggregation='max'))
 
         stalls = gvsoc.gui.Signal(self, active, name='events', path="pcer_instr",         display=gvsoc.gui.DisplayPulse(), groups=['stall'])
         gvsoc.gui.Signal(self, stalls, name="cycles",        path="event_cycles",        display=gvsoc.gui.DisplayPulse(), groups=['stall'])

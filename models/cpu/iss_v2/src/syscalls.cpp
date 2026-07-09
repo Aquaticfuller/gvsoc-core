@@ -760,6 +760,15 @@ void Syscalls::handle_riscv_ebreak()
     //   break;
     // }
 
+    case 0x11A:  // SEMIHOSTING_GV_STACK_SET
+    {
+#if defined(CONFIG_GVSOC_ISS_STACK_CHECKER)
+        this->iss.regfile.stack_set(this->iss.regfile.get_reg_untimed(11),
+            this->iss.regfile.get_reg_untimed(12));
+#endif
+        break;
+    }
+
     case 0x117:  // SEMIHOSTING_GV_STATS_START
     {
         vp::StatsEngine *engine = this->iss.stats.get_engine();

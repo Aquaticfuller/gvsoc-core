@@ -80,6 +80,16 @@ public:
     inline void memcheck_shift_right(int out_reg, int in_reg, int shift);
     inline void memcheck_shift_right_signed(int out_reg, int in_reg, int shift);
 
+#if defined(CONFIG_GVSOC_ISS_STACK_CHECKER)
+    // Stack checker: the runtime declares the stack the core is executing on
+    // via semihosting (SEMIHOSTING_GV_STACK_SET). Every SP write is then
+    // checked against the declared range, and the stack usage is dumped as a
+    // real trace event, which the GUI displays as an analog signal.
+    void stack_set(iss_reg_t base, iss_reg_t size);
+    void stack_sp_update(iss_reg_t sp);
+    void stack_fault_report(iss_reg_t sp);
+#endif
+
     inline bool scoreboard_insn_check(iss_insn_t *insn);
     inline void scoreboard_insn_clear(iss_insn_t *insn);
     inline void scoreboard_insn_start(iss_insn_t *insn);
@@ -155,6 +165,20 @@ private:
 #if defined(CONFIG_GVSOC_EVENT_ACTIVE)
     std::vector<vp::Signal<iss_reg_t>> reg_signals;
 #endif
+
+#if defined(CONFIG_GVSOC_ISS_STACK_CHECKER)
+    // Bounds of the stack declared by the runtime, top is the first address
+    // after the stack
+    iss_reg_t stack_base;
+    iss_reg_t stack_top;
+    // True when a stack has been declared
+    bool stack_enabled;
+    // The declaration can precede the actual stack switch (context-switch
+    // case, where SP still points to the previous thread stack). The checks
+    // only arm once SP first lands inside the declared range.
+    bool stack_active;
+    vp::Trace stack_usage_event;
+#endif
 };
 
 inline bool Regfile::is_freg(int reg)
@@ -196,6 +220,12 @@ inline void Regfile::set_reg(int reg, uint64_t value)
     if (reg < ISS_DUMMY_REG)
     {
         this->reg_signals[reg] = value;
+    }
+#endif
+#if defined(CONFIG_GVSOC_ISS_STACK_CHECKER)
+    if (__builtin_expect(reg == 2, 0))
+    {
+        this->stack_sp_update((iss_reg_t)value);
     }
 #endif
 }

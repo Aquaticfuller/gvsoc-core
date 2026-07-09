@@ -137,9 +137,6 @@ void Csr::reset(bool active)
         this->pcmr = 0;
         this->pcer = 3;
     #endif
-    #if defined(CONFIG_GVSOC_ISS_STACK_CHECKER)
-        this->stack_conf = 0;
-    #endif
         this->dcsr = 4 << 28;
         this->fcsr.raw = 0;
 
@@ -507,52 +504,6 @@ static bool mhpmevent_write(Iss *iss, unsigned int value, int id)
 /*
  *   PULP CSRS
  */
-
-#ifdef CONFIG_GVSOC_ISS_STACK_CHECKER
-
-static bool stack_conf_write(Iss *iss, iss_reg_t value)
-{
-    iss->csr.stack_conf = value;
-
-    if (iss->csr.stack_conf)
-        iss->csr.trace.msg("Activating stack checking (start: 0x%x, end: 0x%x)\n", iss->csr.stack_start, iss->csr.stack_end);
-    else
-        iss->csr.trace.msg("Deactivating stack checking\n");
-
-    return false;
-}
-
-static bool stack_conf_read(Iss *iss, iss_reg_t *value)
-{
-    *value = iss->csr.stack_conf;
-    return false;
-}
-
-static bool stack_start_write(Iss *iss, iss_reg_t value)
-{
-    iss->csr.stack_start = value;
-    return false;
-}
-
-static bool stack_start_read(Iss *iss, iss_reg_t *value)
-{
-    *value = iss->csr.stack_start;
-    return false;
-}
-
-static bool stack_end_write(Iss *iss, iss_reg_t value)
-{
-    iss->csr.stack_end = value;
-    return false;
-}
-
-static bool stack_end_read(Iss *iss, iss_reg_t *value)
-{
-    *value = iss->csr.stack_end;
-    return false;
-}
-
-#endif
 
 static bool umode_read(Iss *iss, iss_reg_t *value)
 {
@@ -1180,18 +1131,6 @@ bool iss_csr_read(Iss *iss, iss_insn_t *insn, iss_reg_t reg, iss_reg_t *value)
         break;
 #endif
 
-#ifdef CONFIG_GVSOC_ISS_STACK_CHECKER
-    case CSR_STACK_CONF:
-        status = stack_conf_read(iss, value);
-        break;
-    case CSR_STACK_START:
-        status = stack_start_read(iss, value);
-        break;
-    case CSR_STACK_END:
-        status = stack_end_read(iss, value);
-        break;
-#endif
-
 #if defined(CONFIG_GVSOC_ISS_SNITCH)
     case 0x7d0:
     case 0x7d1:
@@ -1314,23 +1253,11 @@ bool iss_csr_write(Iss *iss, iss_insn_t *insn, iss_reg_t reg, iss_reg_t value)
     case 0xF13:
     case 0xF14:
         return false;
-#ifdef CONFIG_GVSOC_ISS_STACK_CHECKER
-    case CSR_STACK_CONF:
-        return stack_conf_write(iss, value);
-        break;
-    case CSR_STACK_START:
-        return stack_start_write(iss, value);
-        break;
-    case CSR_STACK_END:
-        return stack_end_write(iss, value);
-        break;
-#else
     case 0x7d0:
     case 0x7d1:
     case 0x7d2:
         return false;
         break;
-#endif
     }
 
 #if defined(ISS_HAS_PERF_COUNTERS)
@@ -1611,14 +1538,6 @@ const char *iss_csr_name(Iss *iss, iss_reg_t reg)
     case 0x7b3:
         return "scratch1";
 
-#ifdef CONFIG_GVSOC_ISS_STACK_CHECKER
-    case CSR_STACK_CONF:
-        return "stack_conf";
-    case CSR_STACK_START:
-        return "stack_start";
-    case CSR_STACK_END:
-        return "stack_end";
-#endif
     }
 
 #if defined(ISS_HAS_PERF_COUNTERS)
