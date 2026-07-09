@@ -426,19 +426,28 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 }
             }
         }
+    }
 
-        // Check if the first enqueued instruction must be removed
-        if (_this->nb_pending_insn.get() > 0)
+    // Check if the first enqueued instruction must be removed. This must run every cycle,
+    // NOT only while _this->pending_size != 0 (i.e. while some other, newer instruction
+    // happens to be mid-issue): the head instruction's own bursts complete asynchronously
+    // via data_response(), which can happen well after this instruction (and every
+    // instruction issued after it) has finished ISSUING all its bursts — at which point
+    // pending_size is already back to 0 and this check would otherwise never run again,
+    // permanently stalling Ara's global instruction queue even though AraVlsu itself has
+    // nothing left outstanding. (Confirmed via [VLSU_FSM_DBG]/[ARA_DBG]: AraVlsu reaches
+    // nb_waiting_insn=0, pending_size=0 while nb_pending_insn stays stuck at 1 forever, with
+    // Ara's global queue full and its head instruction never marked done.)
+    if (_this->nb_pending_insn.get() > 0)
+    {
+        AraVlsuPendingInsn &slot = _this->insns[_this->insn_first];
+        PendingInsn *pending_insn = slot.insn;
+        if (_this->pending_size == 0 && slot.nb_pending_bursts == 0 &&
+            pending_insn->timestamp <= _this->ara.iss.top.clock.get_cycles())
         {
-            AraVlsuPendingInsn &slot = _this->insns[_this->insn_first];
-            PendingInsn *pending_insn = slot.insn;
-            if (_this->pending_size == 0 && slot.nb_pending_bursts == 0 &&
-                pending_insn->timestamp <= _this->ara.iss.top.clock.get_cycles())
-            {
-                _this->insn_first = (_this->insn_first + 1) % AraVlsu::queue_size;
-                _this->nb_pending_insn.dec(1);
-                _this->ara.insn_end(pending_insn);
-            }
+            _this->insn_first = (_this->insn_first + 1) % AraVlsu::queue_size;
+            _this->nb_pending_insn.dec(1);
+            _this->ara.insn_end(pending_insn);
         }
     }
 }
