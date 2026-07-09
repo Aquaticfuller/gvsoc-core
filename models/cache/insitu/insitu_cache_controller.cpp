@@ -74,6 +74,7 @@ private:
 
     // ===== Internal helpers =====
     vp::IoReqStatus handle_request(vp::IoReq *req);
+    void try_admit_stalled();
     CacheLine *lookup(uint32_t tag, uint32_t set, int *way_out);
     int pick_victim(uint32_t tag, uint32_t set);
     void issue_write_through(vp::IoReq *user_req);
@@ -190,6 +191,14 @@ private:
     std::vector<std::deque<MshrEntry>>   mshr_;      // [num_sets]
     std::vector<bool>                    refill_in_flight_;  // [num_sets]
     std::vector<int64_t>                 set_busy_until_;    // [num_sets]
+
+    // inline_sync_miss_ only: requests DENIED purely because retr/miss/evic fifo capacity
+    // was momentarily exhausted, with nobody to retry them (async ISS masters like AraVlsu
+    // treat a DENIED as "someone else is holding this and will complete it" and move on —
+    // true for the FlooNoc NI's DENIED contract but NOT for a plain capacity reject). Held
+    // here and re-attempted via try_admit_stalled() whenever a fifo slot frees up, so the
+    // request eventually gets a genuine resp() instead of being silently dropped.
+    std::deque<vp::IoReq*>               admission_stall_queue_;
 
     // 1-entry forwarding buffer: the line whose row is currently cached in the access
     // controller's registers. A read hit on this line forwards combinationally (skips the
@@ -366,6 +375,13 @@ void InsituCacheController::reset(bool active)
 vp::IoReqStatus InsituCacheController::req_handler(vp::Block *__this, vp::IoReq *req)
 {
     InsituCacheController *_this = static_cast<InsituCacheController *>(__this);
+
+    // Debug (syscall/printf) accesses bypass the cache and go straight to L2.
+    // L2 is synchronous so this always returns IO_REQ_OK without queuing an MSHR entry.
+    if (req->is_debug()) {
+        return _this->refill_itf_.req(req);
+    }
+
     _this->trace_.msg(vp::Trace::LEVEL_TRACE,
         "req addr=0x%lx size=%lu wr=%d\n",
         (unsigned long)req->get_addr(),
@@ -399,6 +415,34 @@ vp::IoReqStatus InsituCacheController::flush_req_handler(vp::Block *__this, vp::
     _this->trace_.msg(vp::Trace::LEVEL_DEBUG, "cache flush/invalidate (now %ld)\n",
                       (long)_this->clock.get_cycles());
     return vp::IO_REQ_OK;
+}
+
+// Re-attempt admission for requests parked in admission_stall_queue_ because a retr/miss/
+// evic fifo was momentarily full (inline_sync_miss_ mode only — see the queue's comment).
+// Called whenever one of those fifo levels drops, i.e. capacity may have freed up.
+// handle_request() is safe to call again on these: they were returned from *before* any
+// state mutation, so re-deriving tag/set/line from req's untouched fields is equivalent to
+// a fresh call. A retried OK needs an explicit resp() here since this isn't happening inside
+// the original synchronous req() call anymore; a retried PENDING has already been parked by
+// handle_request() itself (onto mshr_ or back onto this same stall queue) and needs nothing
+// further from us. Stops at the first request that is still DENIED (still no capacity) to
+// preserve FIFO order.
+void InsituCacheController::try_admit_stalled()
+{
+    while (!admission_stall_queue_.empty()) {
+        vp::IoReq *req = admission_stall_queue_.front();
+        admission_stall_queue_.pop_front();
+        const vp::IoReqStatus rst = this->handle_request(req);
+        if (rst == vp::IO_REQ_OK) {
+            req->get_resp_port()->resp(req);
+        } else if (rst == vp::IO_REQ_DENIED) {
+            // Still no room — put it back at the head and stop; will retry next time
+            // capacity frees.
+            admission_stall_queue_.push_front(req);
+            break;
+        }
+        // IO_REQ_PENDING: already re-parked by handle_request(), nothing more to do.
+    }
 }
 
 vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
@@ -530,6 +574,13 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
             enable_multi_read_pend_ && !is_write && line->state == LineState::READ_PEND;
         if (!is_read_pend_merge && retr_fifo_level_ >= retr_fifo_depth_) {
             cnt_stall_mshr_full_++;
+            if (inline_sync_miss_) {
+                // No one retries a DENIED for a closed-loop async master (see
+                // admission_stall_queue_ comment) — hold it and re-attempt admission
+                // ourselves once a retr_fifo slot frees up.
+                admission_stall_queue_.push_back(req);
+                return vp::IO_REQ_PENDING;
+            }
             return vp::IO_REQ_DENIED;
         }
         req->save();
@@ -543,6 +594,10 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
     // --- miss: allocate + refill ---
     if (miss_fifo_level_ >= miss_fifo_depth_) {
         cnt_stall_miss_fifo_++;
+        if (inline_sync_miss_) {
+            admission_stall_queue_.push_back(req);
+            return vp::IO_REQ_PENDING;
+        }
         return vp::IO_REQ_DENIED;
     }
 
@@ -552,6 +607,10 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
     if (vline.state == LineState::VALID && vline.dirty) {
         if (evic_fifo_level_ >= evic_fifo_depth_) {
             cnt_stall_evic_fifo_++;
+            if (inline_sync_miss_) {
+                admission_stall_queue_.push_back(req);
+                return vp::IO_REQ_PENDING;
+            }
             return vp::IO_REQ_DENIED;
         }
         uint64_t old_line_addr =
@@ -734,6 +793,7 @@ void InsituCacheController::issue_eviction(uint32_t line_addr)
     evic_fifo_level_++;
     (void)this->evict_itf_.req(&evict_req_);
     if (evic_fifo_level_ > 0) evic_fifo_level_--;  // single-slot model — phase 6 can refine
+    if (inline_sync_miss_) this->try_admit_stalled();
 
     // Occupancy: a dirty writeback shares the near-serial install/writeback pipeline with
     // refills, so it consumes a drain slot (refills + writebacks serialize on the same
@@ -868,6 +928,10 @@ void InsituCacheController::fsm_drain_mshr(uint32_t set)
 
         req->get_resp_port()->resp(req);
     }
+
+    // retr_fifo_level_ (and, transitively via miss_fifo_level_ freed just before this was
+    // called from refill_resp_handler) may have room now — see admission_stall_queue_.
+    if (inline_sync_miss_) this->try_admit_stalled();
 }
 
 // ---------- Module entry point ----------
