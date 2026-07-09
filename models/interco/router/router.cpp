@@ -266,10 +266,22 @@ vp::IoReqStatus Router::handle_req(vp::IoReq *req, int port)
     // Get the mapping from the tree
     vp::MappingTreeEntry *mapping = this->mapping_tree.get(offset, size, req->get_is_write());
 
+    if (offset < 0x2000)
+    {
+        fprintf(stderr, "[ROUTER_DBG %s] offset=0x%llx mapping=%s\n",
+            this->get_path().c_str(), (unsigned long long)offset,
+            mapping ? mapping->name.c_str() : "NULL");
+    }
+
     // In case no mapping was found, or we hit the error mapping, return an error
     if (!mapping || mapping->id == this->error_id)
     {
         this->stat_errors++;
+        if (offset < 0x2000)
+        {
+            fprintf(stderr, "[ROUTER_DBG %s] offset=0x%llx -> INVALID (no mapping / error mapping)\n",
+                this->get_path().c_str(), (unsigned long long)offset);
+        }
         return vp::IO_REQ_INVALID;
     }
 
@@ -285,6 +297,11 @@ vp::IoReqStatus Router::handle_req(vp::IoReq *req, int port)
         // The mapping may exist and not be connected, return an error in this case
         if (!entry->itf.is_bound())
         {
+            if (offset < 0x2000)
+            {
+                fprintf(stderr, "[ROUTER_DBG %s] offset=0x%llx mapping=%s -> INVALID (port not bound)\n",
+                    this->get_path().c_str(), (unsigned long long)offset, mapping->name.c_str());
+            }
             this->trace.msg(vp::Trace::LEVEL_WARNING, "Invalid access, trying to route to non-connected interface (offset: 0x%llx, size: 0x%llx, is_write: %d)\n",
                 offset, size, is_write);
             return vp::IO_REQ_INVALID;

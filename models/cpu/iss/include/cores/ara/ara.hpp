@@ -103,6 +103,9 @@ public:
 private:
     // Handler for internal FSM
     static void fsm_handler(vp::Block *__this, vp::ClockEvent *event);
+    // Response callback invoked by the interconnect when an async (IO_REQ_PENDING) request
+    // completes.  Pushes the request back to its port queue and decrements nb_pending_bursts.
+    static void data_response(vp::Block *__this, vp::IoReq *req);
     // Handler called when a load instruction starts to be processed, in order to initialize the FSM
     // for a read burst
     static void handle_insn_load(AraVlsu *vlsu, iss_insn_t *insn);

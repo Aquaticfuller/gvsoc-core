@@ -19,6 +19,7 @@
  * Authors: Germain Haugou, GreenWaves Technologies (germain.haugou@greenwaves-technologies.com)
  */
 
+#include <cstdio>
 #include <vp/vp.hpp>
 #include "cpu/iss/include/iss.hpp"
 
@@ -178,7 +179,13 @@ void Exec::exec_instr(vp::Block *__this, vp::ClockEvent *event)
     {
         iss_reg_t index;
         iss_insn_t *insn = iss->insn_cache.get_insn(pc, index);
-        if (insn == NULL) return;
+        if (insn == NULL)
+        {
+            fprintf(stderr, "[GETINSN_NULL_DBG %s] cycle=%lld pc=0x%lx\n",
+                iss->top.get_path().c_str(), (long long)iss->top.clock.get_cycles(),
+                (unsigned long)pc);
+            return;
+        }
 
         #if defined(CONFIG_GVSOC_ISS_EXEC_SCOREBOARD)
         // Since the instruction may be not decoded yet and will be once the handler is executed,
@@ -219,6 +226,12 @@ void Exec::exec_instr(vp::Block *__this, vp::ClockEvent *event)
 
         // Takes care first of all optional features (traces, VCD and so on)
         iss->exec.insn_exec_profiling();
+
+        {
+            fprintf(stderr, "[SCALAR_PC_DBG %s] cycle=%lld pc=0x%lx\n",
+                iss->top.get_path().c_str(), (long long)iss->top.clock.get_cycles(),
+                (unsigned long)pc);
+        }
 
         // Execute the instruction and replace the current one with the new one
         iss->exec.current_insn = insn->fast_handler(iss, insn, pc);
@@ -298,6 +311,13 @@ void Exec::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
     Iss *iss = (Iss *)__this;
     Exec *_this = &iss->exec;
 
+    {
+        fprintf(stderr, "[CHECKALL_DBG %s] cycle=%lld pc=0x%lx stall_cycles=%d wfi=%d\n",
+            iss->top.get_path().c_str(), (long long)iss->top.clock.get_cycles(),
+            (unsigned long)iss->exec.current_insn, (int)_this->stall_cycles,
+            (int)iss->exec.wfi.get());
+    }
+
     if (iss->exec.handle_stall_cycles()) return;
 
     _this->trace.msg(vp::Trace::LEVEL_TRACE, "Handling instruction with slow handler (pc: 0x%lx)\n", iss->exec.current_insn);
@@ -340,7 +360,13 @@ void Exec::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
     {
         iss_reg_t index;
         iss_insn_t *insn = iss->insn_cache.get_insn(pc, index);
-        if (insn == NULL) return;
+        if (insn == NULL)
+        {
+            fprintf(stderr, "[GETINSN_NULL_DBG %s] cycle=%lld pc=0x%lx\n",
+                iss->top.get_path().c_str(), (long long)iss->top.clock.get_cycles(),
+                (unsigned long)pc);
+            return;
+        }
 
         #if defined(CONFIG_GVSOC_ISS_EXEC_SCOREBOARD)
         // Since the instruction may be not decoded yet and will be once the handler is executed,
@@ -359,6 +385,9 @@ void Exec::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
             {
                 if (iss->regfile.scoreboard_reg_timestamp[insn->in_regs[i]] == -1)
                 {
+                    fprintf(stderr, "[STALL_IN_DBG %s] cycle=%lld pc=0x%lx reg=%d\n",
+                        iss->top.get_path().c_str(), (long long)iss->top.clock.get_cycles(),
+                        (unsigned long)pc, insn->in_regs[i]);
                     _this->trace.msg(vp::Trace::LEVEL_TRACE, "Stalling due to register dependency (reg: %d)\n", insn->in_regs[i]);
                     return;
                 }
@@ -371,6 +400,9 @@ void Exec::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
             {
                 if (iss->regfile.scoreboard_reg_timestamp[insn->out_regs[i]] == -1)
                 {
+                    fprintf(stderr, "[STALL_OUT_DBG %s] cycle=%lld pc=0x%lx reg=%d\n",
+                        iss->top.get_path().c_str(), (long long)iss->top.clock.get_cycles(),
+                        (unsigned long)pc, insn->out_regs[i]);
                     iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "Stalling due to output register dependency (reg: %d)\n", insn->out_regs[i]);
                     return;
                 }
@@ -379,7 +411,15 @@ void Exec::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
 
         #endif
 
+        fprintf(stderr, "[PREEXEC_DBG %s] cycle=%lld pc=0x%lx\n",
+            iss->top.get_path().c_str(), (long long)iss->top.clock.get_cycles(),
+            (unsigned long)pc);
+
         _this->current_insn = _this->insn_exec(insn, pc);
+
+        fprintf(stderr, "[POSTEXEC_DBG %s] cycle=%lld pc=0x%lx next_pc=0x%lx\n",
+            iss->top.get_path().c_str(), (long long)iss->top.clock.get_cycles(),
+            (unsigned long)pc, (unsigned long)_this->current_insn);
 
         _this->asm_trace_event.event_string(insn->desc->label, false);
 

@@ -20,6 +20,8 @@
 
 #include "cpu/iss/include/iss.hpp"
 #include "cpu/iss/include/cores/ara/ara.hpp"
+#include <cstdio>
+#include <cstring>
 
 AraVlsu::AraVlsu(Ara &ara, IssWrapper &top)
 : AraBlock(&ara, "vlsu"), ara(ara),
@@ -55,6 +57,7 @@ fsm_event(this, &AraVlsu::fsm_handler)
     for (int i=0; i<nb_ports; i++)
     {
         top.new_master_port("vlsu_" + std::to_string(i), &this->ports[i], this);
+        this->ports[i].set_resp_meth(&AraVlsu::data_response);
     }
 
     this->width = top.get_js_config()->get_child_int("vu/lsu_width");
@@ -71,6 +74,33 @@ fsm_event(this, &AraVlsu::fsm_handler)
 
 void AraVlsu::start()
 {
+}
+
+void AraVlsu::data_response(vp::Block *__this, vp::IoReq *req)
+{
+    AraVlsu *_this = (AraVlsu *)__this;
+    // Args were pushed in order: slot, port_id, vreg, size — pop in reverse.
+    // vreg/size are only meaningful for the async (IO_REQ_PENDING/DENIED) path: the
+    // synchronous path commits immediately at issue time and pops (and discards) these
+    // same four slots right there instead of leaving them for this callback.
+    int size = (int)(uintptr_t)req->arg_pop();
+    int vreg = (int)(uintptr_t)req->arg_pop();
+    int port_id = (int)(uintptr_t)req->arg_pop();
+    AraVlsuPendingInsn *slot = (AraVlsuPendingInsn *)req->arg_pop();
+    fprintf(stderr, "[VLSU_DBG %s] cycle=%lld RESPONSE port=%d addr=0x%lx nb_pending_bursts_after=%d\n",
+        _this->get_path().c_str(), (long long)_this->ara.iss.top.clock.get_cycles(), port_id,
+        (unsigned long)req->get_addr(), slot->nb_pending_bursts - 1);
+    _this->req_queues[port_id]->push_back(req);
+    slot->nb_pending_bursts--;
+    // Only now, once the data has actually landed, tell the scoreboard the elements are
+    // committed. Committing at issue time (as used to happen) is only safe when the
+    // interconnect completes synchronously; CachePool's NUMA/cache paths routinely return
+    // IO_REQ_PENDING/DENIED for remote-bank accesses, so a chained consumer instruction
+    // could previously start reading a vector register before this burst's data was
+    // actually written, silently consuming stale/zero elements.
+    _this->ara.insn_commit(vreg, size);
+    // Re-enable the FSM so it can issue the next burst or commit the instruction.
+    _this->fsm_event.enable();
 }
 
 void AraVlsu::reset(bool active)
@@ -210,6 +240,18 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     AraVlsu *_this = (AraVlsu *)__this;
 
+    {
+        static uint64_t dbg_counter2 = 0;
+        if ((dbg_counter2++ % 200000) == 0)
+        {
+            fprintf(stderr, "[VLSU_FSM_DBG %s] cycle=%lld nb_pending_insn=%d insn_first=%d "
+                "insn_first_waiting=%d insn_last=%d nb_waiting_insn=%d pending_size=0x%lx\n",
+                _this->get_path().c_str(), (long long)_this->ara.iss.top.clock.get_cycles(),
+                _this->nb_pending_insn.get(), _this->insn_first, _this->insn_first_waiting,
+                _this->insn_last, (int)_this->nb_waiting_insn, (unsigned long)_this->pending_size);
+        }
+    }
+
     // In case nothing is on-going, disable the FSM
     if (_this->nb_pending_insn.get() == 0)
     {
@@ -234,6 +276,19 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         AraVlsuPendingInsn &slot = _this->insns[_this->insn_first_waiting];
         PendingInsn *pending_insn = slot.insn;
 
+        static uint64_t dbg_counter = 0;
+        bool ready = pending_insn->timestamp <= _this->ara.iss.top.clock.get_cycles() &&
+            _this->pending_size == 0;
+        if (!ready && (dbg_counter++ % 500000) == 0)
+        {
+            fprintf(stderr, "[VLSU_WAIT_DBG %s] cycle=%lld pc=0x%lx nb_waiting_insn=%d ts=%lld "
+                "pending_size=0x%lx nb_pending_bursts=%d\n",
+                _this->get_path().c_str(), (long long)_this->ara.iss.top.clock.get_cycles(),
+                (unsigned long)pending_insn->pc, (int)_this->nb_waiting_insn,
+                (long long)pending_insn->timestamp, (unsigned long)_this->pending_size,
+                slot.nb_pending_bursts);
+        }
+
         if (pending_insn->timestamp <=_this->ara.iss.top.clock.get_cycles() &&
             _this->pending_size == 0)
         {
@@ -247,6 +302,17 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
     if (_this->pending_size)
     {
+        static uint64_t dbg_counter3 = 0;
+        bool dbg_this_core = strstr(_this->get_path().c_str(), "tile_0/pe0/ara") != nullptr;
+        if (dbg_this_core && (dbg_counter3++ % 2000) == 0)
+        {
+            fprintf(stderr, "[VLSU_BURST_DBG %s] cycle=%lld pending_size=0x%lx ports_empty=[%d,%d,%d,%d]\n",
+                _this->get_path().c_str(), (long long)_this->ara.iss.top.clock.get_cycles(),
+                (unsigned long)_this->pending_size,
+                (int)_this->req_queues[0]->empty(), (int)_this->req_queues[1]->empty(),
+                (int)_this->req_queues[2]->empty(), (int)_this->req_queues[3]->empty());
+        }
+
         // If a pending request is ready, try to send requests to available ports
         for (int i=0; i<_this->ports.size(); i++)
         {
@@ -296,21 +362,55 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
                 req->set_data(_this->pending_velem);
 
+                // Push slot pointer, port index, target vreg and burst size onto the
+                // request arg stack so that data_response can find them for async
+                // (IO_REQ_PENDING/DENIED) completions and commit the scoreboard only once
+                // the data has actually arrived (see data_response for why).
+                AraVlsuPendingInsn &slot = _this->insns[_this->insn_first_waiting];
+                req->arg_push((void *)&slot);
+                req->arg_push((void *)(uintptr_t)i);
+                req->arg_push((void *)(uintptr_t)_this->pending_vreg);
+                req->arg_push((void *)(uintptr_t)size);
+
                 vp::IoReqStatus err = _this->ports[i].req(req);
 
-                // For now only synchronous requests are supported, so for snitch cluster
-                // Asynchronous will be needed when having more complex interconnects behind.
-                // Then the requests should be handled properly to model the number of on-going
-                // transactions.
-                if (err != vp::IO_REQ_OK)
+                fprintf(stderr, "[VLSU_DBG %s] cycle=%lld ISSUE port=%d addr=0x%lx size=%lu is_write=%d err=%d\n",
+                    _this->get_path().c_str(), (long long)_this->ara.iss.top.clock.get_cycles(), i,
+                    (unsigned long)addr, (unsigned long)size, (int)_this->pending_is_write, (int)err);
+
+                if (err == vp::IO_REQ_OK)
                 {
-                    _this->trace.fatal("Unimplemented async response");
+                    // Sync: data is already valid, commit now. Pop our args (in reverse
+                    // push order) and return the request to the port queue.
+                    (void)req->arg_pop();  // size
+                    (void)req->arg_pop();  // vreg
+                    (void)req->arg_pop();  // port_id
+                    (void)req->arg_pop();  // slot
+                    _this->req_queues[i]->push_back(req);
+                    _this->ara.insn_commit(_this->pending_vreg, size);
+                }
+                else if (err == vp::IO_REQ_PENDING)
+                {
+                    // Async: data_response callback will push req back and decrement
+                    // nb_pending_bursts once the response arrives from the interconnect.
+                    slot.nb_pending_bursts++;
+                }
+                else if (err == vp::IO_REQ_DENIED)
+                {
+                    // The NI queued the req in its denied list; it will process it when
+                    // ready and call response via the Router's response callback.
+                    // Treat exactly like PENDING: count it as in-flight and advance
+                    // address so remaining ports issue at their correct addresses.
+                    // The synchronous Router does not propagate grants so we don't
+                    // rely on a grant callback; the response will close the burst.
+                    slot.nb_pending_bursts++;
+                }
+                else
+                {
+                    _this->trace.fatal("Unsupported IO response status: %d", (int)err);
                 }
 
-                // Put it back now until asynchronous responses are supported
-                _this->req_queues[i]->push_back(req);
-
-                // Prepare the next burst
+                // Prepare the next burst (for IO_REQ_OK, IO_REQ_PENDING, IO_REQ_DENIED).
                 if (_this->reg_indexed == -1)
                 {
                     _this->pending_addr += _this->strided ? _this->stride : size;
@@ -324,10 +424,6 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                     _this->nb_waiting_insn--;
                     _this->insn_first_waiting = (_this->insn_first_waiting + 1) % AraVlsu::queue_size;
                 }
-
-                // In case chaining is enabled, notify that some elements has been handled as it
-                // might start an instruction
-                _this->ara.insn_commit(_this->pending_vreg, req->get_size());
             }
         }
 

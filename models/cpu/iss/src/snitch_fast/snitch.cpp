@@ -21,6 +21,7 @@
 
 #include "cpu/iss/include/iss.hpp"
 #include <string.h>
+#include <cstdio>
 
 
 Iss::Iss(IssWrapper &top)
@@ -84,11 +85,18 @@ void Iss::barrier_sync(vp::Block *__this, bool value)
 {
     Iss *_this = (Iss *)__this;
 
-    // Clear the flag
+    bool in_wfi = _this->exec.wfi.get();
+
+    // Skip cores stalled for cache misses (not waiting for barrier and not in WFI).
+    // Without this guard, a cache-miss-stalled core gets a premature stalled_dec when
+    // another core's barrier_ack fires; the cache response then double-decrements → crash.
+    if (!_this->waiting_barrier && !in_wfi)
+        return;
+
     _this->waiting_barrier = false;
 
     // In case the barrier is reached as soon as we notify it, we are not yet stalled
-    // and should not to anything
+    // and should not do anything
 #ifdef CONFIG_GVSOC_ISS_EXEC_WAKEUP_COUNTER
     if (_this->exec.wfi.get())
 #else
@@ -98,6 +106,9 @@ void Iss::barrier_sync(vp::Block *__this, bool value)
 #ifdef CONFIG_GVSOC_ISS_EXEC_WAKEUP_COUNTER
         _this->exec.wfi.set(false);
         _this->exec.busy_enter();
+#else
+        if (in_wfi)
+            _this->exec.wfi.set(false);
 #endif
         if (_this->exec.stall_cycles > (_this->top.clock.get_cycles() - _this->exec.wfi_start))
         {
@@ -255,12 +266,26 @@ void IssWrapper::insn_commit(PendingInsn *pending_insn)
 
 iss_reg_t IssWrapper::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
+    static uint64_t dbg_counter = 0;
+    bool dbg_print = (dbg_counter++ % 500000) == 0;
+
     // We stall the instruction if ara queue is full
     if (iss->vu.queue_is_full())
     {
+        if (dbg_print)
+        {
+            fprintf(stderr, "[STUB_DBG] cycle=%lld pc=0x%lx BLOCKED: queue_is_full\n",
+                (long long)iss->top.clock.get_cycles(), (unsigned long)pc);
+        }
         iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "%s queue is full (pc: 0x%lx)\n",
             iss->vu.queue_is_full() ? "Ara" : "Core", pc);
         return pc;
+    }
+
+    if (dbg_print)
+    {
+        fprintf(stderr, "[STUB_DBG] cycle=%lld pc=0x%lx queue not full, nb_in_reg=%d\n",
+            (long long)iss->top.clock.get_cycles(), (unsigned long)pc, insn->nb_in_reg);
     }
 
     // Account vector loads and stores to synchronize with snitch
@@ -284,6 +309,11 @@ iss_reg_t IssWrapper::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_r
             {
                 if (iss->regfile.scoreboard_reg_timestamp[insn->in_regs[i]] == -1)
                 {
+                    if (dbg_print)
+                    {
+                        fprintf(stderr, "[STUB_DBG] cycle=%lld pc=0x%lx BLOCKED: int reg dependency reg=%d\n",
+                            (long long)iss->top.clock.get_cycles(), (unsigned long)pc, insn->in_regs[i]);
+                    }
                     iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "Blocked due to int reg dependency (pc: 0x%lx, reg: %d)\n",
                         pc, insn->in_regs[i]);
                     return pc;
@@ -294,6 +324,12 @@ iss_reg_t IssWrapper::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_r
                 int64_t cycles = iss->top.clock.get_cycles();
                 if (iss->sequencer.scoreboard_freg_timestamp[insn->in_regs[i]] > cycles)
                 {
+                    if (dbg_print)
+                    {
+                        fprintf(stderr, "[STUB_DBG] cycle=%lld pc=0x%lx BLOCKED: float reg dependency reg=%d ts=%lld\n",
+                            (long long)iss->top.clock.get_cycles(), (unsigned long)pc, insn->in_regs[i],
+                            (long long)iss->sequencer.scoreboard_freg_timestamp[insn->in_regs[i]]);
+                    }
                     iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "Blocked due to float reg dependency (pc: 0x%lx, reg: %d)\n",
                         pc, insn->in_regs[i]);
                     return pc;

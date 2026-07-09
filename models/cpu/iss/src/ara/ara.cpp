@@ -19,6 +19,7 @@
  */
 
  #include <cstdint>
+#include <cstdio>
 #include "cpu/iss/include/iss.hpp"
 #include "cpu/iss/include/cores/ara/ara.hpp"
 
@@ -254,6 +255,16 @@ void Ara::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     if (_this->nb_pending_insn.get() > 0)
     {
         PendingInsn *pending_insn = &_this->pending_insns[_this->insn_first];
+
+        static uint64_t dbg_counter = 0;
+        if (!pending_insn->done && (dbg_counter++ % 500000) == 0)
+        {
+            fprintf(stderr, "[ARA_DBG %s] cycle=%lld HEAD_NOT_DONE pc=0x%lx nb_pending_insn=%d queue_size=%d insn_first=%d chained=%d\n",
+                _this->get_path().c_str(), (long long)_this->iss.top.clock.get_cycles(),
+                (unsigned long)pending_insn->pc, _this->nb_pending_insn.get(), _this->queue_size,
+                _this->insn_first, (int)pending_insn->chained);
+        }
+
         if (pending_insn->done)
         {
             _this->nb_pending_insn.dec(1);
