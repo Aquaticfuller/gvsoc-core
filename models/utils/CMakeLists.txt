@@ -73,6 +73,20 @@ vp_model(NAME utils.io_v2_beat_width_adapter
     INCLUDES "${CMAKE_BINARY_DIR}/gvsoc/engine"
 )
 
+# ---------------------------------------------------------------------------
+# IoV2SingleReqToBeatAdapter — per-combination replacement of the collapse
+# adapter for an IoV2SingleReq master bound to an IoV2Beat slave. Translates
+# the allocation conventions (frees the downstream read beats, hands the
+# master back its own request) with no single-outstanding serialisation:
+# any number of accesses can be in flight. Reads its parameters from the
+# generated config tree (IoV2SingleReqToBeatAdapterConfig), hence the engine
+# binary-dir include.
+# ---------------------------------------------------------------------------
+vp_model(NAME utils.io_v2_single_req_to_beat_adapter
+    SOURCES "io_v2_single_req_to_beat_adapter.cpp"
+    INCLUDES "${CMAKE_BINARY_DIR}/gvsoc/engine"
+)
+
 add_subdirectory(loader)
 
 # ---------------------------------------------------------------------------

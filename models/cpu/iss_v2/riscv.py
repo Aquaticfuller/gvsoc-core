@@ -673,9 +673,10 @@ class RiscvCommon(st.Component):
         """
         # SingleReq: the LSU owns its (pooled) request and recovers it on the
         # response by identity, so the data port is a single-req initiator. The
-        # class signature also makes the framework insert a collapse adapter when
-        # this binds to a beat plane (e.g. a KIND_BEAT router), so the LSU's own
-        # request never travels downstream — only a reallocated one does.
+        # class signature also makes the framework insert the single-req-to-beat
+        # adapter when this binds to a beat plane (e.g. a KIND_BEAT router), so
+        # the LSU's own request never travels downstream — only the adapter's
+        # data-less one does — while outstanding accesses still pipeline.
         self.itf_bind('data', itf,
             signature=IoV2SingleReq() if self._uses_io_v2 else 'io')
 
