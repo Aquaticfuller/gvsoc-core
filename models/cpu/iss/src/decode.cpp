@@ -371,21 +371,13 @@ void Decode::decode_pc(iss_insn_t *insn, iss_reg_t pc)
 
     this->trace.msg("Got opcode (opcode: 0x%lx)\n", opcode);
 
-    fprintf(stderr, "[DECODE_DBG] pc=0x%lx raw_opcode=0x%lx\n",
-        (unsigned long)pc, (unsigned long)opcode);
-
     if (this->decode_opcode(insn, pc, opcode))
     {
         this->trace.msg("Unknown instruction\n");
-        fprintf(stderr, "[DECODE_DBG] pc=0x%lx raw_opcode=0x%lx -> ILLEGAL/UNKNOWN\n",
-            (unsigned long)pc, (unsigned long)opcode);
         insn->handler = iss_exec_insn_illegal;
         insn->fast_handler = iss_exec_insn_illegal;
         return;
     }
-
-    fprintf(stderr, "[DECODE_DBG] pc=0x%lx raw_opcode=0x%lx -> OK size=%d\n",
-        (unsigned long)pc, (unsigned long)opcode, insn->size);
 
     insn->opcode = opcode;
 }

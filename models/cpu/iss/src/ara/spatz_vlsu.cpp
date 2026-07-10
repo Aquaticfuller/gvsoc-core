@@ -87,9 +87,6 @@ void AraVlsu::data_response(vp::Block *__this, vp::IoReq *req)
     int vreg = (int)(uintptr_t)req->arg_pop();
     int port_id = (int)(uintptr_t)req->arg_pop();
     AraVlsuPendingInsn *slot = (AraVlsuPendingInsn *)req->arg_pop();
-    fprintf(stderr, "[VLSU_DBG %s] cycle=%lld RESPONSE port=%d addr=0x%lx nb_pending_bursts_after=%d\n",
-        _this->get_path().c_str(), (long long)_this->ara.iss.top.clock.get_cycles(), port_id,
-        (unsigned long)req->get_addr(), slot->nb_pending_bursts - 1);
     _this->req_queues[port_id]->push_back(req);
     slot->nb_pending_bursts--;
     // Only now, once the data has actually landed, tell the scoreboard the elements are
@@ -240,18 +237,6 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     AraVlsu *_this = (AraVlsu *)__this;
 
-    {
-        static uint64_t dbg_counter2 = 0;
-        if ((dbg_counter2++ % 200000) == 0)
-        {
-            fprintf(stderr, "[VLSU_FSM_DBG %s] cycle=%lld nb_pending_insn=%d insn_first=%d "
-                "insn_first_waiting=%d insn_last=%d nb_waiting_insn=%d pending_size=0x%lx\n",
-                _this->get_path().c_str(), (long long)_this->ara.iss.top.clock.get_cycles(),
-                _this->nb_pending_insn.get(), _this->insn_first, _this->insn_first_waiting,
-                _this->insn_last, (int)_this->nb_waiting_insn, (unsigned long)_this->pending_size);
-        }
-    }
-
     // In case nothing is on-going, disable the FSM
     if (_this->nb_pending_insn.get() == 0)
     {
@@ -276,19 +261,6 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         AraVlsuPendingInsn &slot = _this->insns[_this->insn_first_waiting];
         PendingInsn *pending_insn = slot.insn;
 
-        static uint64_t dbg_counter = 0;
-        bool ready = pending_insn->timestamp <= _this->ara.iss.top.clock.get_cycles() &&
-            _this->pending_size == 0;
-        if (!ready && (dbg_counter++ % 500000) == 0)
-        {
-            fprintf(stderr, "[VLSU_WAIT_DBG %s] cycle=%lld pc=0x%lx nb_waiting_insn=%d ts=%lld "
-                "pending_size=0x%lx nb_pending_bursts=%d\n",
-                _this->get_path().c_str(), (long long)_this->ara.iss.top.clock.get_cycles(),
-                (unsigned long)pending_insn->pc, (int)_this->nb_waiting_insn,
-                (long long)pending_insn->timestamp, (unsigned long)_this->pending_size,
-                slot.nb_pending_bursts);
-        }
-
         if (pending_insn->timestamp <=_this->ara.iss.top.clock.get_cycles() &&
             _this->pending_size == 0)
         {
@@ -302,17 +274,6 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
     if (_this->pending_size)
     {
-        static uint64_t dbg_counter3 = 0;
-        bool dbg_this_core = strstr(_this->get_path().c_str(), "tile_0/pe0/ara") != nullptr;
-        if (dbg_this_core && (dbg_counter3++ % 2000) == 0)
-        {
-            fprintf(stderr, "[VLSU_BURST_DBG %s] cycle=%lld pending_size=0x%lx ports_empty=[%d,%d,%d,%d]\n",
-                _this->get_path().c_str(), (long long)_this->ara.iss.top.clock.get_cycles(),
-                (unsigned long)_this->pending_size,
-                (int)_this->req_queues[0]->empty(), (int)_this->req_queues[1]->empty(),
-                (int)_this->req_queues[2]->empty(), (int)_this->req_queues[3]->empty());
-        }
-
         // If a pending request is ready, try to send requests to available ports
         for (int i=0; i<_this->ports.size(); i++)
         {
@@ -373,10 +334,6 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 req->arg_push((void *)(uintptr_t)size);
 
                 vp::IoReqStatus err = _this->ports[i].req(req);
-
-                fprintf(stderr, "[VLSU_DBG %s] cycle=%lld ISSUE port=%d addr=0x%lx size=%lu is_write=%d err=%d\n",
-                    _this->get_path().c_str(), (long long)_this->ara.iss.top.clock.get_cycles(), i,
-                    (unsigned long)addr, (unsigned long)size, (int)_this->pending_is_write, (int)err);
 
                 if (err == vp::IO_REQ_OK)
                 {

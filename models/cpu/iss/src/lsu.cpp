@@ -382,12 +382,6 @@ void Lsu::start()
 
 void Lsu::store_resume(Lsu *lsu, vp::IoReq *req)
 {
-    if (req->get_addr() >= 0x800037c8 && req->get_addr() < 0x800037c8 + 0x400)
-    {
-        fprintf(stderr, "[LSU_DBG %s] cycle=%lld STORE_RESUME addr=0x%lx\n",
-            lsu->iss.top.get_path().c_str(), (long long)lsu->iss.top.clock.get_cycles(),
-            (unsigned long)req->get_addr());
-    }
     // For now we don't have to do anything as the register was written directly
     // by the request but we cold support sign-extended loads here;
 #ifdef CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING

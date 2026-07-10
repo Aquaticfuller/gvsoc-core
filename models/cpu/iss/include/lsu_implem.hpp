@@ -528,12 +528,6 @@ inline bool Lsu::store_float(iss_insn_t *insn, iss_addr_t addr, int size, int re
 #else
     phys_addr = addr;
 #endif
-    if (addr >= 0x800037c8 && addr < 0x800037c8 + 0x400)
-    {
-        fprintf(stderr, "[LSU_DBG %s] cycle=%lld STORE_FLOAT_ENTRY addr=0x%lx size=%d val=%f\n",
-            this->iss.top.get_path().c_str(), (long long)this->iss.top.clock.get_cycles(),
-            (unsigned long)addr, size, (double)this->iss.regfile.get_freg(reg));
-    }
 
 #ifdef CONFIG_GVSOC_ISS_MEMORY
 
@@ -556,12 +550,6 @@ inline bool Lsu::store_float(iss_insn_t *insn, iss_addr_t addr, int size, int re
     int req_id;
     if ((err = this->data_req(phys_addr, (uint8_t *)this->iss.regfile.freg_store_ref(reg), NULL, size, true, latency, req_id)) == 0)
     {
-        if (addr >= 0x800037c8 && addr < 0x800037c8 + 0x400)
-        {
-            fprintf(stderr, "[LSU_DBG %s] cycle=%lld STORE_FLOAT_SYNC_OK addr=0x%lx\n",
-                this->iss.top.get_path().c_str(), (long long)this->iss.top.clock.get_cycles(),
-                (unsigned long)addr);
-        }
         // For now we don't have to do anything as the register was written directly
         // by the request but we cold support sign-extended loads here;
 
@@ -575,12 +563,6 @@ inline bool Lsu::store_float(iss_insn_t *insn, iss_addr_t addr, int size, int re
     }
     else
     {
-        if (addr >= 0x800037c8 && addr < 0x800037c8 + 0x400)
-        {
-            fprintf(stderr, "[LSU_DBG %s] cycle=%lld STORE_FLOAT_ASYNC addr=0x%lx err=%d req_id=%d\n",
-                this->iss.top.get_path().c_str(), (long long)this->iss.top.clock.get_cycles(),
-                (unsigned long)addr, err, req_id);
-        }
         if (err != vp::IO_REQ_INVALID)
         {
 #ifdef CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING

@@ -272,13 +272,7 @@ cache_line_t *Cache::refill(int line_index, unsigned int line_offset, unsigned i
 
     this->refill_event_clear_event.cancel();
 
-    fprintf(stderr, "[CACHE_REFILL_DBG %s] full_addr=0x%x is_bound=%d\n",
-        this->get_path().c_str(), full_addr, (int)this->refill_itf.is_bound());
-
     vp::IoReqStatus err = this->refill_itf.req(refill_req);
-
-    fprintf(stderr, "[CACHE_REFILL_DBG %s] full_addr=0x%x err=%d data0=0x%02x\n",
-        this->get_path().c_str(), full_addr, (int)err, refill_data[0]);
 
     if (err != vp::IO_REQ_OK)
     {

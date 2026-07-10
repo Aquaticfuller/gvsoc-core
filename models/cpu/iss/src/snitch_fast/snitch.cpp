@@ -266,26 +266,12 @@ void IssWrapper::insn_commit(PendingInsn *pending_insn)
 
 iss_reg_t IssWrapper::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
-    static uint64_t dbg_counter = 0;
-    bool dbg_print = (dbg_counter++ % 500000) == 0;
-
     // We stall the instruction if ara queue is full
     if (iss->vu.queue_is_full())
     {
-        if (dbg_print)
-        {
-            fprintf(stderr, "[STUB_DBG] cycle=%lld pc=0x%lx BLOCKED: queue_is_full\n",
-                (long long)iss->top.clock.get_cycles(), (unsigned long)pc);
-        }
         iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "%s queue is full (pc: 0x%lx)\n",
             iss->vu.queue_is_full() ? "Ara" : "Core", pc);
         return pc;
-    }
-
-    if (dbg_print)
-    {
-        fprintf(stderr, "[STUB_DBG] cycle=%lld pc=0x%lx queue not full, nb_in_reg=%d\n",
-            (long long)iss->top.clock.get_cycles(), (unsigned long)pc, insn->nb_in_reg);
     }
 
     // Account vector loads and stores to synchronize with snitch
@@ -309,11 +295,6 @@ iss_reg_t IssWrapper::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_r
             {
                 if (iss->regfile.scoreboard_reg_timestamp[insn->in_regs[i]] == -1)
                 {
-                    if (dbg_print)
-                    {
-                        fprintf(stderr, "[STUB_DBG] cycle=%lld pc=0x%lx BLOCKED: int reg dependency reg=%d\n",
-                            (long long)iss->top.clock.get_cycles(), (unsigned long)pc, insn->in_regs[i]);
-                    }
                     iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "Blocked due to int reg dependency (pc: 0x%lx, reg: %d)\n",
                         pc, insn->in_regs[i]);
                     return pc;
@@ -324,12 +305,6 @@ iss_reg_t IssWrapper::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_r
                 int64_t cycles = iss->top.clock.get_cycles();
                 if (iss->sequencer.scoreboard_freg_timestamp[insn->in_regs[i]] > cycles)
                 {
-                    if (dbg_print)
-                    {
-                        fprintf(stderr, "[STUB_DBG] cycle=%lld pc=0x%lx BLOCKED: float reg dependency reg=%d ts=%lld\n",
-                            (long long)iss->top.clock.get_cycles(), (unsigned long)pc, insn->in_regs[i],
-                            (long long)iss->sequencer.scoreboard_freg_timestamp[insn->in_regs[i]]);
-                    }
                     iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "Blocked due to float reg dependency (pc: 0x%lx, reg: %d)\n",
                         pc, insn->in_regs[i]);
                     return pc;

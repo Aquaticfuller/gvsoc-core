@@ -303,13 +303,6 @@ vp::IoReqStatus Memory::req(vp::Block *__this, vp::IoReq *req)
     uint8_t *data = req->get_data();
     uint64_t size = req->get_size();
 
-    if (offset < 0x2000)
-    {
-        fprintf(stderr, "[MEM_DBG %s] offset=0x%lx size=0x%lx is_write=%d\n",
-            _this->get_path().c_str(), (unsigned long)offset, (unsigned long)size,
-            (int)req->get_is_write());
-    }
-
     _this->trace.msg("Memory access (offset: 0x%x, size: 0x%x, is_write: %d, op: %d)\n", offset, size, req->get_is_write(), req->get_opcode());
 
     // Count stats
