@@ -80,6 +80,7 @@ private:
     void issue_write_through(vp::IoReq *user_req);
     void functional_write_mem(vp::IoReq *user_req);
     vp::IoReqStatus issue_refill(uint32_t line_addr, uint32_t set, int way);
+    vp::IoReqStatus send_refill(uint32_t line_addr);
     void issue_eviction(uint32_t line_addr);
     void fsm_drain_mshr(uint32_t set);
 
@@ -229,6 +230,15 @@ private:
     // handler must re-decode the cache set/tag from THIS original address, not req->get_addr(),
     // or it fails to match the pending line and the miss never completes. (-1 = none.)
     uint64_t pending_refill_addr_ = 0;
+    // refill_req_ (and refill_data_buf_) are single shared scratch objects — only one refill
+    // can be in flight through them at a time. refill_busy_ enforces that: a miss that occurs
+    // while a refill is already outstanding gets its line_addr queued here instead of
+    // clobbering the in-flight one's tracking state (see issue_refill/send_refill). Without
+    // this, two overlapping misses (routine under NUMA/async refill latency) silently corrupt
+    // each other's refill_resp_handler set/tag re-derivation, permanently stranding one line
+    // in READ_PEND/WRITE_PEND with its MSHR never drained.
+    bool                  refill_busy_ = false;
+    std::deque<uint32_t>  refill_wait_queue_;
     // Scratch buffers backing each req's data pointer. The downstream memory model
     // performs a memcpy against the request's data pointer, so we must provide a real
     // buffer even though the perf model doesn't care about the byte values.
@@ -457,25 +467,6 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
     const bool is_scalar = (scalar_bypass_port_ >= 0) &&
                            (req->get_initiator() == scalar_bypass_port_);
 
-    // Unconditional (no address filter): every WRITE seen by ANY controller, to correlate
-    // against the SCALAR_PC_DBG cycles where the fdotp reduction's `fsw` instructions fire.
-    if (is_write)
-    {
-        fprintf(stderr, "[RESULT_SCAN_DBG %s] cycle=%lld addr=0x%lx is_write=%d\n",
-            this->get_path().c_str(), (long long)now, (unsigned long)addr, (int)is_write);
-    }
-
-    // [RESULT_DBG] fdotp §13.1 reduction investigation: trace every access to the fdotp
-    // `result[]` array (0x800037c8, 256 floats). Writes print their value immediately
-    // (already in req->get_data() at entry); reads are printed after the value is resolved,
-    // at each exchange_line_data(..., line_to_req=true) call site below.
-    if (addr >= 0x80003ac8 && addr < 0x80003ac8 + 0x900 && is_write && req->get_data() != nullptr)
-    {
-        fprintf(stderr, "[RESULT_DBG %s] cycle=%lld addr=0x%lx WRITE val=%f initiator=%d\n",
-            this->get_path().c_str(), (long long)now, (unsigned long)addr,
-            (double)*(float *)req->get_data(), req->get_initiator());
-    }
-
     // Write-commit backpressure: the RTL write path serializes through the write-info
     // FIFO + per-way commit, so writes accept at most once per write_commit_cycles_.
     if (is_write && write_commit_cycles_ > 1) {
@@ -572,12 +563,6 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
             if (write_through_mode_) issue_write_through(req);
         } else {
             if (carry_data_) exchange_line_data(req, set, way, /*line_to_req=*/true);  // serve read
-            if (addr >= 0x80003ac8 && addr < 0x80003ac8 + 0x900 && req->get_data() != nullptr)
-            {
-                fprintf(stderr, "[RESULT_DBG %s] cycle=%lld addr=0x%lx READ_HIT val=%f initiator=%d\n",
-                    this->get_path().c_str(), (long long)now, (unsigned long)addr,
-                    (double)*(float *)req->get_data(), req->get_initiator());
-            }
             cnt_rd_hit_++;
             // A read hit keeps the hit pipeline's decoupling registers occupied; the next
             // read hit within the fill window inherits the streaming latency.
@@ -677,12 +662,6 @@ vp::IoReqStatus InsituCacheController::handle_request(vp::IoReq *req)
                 vline.dirty = true;
             } else {
                 exchange_line_data(req, set, victim_way, /*line_to_req=*/true);
-                if (addr >= 0x80003ac8 && addr < 0x80003ac8 + 0x900 && req->get_data() != nullptr)
-                {
-                    fprintf(stderr, "[RESULT_DBG %s] cycle=%lld addr=0x%lx READ_MISS val=%f initiator=%d\n",
-                        this->get_path().c_str(), (long long)now, (unsigned long)addr,
-                        (double)*(float *)req->get_data(), req->get_initiator());
-                }
             }
             req->inc_latency(refill_lat);
             return vp::IO_REQ_OK;
@@ -788,6 +767,23 @@ void InsituCacheController::issue_write_through(vp::IoReq *user_req)
 vp::IoReqStatus InsituCacheController::issue_refill(uint32_t line_addr, uint32_t set, int way)
 {
     (void)set; (void)way;
+    if (refill_busy_) {
+        // The single shared refill_req_/pending_refill_addr_ tracking state is already in use
+        // by another outstanding refill. Queue this line's fetch instead of clobbering it —
+        // it will be sent once the in-flight refill completes (see refill_resp_handler). The
+        // line was already marked READ_PEND/WRITE_PEND by the caller before this call, so
+        // subsequent accesses to it correctly merge onto the MSHR in the meantime. Callers
+        // already treat any non-OK status as "park the request," so PENDING here is safe for
+        // both the inline_sync_miss_ and open-loop call sites.
+        refill_wait_queue_.push_back(line_addr);
+        return vp::IO_REQ_PENDING;
+    }
+    return this->send_refill(line_addr);
+}
+
+vp::IoReqStatus InsituCacheController::send_refill(uint32_t line_addr)
+{
+    refill_busy_ = true;
     pending_refill_addr_ = line_addr;   // remember pre-routing address for the resp handler
     refill_req_.init();
     refill_req_.set_addr(line_addr);
@@ -802,6 +798,13 @@ vp::IoReqStatus InsituCacheController::issue_refill(uint32_t line_addr, uint32_t
     cnt_refills_issued_++;
 
     vp::IoReqStatus st = this->refill_itf_.req(&refill_req_);
+    if (st != vp::IO_REQ_PENDING) {
+        // Either it completed synchronously (OK) or was rejected outright — either way the
+        // shared slot is free again immediately (refill_resp_handler won't be called for a
+        // rejection, and the OK case's caller inlines completion itself without going through
+        // refill_resp_handler either).
+        refill_busy_ = false;
+    }
     if (st != vp::IO_REQ_OK && st != vp::IO_REQ_PENDING) {
         this->trace_.msg(vp::Trace::LEVEL_WARNING,
             "refill rejected (st=%d) addr=0x%x\n", (int)st, line_addr);
@@ -904,6 +907,21 @@ void InsituCacheController::refill_resp_handler(vp::Block *__this, vp::IoReq *re
         set, pending_way, tag, (long)line.ready_cycle);
 
     _this->fsm_drain_mshr(set);
+
+    // The shared refill slot is now free. If another miss queued up while this refill was
+    // outstanding (see issue_refill), send it now.
+    _this->refill_busy_ = false;
+    if (!_this->refill_wait_queue_.empty()) {
+        uint32_t next_line_addr = _this->refill_wait_queue_.front();
+        _this->refill_wait_queue_.pop_front();
+        const vp::IoReqStatus rst = _this->send_refill(next_line_addr);
+        if (rst == vp::IO_REQ_OK) {
+            // Completed synchronously — run it through the same completion path (mark line
+            // VALID, install data, drain its MSHR) as any other refill.
+            InsituCacheController::refill_resp_handler(_this, &_this->refill_req_);
+        }
+        // IO_REQ_PENDING: will complete later via the normal async callback.
+    }
 }
 
 // ---------- MSHR drain ----------
@@ -955,12 +973,6 @@ void InsituCacheController::fsm_drain_mshr(uint32_t set)
             if (write_through_mode_) issue_write_through(req);
         } else if (carry_data_ && line != nullptr) {
             exchange_line_data(req, s, way, /*line_to_req=*/true);   // serve deferred read
-            if (addr >= 0x80003ac8 && addr < 0x80003ac8 + 0x900 && req->get_data() != nullptr)
-            {
-                fprintf(stderr, "[RESULT_DBG %s] cycle=%lld addr=0x%lx READ_DEFERRED val=%f initiator=%d\n",
-                    this->get_path().c_str(), (long long)this->clock.get_cycles(),
-                    (unsigned long)addr, (double)*(float *)req->get_data(), req->get_initiator());
-            }
         }
 
         req->get_resp_port()->resp(req);
