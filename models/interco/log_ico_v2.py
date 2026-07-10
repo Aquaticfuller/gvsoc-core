@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from config_tree import Config, cfg_field
 from gvsoc.systree import Component, SlaveItf
-from gvsoc.signature import IoV2Sync
+from gvsoc.signature import IoV2Sync, IoV2SingleReq
 
 
 class LogIcoConfig(Config):
@@ -305,15 +305,14 @@ class LogIco(Component):
         """Returns the slave port ``input_<id>`` for master ``id``.
 
         Each master gets its own muxed input port. The input side speaks
-        the general (async-capable) ``io_v2`` contract: every fresh
+        the single-req contract (:class:`IoV2SingleReq`): every fresh
         request is ``DENIED`` and the master is later ``retry()``-ed
         by the round-robin arbiter; the re-issued request then
-        completes inline as ``DONE``. A master bound here must
-        therefore implement the standard async DENY/retry handshake
-        (i.e. be ``IoV2BigPacket`` / generic ``io_v2``, not
-        ``IoV2Sync``).
+        completes inline as ``DONE`` — always a single-beat response,
+        never a beat stream. A master bound here must implement the
+        standard DENY/retry handshake (so not ``IoV2Sync``).
         """
-        return SlaveItf(self, f'input_{id}', signature='io_v2')
+        return SlaveItf(self, f'input_{id}', signature=IoV2SingleReq())
 
     def o_OUTPUT(self, id: int, itf: SlaveItf):
         """Binds downstream bank ``output_<id>`` to ``itf``.

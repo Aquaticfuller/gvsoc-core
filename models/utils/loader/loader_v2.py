@@ -13,6 +13,7 @@ the boot-time binary loader (``loader_v2.cpp``).
 from __future__ import annotations
 
 import gvsoc.systree
+import gvsoc.signature
 
 
 class ElfLoader(gvsoc.systree.Component):
@@ -280,8 +281,12 @@ class ElfLoader(gvsoc.systree.Component):
         that populate the target memories. It should be connected
         to an interconnect that can reach every memory containing
         at least one section of the binary.
+
+        Single-req initiator: exactly one chunk is in flight at a time and
+        each chunk is answered by a single-beat response (inline DONE or
+        GRANTED + one resp()).
         """
-        self.itf_bind('out', itf, signature='io_v2')
+        self.itf_bind('out', itf, signature=gvsoc.signature.IoV2SingleReq())
 
     def o_START(self, itf: gvsoc.systree.SlaveItf):
         """Binds the fetch-enable wire master port.

@@ -48,12 +48,12 @@ class Dramsys(st.Component):
     def i_INPUT(self) -> st.SlaveItf:
         if self.version == 1:
             return st.SlaveItf(self, 'input', signature='io')
-        # v2: beat-protocol slave. IoV2BigPacket is the most permissive
-        # signature — a beat-aware master (declaring IoV2Beat(beat_width)
-        # on its side) gets the framework-inserted IoV2BeatAdapter for
-        # free; a vanilla v2 master tolerates the beat-stream response
-        # form per the protocol contract.
-        return st.SlaveItf(self, 'input', signature=gvsoc.signature.IoV2BigPacket())
+        # v2: beat-protocol slave, but its beat width is only known at
+        # runtime (= the DRAMSys memspec access_size), so it cannot declare
+        # IoV2Beat(width) statically. Declared IoV2Any so any v2 master binds
+        # directly; masters are expected to be beat-aware (beat-form writes
+        # are mandatory — a big-packet write wider than the beat is a fatal).
+        return st.SlaveItf(self, 'input', signature=gvsoc.signature.IoV2Any())
 
     # PIM ports are v1-only. The v2 wrapper does not implement them.
     def o_SENDMEMSPEC(self, itf: st.SlaveItf):

@@ -17,7 +17,7 @@ from typing_extensions import override
 
 from config_tree import Config, cfg_field
 from gvsoc.systree import Component, SlaveItf
-from gvsoc.signature import IoV2BigPacket
+from gvsoc.signature import IoV2SingleReq
 from gvsoc.gui import Signal
 
 
@@ -328,9 +328,11 @@ class Cache(Component):
         """Returns the input slave port for memory access requests.
 
         Incoming io_v2 requests land here. Hits are served inline; misses
-        trigger a refill via the ``REFILL`` master port.
+        trigger a refill via the ``REFILL`` master port. Each request gets a
+        single-beat response (inline DONE on a hit, GRANTED + one resp() on
+        a miss), so the port speaks the single-req contract.
         """
-        return SlaveItf(self, 'input', signature='io_v2')
+        return SlaveItf(self, 'input', signature=IoV2SingleReq())
 
     def i_FLUSH(self) -> SlaveItf:
         """Returns the flush slave port.
@@ -378,13 +380,14 @@ class Cache(Component):
         The address sent downstream is transformed according to the
         configured ``refill_shift`` and ``refill_offset``.
 
-        The refill master routes responses by request identity, so it is
-        declared :class:`IoV2BigPacket`: against a beat slave (e.g. a
+        The refill master routes responses by request identity and keeps a
+        single refill in flight, expecting a single-beat response — so it is
+        declared :class:`IoV2SingleReq`: against a beat slave (e.g. a
         ``router_v2`` beat crossbar) the framework auto-inserts the
-        collapse adapter instead of letting the per-beat response stream
-        reach the cache directly.
+        single-req-to-beat adapter instead of letting the per-beat response
+        stream reach the cache directly.
         """
-        self.itf_bind('refill', itf, signature=IoV2BigPacket())
+        self.itf_bind('refill', itf, signature=IoV2SingleReq())
 
     @override
     def gen_gui(self, parent_signal: Signal):

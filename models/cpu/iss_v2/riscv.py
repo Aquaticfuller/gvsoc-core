@@ -208,7 +208,7 @@ class LsuV2(IssModule):
         iss.add_sources(['cpu/iss_v2/src/lsu_v2.cpp'])
         iss.isa.add_implem_include('<cpu/iss_v2/include/lsu_v2_implem.hpp>')
         # Tell the iss that fetch/data master ports speak the io_v2 protocol
-        # so o_FETCH / o_DATA / o_DATA_DEBUG bind with signature='io_v2'.
+        # so o_FETCH / o_DATA / o_DATA_DEBUG bind with the IoV2SingleReq signature.
         iss._uses_io_v2 = True
 
 class Exception(IssModule):
@@ -359,8 +359,8 @@ class RiscvCommon(st.Component):
         super().__init__(parent, name, config=config)
 
         # Default to v1 IO protocol on the master ports. ``LsuV2.gen()`` flips
-        # this to True so o_FETCH / o_DATA / o_DATA_DEBUG bind with
-        # signature='io_v2'.
+        # this to True so o_FETCH / o_DATA / o_DATA_DEBUG bind with the
+        # IoV2SingleReq signature.
         self._uses_io_v2: bool = False
 
         self.isa: Isa = isa
@@ -656,8 +656,11 @@ class RiscvCommon(st.Component):
         slave: gvsoc.systree.SlaveItf
             Slave interface
         """
+        # Like the data port below, the fetch unit is a single-req initiator:
+        # each line fetch is one request answered by a single-beat response
+        # routed back by identity.
         self.itf_bind('fetch', itf,
-            signature='io_v2' if self._uses_io_v2 else 'io')
+            signature=IoV2SingleReq() if self._uses_io_v2 else 'io')
 
     def o_DATA(self, itf: gvsoc.systree.SlaveItf):
         """Binds the data port.

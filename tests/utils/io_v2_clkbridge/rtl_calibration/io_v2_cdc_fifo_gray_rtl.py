@@ -59,7 +59,7 @@ class IoV2CdcFifoGrayRtl(Component):
         self.add_property('plugin_path', plugin_path or _default_plugin_path())
 
     def i_INPUT(self) -> SlaveItf:
-        return SlaveItf(self, 'input', signature=IoV2BigPacket())
+        return SlaveItf(self, 'input', signature=IoV2BigPacket(allow=True))
 
     def o_OUTPUT(self, slave: SlaveItf):
-        self.itf_bind('output', slave, signature=IoV2BigPacket())
+        self.itf_bind('output', slave, signature=IoV2BigPacket(allow=True))

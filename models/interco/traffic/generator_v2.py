@@ -15,6 +15,7 @@
 #
 
 import gvsoc.systree
+import gvsoc.signature
 
 
 class GeneratorV2(gvsoc.systree.Component):
@@ -36,4 +37,8 @@ class GeneratorV2(gvsoc.systree.Component):
         return gvsoc.systree.SlaveItf(self, 'control', signature='wire<TrafficGeneratorConfig>')
 
     def o_OUTPUT(self, itf: gvsoc.systree.SlaveItf):
-        self.itf_bind('output', itf, signature='io_v2')
+        # Beat-tolerant terminal master: the generator natively consumes raw
+        # per-beat response streams (it measures the path's bandwidth, so the
+        # stream must reach it unmodified) — direct bind against beat slaves,
+        # no collapse adapter.
+        self.itf_bind('output', itf, signature=gvsoc.signature.IoV2Any(beat_tolerant=True))

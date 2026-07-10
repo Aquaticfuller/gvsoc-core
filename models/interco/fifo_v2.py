@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from config_tree import Config, cfg_field
 from gvsoc.systree import Component, SlaveItf
+from gvsoc.signature import IoV2Any
 
 
 class FifoConfig(Config):
@@ -76,9 +77,9 @@ class Fifo(Component):
     def i_INPUT(self) -> SlaveItf:
         """Master-facing slave port. Returns ``IO_REQ_GRANTED`` while the
         FIFO has room, ``IO_REQ_DENIED`` when full."""
-        return SlaveItf(self, 'input', signature='io_v2')
+        return SlaveItf(self, 'input', signature=IoV2Any())
 
     def o_OUTPUT(self, itf: SlaveItf):
         """Binds the downstream master port the buffered requests are
         driven through."""
-        self.itf_bind('output', itf, signature='io_v2')
+        self.itf_bind('output', itf, signature=IoV2Any())

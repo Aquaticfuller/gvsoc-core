@@ -45,7 +45,7 @@ class CDCTester(gvsoc.systree.Component):
         # binding and inserts an utils.io_v2_clock_bridge across the two
         # clock domains. IoV2BigPacket is the most permissive v2 master
         # signature β€” it accepts any of the three slave response forms.
-        self.itf_bind('output', itf, signature=IoV2BigPacket())
+        self.itf_bind('output', itf, signature=IoV2BigPacket(allow=True))
 
     def o_DONE(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('done_out', itf, signature='wire<bool>')

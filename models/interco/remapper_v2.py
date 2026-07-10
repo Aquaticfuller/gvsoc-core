@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from config_tree import Config, cfg_field
 from gvsoc.systree import Component, SlaveItf
+from gvsoc.signature import IoV2Any
 
 
 class RemapperConfig(Config):
@@ -258,7 +259,7 @@ class Remapper(Component):
         window) or leaves it alone (outside window) before forwarding
         to the output master port.
         """
-        return SlaveItf(self, 'input', signature='io_v2')
+        return SlaveItf(self, 'input', signature=IoV2Any())
 
     def o_OUTPUT(self, itf: SlaveItf):
         """Binds the downstream master port.
@@ -267,4 +268,4 @@ class Remapper(Component):
         (``target_base + (addr - base)``) or unchanged, depending on
         whether the original address was in the configured window.
         """
-        self.itf_bind('output', itf, signature='io_v2')
+        self.itf_bind('output', itf, signature=IoV2Any())

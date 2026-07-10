@@ -37,7 +37,7 @@ gvsoc/core/tests/utils/io_v2_clkbridge/rtl_calibration/.
 """
 
 from gvsoc.systree import Component, SlaveItf
-from gvsoc.signature import IoV2BigPacket
+from gvsoc.signature import IoV2Any
 
 
 class IoV2ClockBridge(Component):
@@ -72,10 +72,10 @@ class IoV2ClockBridge(Component):
                           depth if depth is not None else self._DEFAULT_DEPTH)
 
     def i_INPUT(self) -> SlaveItf:
-        return SlaveItf(self, 'input', signature=IoV2BigPacket())
+        return SlaveItf(self, 'input', signature=IoV2Any())
 
     def o_OUTPUT(self, slave: SlaveItf):
-        self.itf_bind('output', slave, signature=IoV2BigPacket())
+        self.itf_bind('output', slave, signature=IoV2Any())
 
 
 class IoV2Cdc2PhaseBeh(IoV2ClockBridge):

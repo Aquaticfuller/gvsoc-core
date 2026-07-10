@@ -40,7 +40,7 @@ class IoV2BeatCollapseAdapter(Component):
         self._beat_width = beat_width
 
     def i_INPUT(self) -> SlaveItf:
-        return SlaveItf(self, 'input', signature=IoV2BigPacket())
+        return SlaveItf(self, 'input', signature=IoV2BigPacket(allow=True))
 
     def o_OUTPUT(self, slave: SlaveItf):
         self.itf_bind('output', slave, signature=IoV2Beat(self._beat_width))

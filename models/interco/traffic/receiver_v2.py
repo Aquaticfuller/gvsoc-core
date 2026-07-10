@@ -15,6 +15,7 @@
 #
 
 import gvsoc.systree
+import gvsoc.signature
 
 
 class ReceiverV2(gvsoc.systree.Component):
@@ -34,4 +35,4 @@ class ReceiverV2(gvsoc.systree.Component):
         return gvsoc.systree.SlaveItf(self, 'control', signature='wire<TrafficReceiverConfig>')
 
     def i_INPUT(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, 'input', signature='io_v2')
+        return gvsoc.systree.SlaveItf(self, 'input', signature=gvsoc.signature.IoV2Any())
