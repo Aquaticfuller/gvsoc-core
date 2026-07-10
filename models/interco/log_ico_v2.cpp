@@ -293,6 +293,19 @@ vp::IoReqStatus LogIco::input_req(vp::Block *__this, vp::IoReq *req, int id)
     uint64_t addr   = req->get_addr();
     int bank_id    = _this->decode_bank(addr);
 
+    // The whole request is routed to ONE bank: an access crossing an aligned
+    // interleaving granule would silently land in a single bank and alias a
+    // different global address (bank-local addresses are compressed). Masters
+    // wider than the granule must be chopped upstream — by construction (the
+    // lane splitters), or by the auto-inserted IoV2SingleReqWidthAdapter when
+    // the binding declares widths. Checked in asserts builds.
+    _this->traces.assert(
+        (addr & ((1ULL << _this->cfg.interleaving_width) - 1)) + req->get_size()
+            <= (1ULL << _this->cfg.interleaving_width),
+        "access straddles the interleaving granule (input: %d, addr: 0x%lx, "
+        "size: %lu, granule: %lu)",
+        id, addr, req->get_size(), 1UL << _this->cfg.interleaving_width);
+
     if (_this->in_election)
     {
         // FSM is dispatching retries; any request arriving in this

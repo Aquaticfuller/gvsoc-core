@@ -263,6 +263,13 @@ class Splitter(Component):
         super().__init__(parent, name, config=config)
         self.add_sources(['interco/splitter_v2.cpp'])
         self.nb_outputs = config.input_width // config.output_width
+        # Declared widths for the port signatures. IoV2SingleReq widths must
+        # be powers of two (granule semantics); a non-power-of-two splitter
+        # config falls back to the unchecked width-0 declaration.
+        def sig_width(w):
+            return w if w > 0 and (w & (w - 1)) == 0 else 0
+        self._in_sig_width = sig_width(config.input_width)
+        self._out_sig_width = sig_width(config.output_width)
 
     def gen_gui(self, parent_signal):
         """Surface the input access and each fan-out chunk in the GUI."""
@@ -286,6 +293,13 @@ class Splitter(Component):
         Incoming io_v2 requests land here. Each request is carved into
         up to ``nb_outputs`` consecutive sub-requests and fired out on
         the corresponding output ports.
+
+        Declared width-0 (permissive): a request must fit one input
+        window (checked at run time by the splitter itself), but
+        declaring ``input_width`` here would auto-insert width adapters
+        in front of every width-0 master bound today. Flip it to
+        ``IoV2SingleReq(self._in_sig_width)`` to make the window a
+        build-time guarantee instead.
         """
         return SlaveItf(self, 'input', signature=IoV2SingleReq())
 
@@ -296,5 +310,10 @@ class Splitter(Component):
         ``nb_outputs = input_width / output_width``. The bound
         downstream receives the N-th consecutive chunk of every parent
         request that has ``chunk_id`` ≤ ``N``.
+
+        The declared width is ``output_width``: every chunk fits one
+        output granule, so this master binds directly to a slave
+        declaring that granule (e.g. an interleaved LogIco).
         """
-        self.itf_bind(f'output_{id}', itf, signature=IoV2SingleReq())
+        self.itf_bind(f'output_{id}', itf,
+                      signature=IoV2SingleReq(self._out_sig_width))

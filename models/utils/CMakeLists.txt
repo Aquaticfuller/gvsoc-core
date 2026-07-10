@@ -87,6 +87,20 @@ vp_model(NAME utils.io_v2_single_req_to_beat_adapter
     INCLUDES "${CMAKE_BINARY_DIR}/gvsoc/engine"
 )
 
+# ---------------------------------------------------------------------------
+# IoV2SingleReqWidthAdapter — auto-inserted between an IoV2SingleReq master
+# and an IoV2SingleReq slave declaring a tighter width granule. Splits any
+# access straddling an aligned granule boundary into granule-aligned
+# sub-accesses (identity contract preserved), so a bank-interleaved fabric
+# never mis-routes a too-wide access to a single bank. Reads its parameters
+# from the generated config tree (IoV2SingleReqWidthAdapterConfig), hence the
+# engine binary-dir include.
+# ---------------------------------------------------------------------------
+vp_model(NAME utils.io_v2_single_req_width_adapter
+    SOURCES "io_v2_single_req_width_adapter.cpp"
+    INCLUDES "${CMAKE_BINARY_DIR}/gvsoc/engine"
+)
+
 add_subdirectory(loader)
 
 # ---------------------------------------------------------------------------
