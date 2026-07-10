@@ -299,7 +299,12 @@ vp::IoReqStatus LogIco::input_req(vp::Block *__this, vp::IoReq *req, int id)
     // wider than the granule must be chopped upstream — by construction (the
     // lane splitters), or by the auto-inserted IoV2SingleReqWidthAdapter when
     // the binding declares widths. Checked in asserts builds.
+    //
+    // With a single slave (slave_bits == 0) there is no interleaving: the
+    // offset is passed through uncompressed and every access lands in bank 0,
+    // so no aliasing is possible and any access width is legal.
     _this->traces.assert(
+        _this->slave_bits == 0 ||
         (addr & ((1ULL << _this->cfg.interleaving_width) - 1)) + req->get_size()
             <= (1ULL << _this->cfg.interleaving_width),
         "access straddles the interleaving granule (input: %d, addr: 0x%lx, "
