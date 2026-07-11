@@ -45,31 +45,114 @@ vp::IoReqStatus IoV2BeatToSyncAdapter::req_handler(vp::Block *__this, vp::IoReq 
     int64_t  burst_id   = req->burst_id;
     int64_t  latency    = 0;
 
-    if (req->get_is_write())
+    if (req->get_is_write() && req->get_opcode() != vp::WRITE)
     {
-        // Forward the whole write burst to the sync slave (the request carries
-        // the full payload). By the IoV2Sync contract it serves any size inline
-        // and must complete with IO_REQ_DONE (never GRANTED/DENIED). Assert it
-        // honoured the contract (asserts/debug builds). Then queue one ack
-        // entry per beat, each round-tripping the master's own request.
+        // Atomic opcodes (LR/SC/SWAP/...) are exempt from the per-burst write
+        // ack: they carry response data, so they keep the classic round-trip —
+        // the master's own request goes back via resp() and nobody else frees
+        // it. Keyed on opcode, not get_is_write() (true for every non-READ
+        // opcode). Forward inline, then queue the round-trip entry.
+        vp::IoReqStatus st = self->out.req(req);
+        self->traces.assert(st == vp::IO_REQ_DONE,
+            "sync slave must reply IO_REQ_DONE inline (got %d)", (int)st);
+        latency = req->get_full_latency();
+
+        self->entries.push_back(StreamEntry{StreamEntry::ATOMIC, req,
+            0, 0, -1, vp::IO_RESP_OK, nullptr});
+    }
+    else if (req->get_is_write())
+    {
+        // WRITE beat. Under the per-burst ack contract the adapter is the
+        // consumer of the master's allocator-backed beats: forward each one
+        // inline to the sync slave (single-beat framing — the sync plane
+        // knows no bursts) and consume it on the spot (the payload was read
+        // inline): free a non-last beat, recycle the last one as the single
+        // data-less burst ack. Every beat still queues its beat-width worth
+        // of SILENT entries in the shared FIFO so the ack drains on exactly
+        // the cycle the last per-beat ack fired before the protocol change.
+        self->traces.assert(req->allocator != nullptr,
+            "write beat is not allocator-backed (req=%p) — unported master", req);
+
+        bool beat_last = req->is_last;
+
+        if (req->is_first || self->open_wr_burst == nullptr)
+        {
+            if (!req->is_first)
+            {
+                self->trace.force_warning(
+                    "Write-burst continuation without an open burst (req=%p) — "
+                    "opening one\n", req);
+            }
+            else if (self->open_wr_burst != nullptr)
+            {
+                self->trace.force_warning(
+                    "Write burst opened while another is still accepting beats "
+                    "(req=%p)\n", req);
+            }
+            self->open_wr_burst = new WriteBurst();
+            self->open_wr_burst->base_addr = burst_addr;
+            self->open_wr_burst->burst_id = burst_id;
+            self->open_wr_burst->initiator = req->initiator;
+        }
+        WriteBurst *burst = self->open_wr_burst;
+        self->traces.assert(burst->initiator == req->initiator,
+            "write beats of one burst must carry the same initiator (req=%p)",
+            req);
+
+        burst->total += total;
+
+        // The downstream plane is not a beat binding: each forwarded beat is
+        // an independent single-beat request there.
+        req->is_first = true;
+        req->is_last = true;
+
         vp::IoReqStatus st = self->out.req(req);
         self->traces.assert(st == vp::IO_REQ_DONE,
             "sync slave must reply IO_REQ_DONE inline (got %d)", (int)st);
 
         latency = req->get_full_latency();
-        vp::IoRespStatus status = req->get_resp_status();
-        uint8_t *data = req->get_data();
+        if (req->get_resp_status() == vp::IO_RESP_INVALID)
+        {
+            burst->status = vp::IO_RESP_INVALID;
+        }
+
+        // Consume the beat: its payload was read inline by the sync slave.
+        // The burst's last beat is recycled as the ack object instead of
+        // being freed (the ack entry below carries it).
+        if (!beat_last)
+        {
+            req->free();
+        }
+
         uint64_t offset = 0;
         do
         {
-            // A zero-size burst still gets a single zero-size ack.
+            // A zero-size beat still consumes a single FIFO slot (and a
+            // zero-size burst still gets its single zero-size ack).
             uint64_t beat = std::min<uint64_t>(total - offset,
                                                (uint64_t)self->beat_width);
-            self->entries.push_back(StreamEntry{nullptr, req,
-                burst_addr + offset, data + offset, beat,
-                offset == 0, offset + beat >= total, burst_id, status});
+            bool is_ack = beat_last && (offset + beat >= total);
+            if (is_ack)
+            {
+                self->entries.push_back(StreamEntry{StreamEntry::WRITE_ACK,
+                    req, burst->base_addr, burst->total, burst->burst_id,
+                    burst->status, burst->initiator});
+            }
+            else
+            {
+                self->entries.push_back(StreamEntry{StreamEntry::WRITE_TICK,
+                    nullptr, 0, 0, -1, vp::IO_RESP_OK, nullptr});
+            }
             offset += beat;
         } while (offset < total);
+
+        if (beat_last)
+        {
+            // Burst complete (every beat completed inline): the record's
+            // snapshot now lives in the ack entry.
+            delete burst;
+            self->open_wr_burst = nullptr;
+        }
     }
     else
     {
@@ -108,8 +191,8 @@ vp::IoReqStatus IoV2BeatToSyncAdapter::req_handler(vp::Block *__this, vp::IoReq 
             b->burst_id = burst_id;
             b->initiator = req->initiator;
 
-            self->entries.push_back(StreamEntry{b, nullptr, 0, nullptr, 0,
-                false, false, -1, vp::IO_RESP_OK});
+            self->entries.push_back(StreamEntry{StreamEntry::READ_BEAT, b,
+                0, 0, -1, vp::IO_RESP_OK, nullptr});
             offset += beat;
         } while (offset < total);
     }
@@ -142,29 +225,34 @@ void IoV2BeatToSyncAdapter::retry_handler(vp::Block *__this, vp::IoRetryChannel)
 
 bool IoV2BeatToSyncAdapter::emit_entry(const StreamEntry &e)
 {
-    vp::IoReq *r;
-    if (e.beat != nullptr)
+    // Silent virtual ack: consumes its 1-entry/cycle FIFO slot (pacing the
+    // stream exactly as the per-beat write acks did) and emits nothing.
+    if (e.kind == StreamEntry::WRITE_TICK)
     {
-        // Read beat: distinct allocator-backed object, fully prepared at
-        // submit time (payload already holds the data). The terminal master
-        // copies it out and frees it — the master's burst request is never
-        // round-tripped as a read beat (initiator-owned convention).
-        r = e.beat;
+        this->trace.msg(vp::Trace::LEVEL_TRACE, "Consume write tick\n");
+        return true;
     }
-    else
+
+    vp::IoReq *r = e.beat;
+    if (e.kind == StreamEntry::WRITE_ACK)
     {
-        // Write ack: round-trip the master's own request object, mutated per
-        // beat. Its data may point into the master's own buffer — writes are
-        // exempt from the data-less rule since nobody else frees them.
-        r = e.wreq;
+        // The single data-less burst ack, recycling the burst's consumed last
+        // beat (see io_v2.hpp, "The write ack"). The initiator frees it.
+        r->prepare();
         r->set_addr(e.addr);
-        r->set_data(e.data);
+        r->set_data(nullptr);
         r->set_size(e.size);
         r->burst_id = e.burst_id;
-        r->is_first = e.is_first;
-        r->is_last = e.is_last;
+        r->is_first = true;
+        r->is_last = true;
         r->set_resp_status(e.status);
+        r->initiator = e.initiator;
     }
+    // READ_BEAT: distinct allocator-backed object, fully prepared at submit
+    // time (payload already holds the data). The terminal master copies it
+    // out and frees it — the master's burst request is never round-tripped as
+    // a read beat (initiator-owned convention). ATOMIC: the master's own
+    // request, emitted unmutated (classic round-trip).
 
     this->trace.msg(vp::Trace::LEVEL_TRACE,
         "Emit beat (req=%p, addr=0x%lx, size=%lu, first=%d, last=%d, write=%d)\n",
@@ -178,6 +266,7 @@ bool IoV2BeatToSyncAdapter::emit_entry(const StreamEntry &e)
         // else advances until the held beat is accepted.
         this->resp_held = true;
         this->held_req = r;
+        this->held_owned = (e.kind != StreamEntry::ATOMIC);
         return false;
     }
     return true;
@@ -199,6 +288,7 @@ void IoV2BeatToSyncAdapter::resp_retry_in_handler(vp::Block *__this,
     }
     self->resp_held = false;
     self->held_req = nullptr;
+    self->held_owned = false;
     if (!self->entries.empty())
     {
         self->fsm_event.enqueue(1);
@@ -279,26 +369,34 @@ void IoV2BeatToSyncAdapter::reset(bool active)
 {
     if (active)
     {
-        // Queued read beats are ours (allocator-backed) — return them to their
-        // pool. Write entries reference the master's own request, not ours to
-        // free.
+        // Queued read beats and pending burst acks (the recycled last beats)
+        // are ours (allocator-backed) — return them to their pool. Silent
+        // ticks carry nothing; atomic entries reference the master's own
+        // request, not ours to free.
         for (auto &e : this->entries)
         {
-            if (e.beat != nullptr)
+            if ((e.kind == StreamEntry::READ_BEAT
+                 || e.kind == StreamEntry::WRITE_ACK)
+                && e.beat != nullptr)
             {
                 e.beat->free();
             }
         }
         this->entries.clear();
-        // Same for a held (back-pressured) beat: free it if it is a read beat,
-        // leave it alone if it is the master's round-tripped write ack.
-        if (this->resp_held && this->held_req != nullptr
-            && !this->held_req->get_is_write())
+        // A burst still accepting beats: its already-received beats were
+        // consumed (freed) inline, only the record remains.
+        delete this->open_wr_burst;
+        this->open_wr_burst = nullptr;
+        // Same for a held (back-pressured) object: a read beat or recycled
+        // burst ack is ours to free; a master-owned atomic round-trip is
+        // left alone.
+        if (this->resp_held && this->held_req != nullptr && this->held_owned)
         {
             this->held_req->free();
         }
         this->resp_held = false;
         this->held_req = nullptr;
+        this->held_owned = false;
         this->fsm_event.cancel();   // safe even if not enqueued
     }
 }

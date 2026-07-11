@@ -20,6 +20,15 @@
  * on the input port: returns IO_REQ_DENIED when full and calls input_itf.retry()
  * once when capacity returns; never tracks denied requests internally (the
  * master holds and resends them per the v2 protocol).
+ *
+ * Per-burst write-ack contract note: this slave keeps the classic per-request
+ * round-trip (it resp()s the master's own request, writes included) and does
+ * NOT implement the beat-plane per-burst write acknowledgement. That is
+ * correct because its input port is declared IoV2Any WITHOUT beat_tolerant
+ * (receiver_v2.py): when a beat master binds it (e.g. the FlooNoC NI target
+ * output, IoV2Beat, in the floonoc tests), the framework auto-inserts the
+ * IoV2BeatAdapter in between, so raw write beats never reach this component —
+ * it always sits on the round-trip plane.
  */
 
 #include <algorithm>

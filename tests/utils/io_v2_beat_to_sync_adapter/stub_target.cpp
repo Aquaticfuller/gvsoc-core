@@ -9,8 +9,10 @@
  * IO_REQ_DONE (the sync contract): fills read data with an addr-derived
  * pattern, annotates latency (and optionally duration), and optionally reports
  * IO_RESP_INVALID. It POLICES the adapter/initiator with traces.assert: each
- * request is a single whole-burst forward (is_first && is_last), addressed
- * within range, and never re-entrant (a sync slave is never pipelined).
+ * request is a single-beat access (is_first && is_last — the adapter serves
+ * reads as beat-sized sub-reads and forwards each write beat on its own),
+ * addressed within range, and never re-entrant (a sync slave is never
+ * pipelined).
  *
  * Config keys: latency, duration, error(bool), base, size, logname.
  */
@@ -72,9 +74,10 @@ vp::IoReqStatus StubTarget::req_handler(vp::Block *__this, vp::IoReq *req)
     _this->traces.assert(!_this->in_call,
         "sync slave received a re-entrant request");
     _this->in_call = true;
-    // The beat->sync adapter forwards the whole burst as one request.
+    // The beat->sync adapter serves reads as beat-sized sub-reads and forwards
+    // each write beat as its own single-beat request.
     _this->traces.assert(req->is_first && req->is_last,
-        "sync slave must receive a single whole-burst request (first=%d last=%d)",
+        "sync slave must receive single-beat requests (first=%d last=%d)",
         req->is_first ? 1 : 0, req->is_last ? 1 : 0);
     _this->traces.assert(addr >= _this->base && addr + sz <= _this->base + _this->size,
         "access [0x%lx,+%lu) outside target range [0x%lx,+%lu)",

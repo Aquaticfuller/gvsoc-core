@@ -42,17 +42,45 @@
  * before it starts denying. The auto defaults are the minimum depths that
  * sustain full streaming.
  *
+ * WRITES are acknowledged once per burst (AXI B-channel semantics, see
+ * io_v2.hpp "Write acknowledgement") on BOTH faces:
+ *   - Upstream face: the adapter is the consumer of the master's
+ *     allocator-backed write beats. Each beat's payload is copied into
+ *     downstream chunks during req(), so the beat is freed right there and
+ *     GRANTED is returned — non-last and last beats alike. When the whole
+ *     burst has completed downstream, ONE data-less ack, drawn from the
+ *     size-0 pool (our copy of the last beat was already freed, and a
+ *     payload-pool object must never be recycled as an ack), is emitted
+ *     upstream and freed by the master.
+ *   - Downstream face: the chunks of one upstream burst are framed as one
+ *     downstream burst (is_first/is_last/burst_id per chunk, same initiator
+ *     — the burst record — on every chunk). A GRANTED chunk was consumed and
+ *     freed by the target (non-last chunks get no resp at all); the burst
+ *     completes on the last chunk's inline DONE (we keep and free the chunk)
+ *     or on the target's single distinct data-less ack, correlated back via
+ *     initiator and freed by us.
+ *
+ * Timing deviation (write acks): before the per-burst ack protocol the
+ * upstream acks were scheduled per input_width stride as the covering
+ * downstream chunk acks arrived. Exact reconstruction of that schedule is
+ * impossible now that non-last chunks are consumed without any downstream
+ * ack, so the single upstream ack is instead scheduled from the downstream
+ * burst completion with the pre-existing per-ack arithmetic — ready =
+ * now + max(1, latency), serialized on ack_cursor — i.e. the FINAL stride
+ * only.
+ *
  * Ownership follows the initiator-owned request convention:
- *   - The upstream burst request is never freed here; read response beats
- *     emitted upstream are distinct allocator-backed objects (input_width
- *     pool) the terminal master frees; write acks round-trip the upstream
- *     master's own request object.
+ *   - The upstream read burst request is never freed here; read response
+ *     beats emitted upstream are distinct allocator-backed objects
+ *     (input_width pool) the terminal master frees. Upstream write beats are
+ *     consumed and freed here at submit (see above).
  *   - The downstream read descriptor is our own allocator-backed (data-less)
  *     object, freed by us when its response stream completes; downstream
- *     read beats are freed by us as we consume them; downstream write beats
+ *     read beats are freed by us as we consume them; downstream write chunks
  *     are our own allocator-backed (output_width pool) objects whose payload
- *     carries a copy of the upstream data — they round-trip back to us as
- *     acks and we free them.
+ *     carries a copy of the upstream data — the downstream target consumes
+ *     and frees them (an inline-DONE'd last chunk stays ours and we free
+ *     it).
  *
  * No public API: private header of the component implementation. The
  * framework auto-inserts the component during the gvrun2 binding-collection
@@ -126,54 +154,50 @@ private:
     };
 
     // ---- WRITE path --------------------------------------------------------
-    // One upstream write request (big-packet burst or one beat of a beat-form
-    // burst). Chopped/packed into output_width downstream chunks; acked
-    // upstream at input_width boundaries once the covering chunks are acked.
-    struct WriteJob
+    // One upstream write burst. Opened by the is_first beat, submission-closed
+    // by the is_last beat (last_seen), released when the downstream burst
+    // completes and the single upstream ack is scheduled. The upstream beats
+    // themselves are consumed at submit (payload copied into chunks, beat
+    // freed) — this record is everything that survives them, snapshotted
+    // before the free.
+    struct WriteBurst
     {
-        vp::IoReq *up_req;
-        uint64_t   addr;
-        uint64_t   size;
-        uint8_t   *data;
-        int64_t    burst_id;
-        bool       up_first;      // framing snapshot (we mutate up_req for acks)
-        bool       up_last;
-        uint64_t   bytes_acked = 0;
-        uint64_t   acks_scheduled = 0;   // bytes covered by scheduled acks
-        bool       zero_ack_scheduled = false;
+        uint64_t base_addr = 0;
+        uint64_t total = 0;       // bytes submitted; final once last_seen
+        bool     last_seen = false;
+        int64_t  burst_id = -1;   // snapshot from the opening beat
+        void    *initiator = nullptr;  // same on every beat (asserted)
+        // Final status latch: any chunk error (inline-DONE INVALID escape
+        // hatch) or an INVALID downstream ack latches INVALID.
         vp::IoRespStatus status = vp::IO_RESP_OK;
-    };
-
-    // Byte range of one WriteJob covered by a downstream chunk.
-    struct ChunkSeg
-    {
-        WriteJob *job;
-        uint64_t  bytes;
     };
 
     // One downstream write beat: allocator-backed request (output_width pool)
     // whose co-allocated payload carries a copy of the covered upstream bytes.
+    // The wrapper only lives until the downstream outcome of its req (GRANTED
+    // or DONE): per-chunk completion is not tracked — the burst record is.
     struct WriteChunk
     {
-        vp::IoReq *req = nullptr;
-        uint64_t   addr = 0;
-        uint64_t   fill = 0;
-        bool       is_first = false;
-        bool       is_last = false;
-        int64_t    burst_id = -1;
-        std::vector<ChunkSeg> segs;
+        vp::IoReq  *req = nullptr;
+        WriteBurst *burst = nullptr;
+        uint64_t    addr = 0;
+        uint64_t    fill = 0;
+        bool        is_first = false;
+        bool        is_last = false;
+        int64_t     burst_id = -1;
     };
 
-    // One upstream write ack scheduled for emission (round-trips up_req).
+    // The single upstream per-burst write ack scheduled for emission (a
+    // distinct data-less size-0-pool object is built at emit time). All
+    // fields are snapshots — the burst record is already released.
     struct PendingAck
     {
-        WriteJob *job;
-        uint64_t  offset;
-        uint64_t  size;
-        bool      is_first;
-        bool      is_last;
-        bool      job_done;       // final ack of the job: release it after emit
-        int64_t   ready_cycle;
+        uint64_t addr;            // burst base address (informational)
+        uint64_t size;            // burst total bytes (informational)
+        int64_t  burst_id;
+        void    *initiator;       // upstream initiator copied from the beats
+        vp::IoRespStatus status;
+        int64_t  ready_cycle;
     };
 
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req);
@@ -195,10 +219,9 @@ private:
     vp::IoReqStatus submit_write(vp::IoReq *req);
     void finish_chunk(bool is_last);
     void issue_pending_chunks();
-    void ack_chunk(WriteChunk *chunk, vp::IoRespStatus status, int64_t latency_cycles);
-    void schedule_job_acks(WriteJob *job, int64_t latency_cycles);
+    void complete_chunk(WriteChunk *chunk, vp::IoReqStatus st);
+    void complete_write_burst(WriteBurst *burst, int64_t latency_cycles);
     void emit_ack(const PendingAck &ack);
-    void release_job(WriteJob *job);
     void maybe_unblock_write();
 
     void reschedule_fsm();
@@ -208,7 +231,8 @@ private:
     // Tiny freelist pools (process-lifetime, like IoReqAllocator).
     ReadBurst  *alloc_read_burst();
     void        free_read_burst(ReadBurst *burst);
-    WriteJob   *alloc_job();
+    WriteBurst *alloc_write_burst();
+    void        free_write_burst(WriteBurst *burst);
     WriteChunk *alloc_chunk();
     void        free_chunk(WriteChunk *chunk);
 
@@ -245,25 +269,26 @@ private:
     bool dn_read_blocked = false;               // we denied a downstream beat
 
     // Write state.
-    std::vector<WriteJob *> live_jobs;          // for reset cleanup
+    std::vector<WriteBurst *> live_bursts;      // awaiting completion (+ reset cleanup)
+    WriteBurst *open_burst = nullptr;           // currently accepting beats
     WriteChunk *cur_chunk = nullptr;            // under construction
     std::deque<WriteChunk *> chunk_queue;       // complete, waiting to issue
-    std::vector<WriteChunk *> chunks_in_flight; // issued, awaiting downstream ack
     WriteChunk *held_chunk = nullptr;           // DENIED downstream, re-send on retry
     int64_t chunk_issue_cursor = -1;            // <=1 downstream chunk / cycle
     bool up_write_blocked = false;              // we denied an upstream write
     std::deque<PendingAck> ack_pending;
-    int64_t ack_cursor = -1;                    // <=1 upstream write ack / cycle
+    int64_t ack_cursor = -1;                    // serializes upstream write acks
 
-    // Response-path back-pressure from the upstream master: the refused beat is
-    // held here and re-sent from resp_retry_in_handler; nothing else is emitted
-    // until it is accepted.
+    // Response-path back-pressure from the upstream master: the refused beat
+    // (a read beat or a write burst ack — both allocator-backed and ours until
+    // accepted) is held here and re-sent from resp_retry_in_handler; nothing
+    // else is emitted until it is accepted.
     bool resp_held = false;
     vp::IoReq *held_req = nullptr;
 
     // Freelists.
     std::vector<ReadBurst *> read_burst_pool;
-    std::vector<WriteJob *> job_pool;
+    std::vector<WriteBurst *> write_burst_pool;
     std::vector<WriteChunk *> chunk_pool;
 
     vp::Trace trace;

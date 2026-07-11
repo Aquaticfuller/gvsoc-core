@@ -40,5 +40,7 @@ class GeneratorV2(gvsoc.systree.Component):
         # Beat-tolerant terminal master: the generator natively consumes raw
         # per-beat response streams (it measures the path's bandwidth, so the
         # stream must reach it unmodified) — direct bind against beat slaves,
-        # no collapse adapter.
+        # no collapse adapter. This also makes it a beat-plane WRITE master:
+        # its pool-backed write requests follow the per-burst acknowledgement
+        # contract (consumed/freed by the target, one data-less ack back).
         self.itf_bind('output', itf, signature=gvsoc.signature.IoV2Any(beat_tolerant=True))

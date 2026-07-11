@@ -27,6 +27,7 @@ from memory.memory_v3 import Memory, MemoryV3Config
 from gvrun.parameter import TargetParameter
 
 from cdc_tester import CDCTester
+from cdc_beat_target import CDCBeatTarget
 # Register the cdc_*_rtl calibration kinds locally (they are not in the
 # shipped simulator model library β€” see rtl_calibration/__init__.py).
 import rtl_calibration  # noqa: F401
@@ -68,6 +69,19 @@ def build_case(case_name: str) -> dict:
         # 8-byte accesses to confirm the bridge is opaque to access size.
         return {**common, 'freq_a': 200_000_000, 'freq_b': 100_000_000,
                 'access_size': 8}
+
+    if case_name == 'beat_burst':
+        # Beat-form multi-beat write bursts (8 beats of 4 bytes) against a
+        # beat target implementing the per-burst write-ack contract: the
+        # target consumes and frees every granted write beat (non-last
+        # beats produce NO response) and acknowledges the burst exactly
+        # once. The burst is LONGER than any parametric bridge depth (1 or
+        # 2), so the bridge's admission back-pressure engages mid-burst;
+        # since granted-and-consumed write beats never come back through
+        # the rev path, this case deadlocks unless the bridge services its
+        # owed upstream retry from the forward-path drain as well.
+        return {**common, 'freq_a': 200_000_000, 'freq_b': 100_000_000,
+                'nb_accesses': 4, 'burst_beats': 8}
 
     raise ValueError(f'Unknown case: {case_name}')
 
@@ -116,12 +130,23 @@ class Chip(gvsoc.systree.Component):
         self.set_clock_bridge_policy(src_clock=clk_b, dst_clock=clk_a,
                                      kind=bridge, opts=bridge_opts)
 
-        # Memories, one in each domain. memory_v3 is IoV2Sync β€” a strict
-        # synchronous slave that the auto-bridge will splice transparently.
-        mem_a = Memory(self, 'mem_a', config=MemoryV3Config(
-            size=MEM_A_SIZE, latency=1))
-        mem_b = Memory(self, 'mem_b', config=MemoryV3Config(
-            size=MEM_B_SIZE, latency=1))
+        # Memories, one in each domain. Default cases use memory_v3 (IoV2Sync,
+        # a strict synchronous slave the auto-bridge splices transparently);
+        # the beat_burst case swaps in the beat-plane target stub, which
+        # implements the per-burst write-acknowledgement contract so the
+        # tester<->target binding stays IoV2Beat on both ends and only the
+        # clock bridge is spliced in between.
+        burst_beats = spec.get('burst_beats', 0)
+        if burst_beats > 0:
+            mem_a = CDCBeatTarget(self, 'mem_a', size=MEM_A_SIZE,
+                                  beat_width=spec['access_size'])
+            mem_b = CDCBeatTarget(self, 'mem_b', size=MEM_B_SIZE,
+                                  beat_width=spec['access_size'])
+        else:
+            mem_a = Memory(self, 'mem_a', config=MemoryV3Config(
+                size=MEM_A_SIZE, latency=1))
+            mem_b = Memory(self, 'mem_b', config=MemoryV3Config(
+                size=MEM_B_SIZE, latency=1))
         clk_a.o_CLOCK(mem_a.i_CLOCK())
         clk_b.o_CLOCK(mem_b.i_CLOCK())
 
@@ -135,6 +160,7 @@ class Chip(gvsoc.systree.Component):
             nb_accesses=spec['nb_accesses'],
             pattern_seed=spec['pattern_seed_a'],
             pipeline_burst=pipeline_burst,
+            burst_beats=burst_beats,
             logname='tester_a')
         tester_b = CDCTester(self, 'tester_b',
             base=0,
@@ -142,6 +168,7 @@ class Chip(gvsoc.systree.Component):
             nb_accesses=spec['nb_accesses'],
             pattern_seed=spec['pattern_seed_b'],
             pipeline_burst=pipeline_burst,
+            burst_beats=burst_beats,
             logname='tester_b')
         clk_a.o_CLOCK(tester_a.i_CLOCK())
         clk_b.o_CLOCK(tester_b.i_CLOCK())

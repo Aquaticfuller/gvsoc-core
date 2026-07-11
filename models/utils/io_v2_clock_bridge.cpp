@@ -35,6 +35,7 @@ IoV2ClockBridge::IoV2ClockBridge(vp::ComponentConf &config)
         this->rev_dst_event = new vp::ClockEvent(this, &IoV2ClockBridge::rev_dst_done_handler);
         this->fwd_dst_event = new vp::ClockEvent(this, &IoV2ClockBridge::fwd_dst_done_handler);
         this->rev_src_event = new vp::ClockEvent(this, &IoV2ClockBridge::rev_src_done_handler);
+        this->retry_event   = new vp::ClockEvent(this, &IoV2ClockBridge::retry_event_handler);
     }
     else
     {
@@ -86,6 +87,29 @@ void IoV2ClockBridge::reset(bool active)
         this->slave_engine->cancel(this->fwd_dst_event);
     if (this->rev_src_event->is_enqueued())
         this->slave_engine->cancel(this->rev_src_event);
+    this->master_engine->cancel(this->retry_event);
+
+    // Write beats sitting in the forward queues were GRANTED to the bridge
+    // (ownership transferred, upstream considers them consumed) and were not
+    // yet forwarded: nobody else will ever free them, so return the
+    // pool-backed ones to their pool. Beat-plane write beats are always
+    // allocator-backed; a write without an allocator back-pointer is a
+    // master-owned object on a non-beat (classic round-trip) flow — the
+    // master still holds it, so it is not ours to free. Reads/atomics in the
+    // forward queues and everything in the rev queues (responses / burst
+    // acks travelling upstream) are dropped un-freed, exactly as before: the
+    // whole subtree resets with us and the respective owners rebuild their
+    // state.
+    for (std::deque<Txn> *queue : { &this->fwd_src_queue, &this->fwd_dst_queue })
+    {
+        for (Txn &t : *queue)
+        {
+            if (t.req->get_opcode() == vp::WRITE && t.req->allocator != nullptr)
+            {
+                t.req->free();
+            }
+        }
+    }
     this->fwd_src_queue.clear();
     this->fwd_dst_queue.clear();
     this->rev_src_queue.clear();
@@ -123,6 +147,53 @@ void IoV2ClockBridge::enqueue_in(std::deque<Txn> &queue, vp::IoReq *req,
 }
 
 
+int IoV2ClockBridge::occupancy() const
+{
+    return (int)(this->fwd_src_queue.size()
+                 + this->fwd_dst_queue.size()
+                 + this->rev_src_queue.size()
+                 + this->rev_dst_queue.size());
+}
+
+
+void IoV2ClockBridge::maybe_retry()
+{
+    // Master-engine context only: in.retry() lands in the upstream master's
+    // clock domain and must fire on one of its edges. Recompute occupancy on
+    // every call — it is the live queue population, not a counter, so a
+    // write beat that was granted downstream (and will never produce a
+    // response) has already retired its slot by leaving fwd_dst.
+    if (this->retry_owed && this->occupancy() < this->depth)
+    {
+        this->retry_owed = false;
+        this->in.retry();
+    }
+}
+
+
+void IoV2ClockBridge::schedule_retry()
+{
+    // Occupancy freed on the slave-engine (forward) side: in.retry() must
+    // not be called cross-domain, so cross back into the master domain
+    // through a master-engine event — the same re-alignment the rev path
+    // applies to responses. The handler re-checks the condition: occupancy
+    // may have been refilled (e.g. by response beats) in between.
+    if (this->retry_owed && this->occupancy() < this->depth)
+    {
+        // ClockEngine::enqueue keeps the earliest pending cycle if the event
+        // is already enqueued.
+        this->master_engine->enqueue(this->retry_event, 1);
+    }
+}
+
+
+void IoV2ClockBridge::retry_event_handler(vp::Block *_this, vp::ClockEvent *)
+{
+    IoV2ClockBridge *self = static_cast<IoV2ClockBridge *>(_this);
+    self->maybe_retry();
+}
+
+
 // ---- v2 IO callbacks (branch on parametric) ------------------------------
 
 vp::IoReqStatus IoV2ClockBridge::in_req_handler(vp::Block *__this, vp::IoReq *req)
@@ -131,17 +202,24 @@ vp::IoReqStatus IoV2ClockBridge::in_req_handler(vp::Block *__this, vp::IoReq *re
 
     if (!self->parametric)
     {
-        // Fast path: sync remote engine and forward inline.
+        // Fast path: sync remote engine and forward inline. This is a pure
+        // 1:1 relay, correct as-is under the per-burst write-ack contract:
+        // the downstream's status (GRANTED / DONE / DENIED) is returned to
+        // the upstream master unmodified, so ownership transfers exactly as
+        // if the two were bound directly — a GRANTED write beat now belongs
+        // to the downstream (the bridge never touched it), an inline DONE
+        // leaves the beat with the master, and the burst ack comes back as
+        // an ordinary response through out_resp_handler.
         self->slave_engine->sync();
         return self->out.req(req);
     }
 
-    // Parametric path: depth gate + enqueue in fwd_src.
-    int in_flight = (int)(self->fwd_src_queue.size()
-                          + self->fwd_dst_queue.size()
-                          + self->rev_src_queue.size()
-                          + self->rev_dst_queue.size());
-    if (in_flight >= self->depth)
+    // Parametric path: depth gate + enqueue in fwd_src. The gate is the live
+    // queue population (occupancy()), not a counter: a write beat granted
+    // downstream retires its slot by leaving fwd_dst (it never comes back),
+    // while round-tripped requests re-occupy a slot in the rev queues until
+    // delivered upstream.
+    if (self->occupancy() >= self->depth)
     {
         self->retry_owed = true;
         return vp::IO_REQ_DENIED;
@@ -164,6 +242,12 @@ vp::IoReqStatus IoV2ClockBridge::in_req_handler(vp::Block *__this, vp::IoReq *re
 vp::IoRespAck IoV2ClockBridge::out_resp_handler(vp::Block *__this, vp::IoReq *req)
 {
     IoV2ClockBridge *self = static_cast<IoV2ClockBridge *>(__this);
+
+    // Any response shape crosses here 1:1 — read beats, atomics round-trips,
+    // and the downstream's per-burst write ack alike. The bridge is not the
+    // initiator: it relays the object upstream unmodified and never frees it
+    // (the initiator frees pool-backed acks / read beats after consuming
+    // them).
 
     if (!self->parametric)
     {
@@ -256,20 +340,83 @@ void IoV2ClockBridge::fwd_dst_done_handler(vp::Block *_this, vp::ClockEvent *)
         Txn t = self->fwd_dst_queue.front();
         self->fwd_dst_queue.pop_front();
 
+        // Snapshot what the write-ack rules key on BEFORE req(): a GRANTED
+        // write beat transfers ownership (buffer included) to the downstream
+        // and must never be touched again.
+        bool write_beat = t.req->get_opcode() == vp::WRITE;
+        bool was_last   = t.req->is_last;
+
         t.req->prepare();
         vp::IoReqStatus st = self->out.req(t.req);
         if (st == vp::IO_REQ_DONE)
         {
-            self->enqueue_in(self->rev_src_queue, t.req,
-                             now_slave + self->k_src_per_dir, 1);
+            if (write_beat && !was_last)
+            {
+                // A non-last write beat is never answered DONE on the beat
+                // plane except as the inline-INVALID escape hatch (malformed
+                // beat rejected by the target). The upstream master granted
+                // the beat away to us, so the bridge owns it: return it to
+                // its pool and drop it. The burst aborts through the
+                // eventual ack's INVALID status — and if the master never
+                // submits the last beat there is no ack at all; that is the
+                // accepted escape-hatch semantics.
+                self->traces.assert(
+                    t.req->get_resp_status() == vp::IO_RESP_INVALID,
+                    "downstream answered DONE(OK) on a non-last write beat "
+                    "(req=%p, addr=0x%lx)", t.req, t.req->get_addr());
+                t.req->free();
+            }
+            else if (write_beat)
+            {
+                // Inline DONE on the LAST write beat: the burst's inline
+                // ack. The upstream master granted the beat to the bridge,
+                // so the bridge still owns the object — recycle it in place
+                // as the async data-less burst ack (keep the burst's final
+                // status and carry the downstream timing annotation;
+                // burst_id / initiator are already the burst's own) and push
+                // it into the rev path exactly like a round-tripped
+                // response, so the upstream ack keeps the CDC delay shape.
+                vp::IoRespStatus status = t.req->get_resp_status();
+                int64_t latency  = t.req->get_latency();
+                int64_t duration = t.req->get_duration();
+                t.req->prepare();
+                t.req->set_data(NULL);
+                t.req->is_first = true;
+                t.req->is_last  = true;
+                t.req->set_resp_status(status);
+                t.req->set_latency(latency);
+                t.req->set_duration(duration);
+                self->enqueue_in(self->rev_src_queue, t.req,
+                                 now_slave + self->k_src_per_dir, 1);
+            }
+            else
+            {
+                // Reads and atomics keep the classic round-trip: the same
+                // object travels back through the rev queues.
+                self->enqueue_in(self->rev_src_queue, t.req,
+                                 now_slave + self->k_src_per_dir, 1);
+            }
         }
-        // GRANTED: out_resp_handler will handle. DENIED: not modeled.
+        // GRANTED: ownership moved downstream — drop the pointer, never
+        // touch the beat again. For a write beat the target consumes and
+        // frees it (non-last beats produce no response at all; the burst's
+        // single ack comes back through out_resp_handler like any other
+        // response). For reads/atomics the response arrives later through
+        // out_resp_handler. DENIED: not modeled.
     }
 
     self->reschedule_event(*self->fwd_dst_event, self->fwd_dst_queue,
                            self->slave_engine);
     self->reschedule_event(*self->rev_src_event, self->rev_src_queue,
                            self->slave_engine);
+
+    // Forwarding retires occupancy: a granted write beat leaves the bridge
+    // for good here (it never produces a response, so no rev-path drain will
+    // ever run on its behalf), and an inline-INVALID non-last beat was freed
+    // outright. The upstream accept window may thus re-open NOW — service an
+    // owed retry. We are on the slave engine, so cross back into the master
+    // domain through the dedicated retry event.
+    self->schedule_retry();
 }
 
 
@@ -308,18 +455,9 @@ void IoV2ClockBridge::rev_dst_done_handler(vp::Block *_this, vp::ClockEvent *)
         self->in.resp(t.req);
     }
 
-    if (self->retry_owed)
-    {
-        int in_flight = (int)(self->fwd_src_queue.size()
-                              + self->fwd_dst_queue.size()
-                              + self->rev_src_queue.size()
-                              + self->rev_dst_queue.size());
-        if (in_flight < self->depth)
-        {
-            self->retry_owed = false;
-            self->in.retry();
-        }
-    }
+    // Delivering upstream freed occupancy; this handler runs on the master
+    // engine, so an owed retry can be serviced synchronously.
+    self->maybe_retry();
 
     self->reschedule_event(*self->rev_dst_event, self->rev_dst_queue,
                            self->master_engine);

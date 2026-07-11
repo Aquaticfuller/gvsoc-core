@@ -10,14 +10,21 @@
  * of a different width makes the framework auto-insert the width adapter.
  *
  * Reads and big-packet writes are issued as ONE whole-burst request per
- * schedule entry; the master then expects ceil(size / beat_width) resp() beats
- * at ITS OWN width. With write_beats=true a write burst is instead streamed as
- * per-beat requests, one per cycle, each expecting one ack — the beat-form
- * write of the v2 protocol, which the width adapter packs/chops downstream.
+ * schedule entry; a read then expects ceil(size / beat_width) resp() beats at
+ * ITS OWN width. With write_beats=true a write burst is instead streamed as
+ * per-beat requests, one per cycle — the beat-form write of the v2 protocol,
+ * which the width adapter packs/chops downstream.
+ *
+ * Writes follow the per-burst ack contract (io_v2.hpp "Write
+ * acknowledgement"): beats are size-0-pool allocations whose data aliases the
+ * master's buffer; a GRANTED beat is consumed and freed by the adapter and
+ * must be forgotten; the burst is answered by exactly ONE resp() carrying a
+ * distinct data-less ack (is_last, data==NULL) that we free — or by an inline
+ * DONE on the last beat, in which case we keep and free our own beat.
  *
  * The response stream is POLICED with traces.assert (asserts builds): exactly
- * N beats, is_first/is_last placement, burst_id, <=1 beat/cycle, status, read
- * data pattern, and the initiator-owned ownership rules.
+ * N beats (1 for a write burst), is_first/is_last placement, burst_id,
+ * <=1 beat/cycle, status, read data pattern, and the ownership rules.
  *
  * Schedule entry keys (cycle/addr/size required):
  *   cycle        : issue cycle of this burst
@@ -61,12 +68,12 @@ private:
     };
 
     // Live state for one outstanding burst, reachable from each resp() beat via
-    // req->initiator.
+    // req->initiator (every request of the burst carries it, per the contract).
     struct BurstState {
         BurstEntry *entry;
         uint8_t *buffer;            // master-owned data buffer (writes)
-        vp::IoReq *req;             // whole-burst descriptor (null in beat mode)
-        std::set<vp::IoReq *> own_beats;  // per-beat write requests in flight
+        vp::IoReq *req;             // whole-burst request (null in beat mode;
+                                    // nulled on write GRANT — the target frees it)
         uint64_t beats_sent_bytes;  // beat mode: bytes already submitted
         int expected_beats;
         int beats_seen;
@@ -83,6 +90,7 @@ private:
 
     void send_burst(BurstEntry *entry);
     void send_next_write_beat(BurstState *bs);
+    void complete_write_inline(BurstState *bs, vp::IoReq *r);
 
     vp::IoMaster out;
     vp::ClockEvent issue_event;
@@ -90,6 +98,10 @@ private:
     vp::ClockEvent quit_event;
     vp::ClockEvent resp_retry_event;
     vp::Trace trace;
+    // Size-0 pool for write requests: their data aliases our buffer and the
+    // adapter (the write-beat consumer) frees them (io_v2.hpp "Request
+    // allocation").
+    vp::IoReqAllocator *req_pool = nullptr;
     std::vector<BurstEntry *> schedule;
     size_t next_to_schedule = 0;
     int beat_width = 0;
@@ -120,6 +132,8 @@ StubMaster::StubMaster(vp::ComponentConf &config)
     if (this->logname.empty()) this->logname = this->get_name();
 
     this->beat_width = this->get_js_config()->get_child_int("beat_width");
+
+    this->req_pool = vp::IoReqAllocator::get(0);
 
     int qac = this->get_js_config()->get_child_int("quit_after_cycles");
     if (qac > 0) this->quit_after_cycles = qac;
@@ -170,7 +184,9 @@ void StubMaster::send_burst(BurstEntry *entry)
 
     BurstState *bs = new BurstState();
     bs->entry = entry;
-    bs->expected_beats = entry->size == 0 ? 1
+    // A write burst is acked exactly ONCE regardless of its size or form
+    // (per-burst write-ack contract); reads stream one beat per beat_width.
+    bs->expected_beats = (entry->is_write || entry->size == 0) ? 1
         : (int)((entry->size + this->beat_width - 1) / this->beat_width);
     bs->beats_seen = 0;
     bs->beats_sent_bytes = 0;
@@ -212,8 +228,26 @@ void StubMaster::send_burst(BurstEntry *entry)
         return;
     }
 
-    bs->req = new vp::IoReq(entry->base_addr, bs->buffer, entry->size, entry->is_write);
-    bs->req->prepare();
+    if (entry->is_write)
+    {
+        // Big-packet-form write: ONE beat carrying the full payload — a
+        // one-beat burst under the per-burst ack rules. Pool-allocated with
+        // data aliasing our buffer; on GRANT the adapter consumes and frees
+        // it, so the object must be forgotten (never reused).
+        bs->req = this->req_pool->alloc();
+        bs->req->prepare();
+        bs->req->set_addr(entry->base_addr);
+        bs->req->set_data(bs->buffer);
+        bs->req->set_size(entry->size);
+        bs->req->set_opcode(vp::WRITE);
+    }
+    else
+    {
+        // Read burst request: data-less, initiator-owned (never freed by the
+        // adapter) — we release it when the last beat lands.
+        bs->req = new vp::IoReq(entry->base_addr, nullptr, entry->size, false);
+        bs->req->prepare();
+    }
     bs->req->is_first = true;
     bs->req->is_last = true;
     bs->req->burst_id = entry->burst_id;
@@ -224,6 +258,19 @@ void StubMaster::send_burst(BurstEntry *entry)
     if (st == vp::IO_REQ_GRANTED)
     {
         this->outstanding++;
+        if (entry->is_write)
+        {
+            // Ownership (buffer included) went with the beat: forget it. The
+            // burst's ack comes back as a distinct data-less pool object.
+            bs->req = nullptr;
+        }
+    }
+    else if (st == vp::IO_REQ_DONE && entry->is_write)
+    {
+        // Inline DONE on a last (here: only) write beat: we keep the beat —
+        // read the final status off it and free it ourselves.
+        this->outstanding++;
+        this->complete_write_inline(bs, bs->req);
     }
     else if (st == vp::IO_REQ_DENIED)
     {
@@ -236,32 +283,64 @@ void StubMaster::send_burst(BurstEntry *entry)
     else
     {
         this->traces.assert(false,
-            "adapter must return GRANTED or DENIED for a beat master (got %d)",
-            (int)st);
+            "unexpected req() status for a beat master (got %d)", (int)st);
     }
+}
+
+// Inline DONE on a write burst's last beat: the fast-path per-burst ack. We
+// still own the beat — police the final status and free it, then retire the
+// whole burst (no resp() will ever fire for it).
+void StubMaster::complete_write_inline(BurstState *bs, vp::IoReq *r)
+{
+    int64_t now = this->clock.get_cycles();
+    BurstEntry *e = bs->entry;
+
+    printf("[%ld] %s WDONE name=%s status=%d\n", now, this->logname.c_str(),
+        e->name.c_str(), (int)r->get_resp_status());
+
+    this->traces.assert(
+        (int)r->get_resp_status() == (e->expect_status ? (int)vp::IO_RESP_INVALID
+                                                       : (int)vp::IO_RESP_OK),
+        "inline write status %d != expected", (int)r->get_resp_status());
+    r->free();
+    if (this->streaming == bs)
+    {
+        this->streaming = nullptr;
+    }
+    delete[] bs->buffer;
+    delete bs;
+    this->outstanding--;
 }
 
 // Submit the next per-beat write request of the streaming burst. On DENY the
 // beat is held (re-sent synchronously from retry_handler); otherwise the pump
-// re-arms for the next beat one cycle later.
+// re-arms for the next beat one cycle later. GRANTED means the adapter
+// consumed and freed the beat — everything needed afterwards (size, last) is
+// snapshotted before req().
 void StubMaster::send_next_write_beat(BurstState *bs)
 {
     int64_t now = this->clock.get_cycles();
     BurstEntry *e = bs->entry;
     uint64_t off = bs->beats_sent_bytes;
     uint64_t beat = std::min<uint64_t>(e->size - off, (uint64_t)this->beat_width);
+    bool last = (off + beat >= e->size);
 
-    vp::IoReq *r = new vp::IoReq(e->base_addr + off, bs->buffer + off, beat, true);
+    // Size-0-pool beat, data aliasing our buffer; the same initiator on every
+    // beat of the burst (contract requirement).
+    vp::IoReq *r = this->req_pool->alloc();
     r->prepare();
+    r->set_addr(e->base_addr + off);
+    r->set_data(bs->buffer + off);
+    r->set_size(beat);
+    r->set_opcode(vp::WRITE);
     r->is_first = (off == 0);
-    r->is_last = (off + beat >= e->size);
+    r->is_last = last;
     r->burst_id = e->burst_id;
     r->initiator = bs;
-    bs->own_beats.insert(r);
 
     printf("[%ld] %s WBEAT name=%s addr=0x%lx size=%lu first=%d last=%d\n",
-        now, this->logname.c_str(), e->name.c_str(), r->get_addr(), beat,
-        r->is_first ? 1 : 0, r->is_last ? 1 : 0);
+        now, this->logname.c_str(), e->name.c_str(), (unsigned long)(e->base_addr + off),
+        beat, off == 0 ? 1 : 0, last ? 1 : 0);
 
     vp::IoReqStatus st = this->out.req(r);
 
@@ -272,13 +351,21 @@ void StubMaster::send_next_write_beat(BurstState *bs)
         bs->held_beat = r;
         return;
     }
+    if (st == vp::IO_REQ_DONE)
+    {
+        // Inline burst ack — only legal on the last beat. We keep our beat.
+        this->traces.assert(last, "inline DONE on a non-last write beat");
+        this->complete_write_inline(bs, r);
+        return;
+    }
     this->traces.assert(st == vp::IO_REQ_GRANTED,
-        "adapter must return GRANTED or DENIED for a write beat (got %d)", (int)st);
+        "unexpected req() status for a write beat (got %d)", (int)st);
 
+    // Beat consumed downstream — forget it.
     bs->beats_sent_bytes += beat;
     if (bs->beats_sent_bytes >= e->size)
     {
-        this->streaming = nullptr;   // all beats submitted; acks still pending
+        this->streaming = nullptr;   // all beats submitted; the ack is pending
     }
     else
     {
@@ -395,36 +482,28 @@ vp::IoRespAck StubMaster::resp_handler(vp::Block *__this, vp::IoReq *req)
     bool last = req->is_last;
 
     // ---- Ownership (initiator-owned request convention) ----
-    // We own our requests and free them ourselves. Read responses are distinct
-    // allocator-backed objects the adapter produces — free each to its pool.
-    // Write acks round-trip our own object: the whole-burst descriptor (each of
-    // its ceil(size/width) acks reuses it), or, in beat mode, the matching
-    // per-beat request (freed on its single ack).
+    // Read responses are distinct allocator-backed objects the adapter
+    // produces — free each to its pool. A write burst gets exactly ONE resp:
+    // a distinct data-less pool ack (our own beats were consumed and freed by
+    // the adapter at GRANT time) — police its shape and free it.
     if (!e->is_write)
     {
         _this->traces.assert(req != bs->req,
             "our descriptor must never be round-tripped as a read beat");
         req->free();
     }
-    else if (e->write_beats)
-    {
-        auto it = bs->own_beats.find(req);
-        _this->traces.assert(it != bs->own_beats.end(),
-            "write ack must round-trip one of our own beat requests");
-        bs->own_beats.erase(it);
-        delete req;
-    }
     else
     {
-        _this->traces.assert(req == bs->req,
-            "write ack must round-trip our own descriptor");
+        _this->traces.assert(req->is_last && req->get_data() == NULL,
+            "write ack must be a data-less is_last beat");
+        req->free();
     }
 
     if (last)
     {
         _this->traces.assert(bs->beats_seen == bs->expected_beats,
             "got %d beats, expected %d", bs->beats_seen, bs->expected_beats);
-        delete bs->req;       // our whole-burst request (null in beat mode)
+        delete bs->req;       // read burst request (null for writes/beat mode)
         delete[] bs->buffer;
         delete bs;
         _this->outstanding--;
@@ -439,25 +518,37 @@ void StubMaster::retry_handler(vp::Block *__this, vp::IoRetryChannel)
     int64_t now = _this->clock.get_cycles();
 
     // A held per-beat write must be re-sent synchronously inside retry().
+    // Snapshot size/last before the re-send: on GRANTED the beat is gone.
     if (_this->streaming != nullptr && _this->streaming->held_beat != nullptr)
     {
         BurstState *bs = _this->streaming;
         vp::IoReq *r = bs->held_beat;
+        uint64_t sz = r->get_size();
+        bool last = r->is_last;
         vp::IoReqStatus st = _this->out.req(r);
-        if (st == vp::IO_REQ_GRANTED)
+        if (st == vp::IO_REQ_DENIED)
         {
-            printf("[%ld] %s REQRESUME name=%s\n", now, _this->logname.c_str(),
-                bs->entry->name.c_str());
-            bs->held_beat = nullptr;
-            bs->beats_sent_bytes += r->get_size();
-            if (bs->beats_sent_bytes >= bs->entry->size)
-            {
-                _this->streaming = nullptr;
-            }
-            else
-            {
-                _this->beat_pump_event.enqueue(1);
-            }
+            return;   // still refused; keep holding
+        }
+        printf("[%ld] %s REQRESUME name=%s\n", now, _this->logname.c_str(),
+            bs->entry->name.c_str());
+        bs->held_beat = nullptr;
+        if (st == vp::IO_REQ_DONE)
+        {
+            _this->traces.assert(last, "inline DONE on a non-last write beat");
+            _this->complete_write_inline(bs, r);
+            return;
+        }
+        _this->traces.assert(st == vp::IO_REQ_GRANTED,
+            "unexpected req() status on write-beat retry (got %d)", (int)st);
+        bs->beats_sent_bytes += sz;
+        if (bs->beats_sent_bytes >= bs->entry->size)
+        {
+            _this->streaming = nullptr;
+        }
+        else
+        {
+            _this->beat_pump_event.enqueue(1);
         }
         return;
     }
@@ -475,11 +566,24 @@ void StubMaster::retry_handler(vp::Block *__this, vp::IoRetryChannel)
             bs->entry->name.c_str());
         _this->req_held = nullptr;
         _this->outstanding++;
+        if (bs->entry->is_write)
+        {
+            // Consumed and freed by the adapter — forget the object.
+            bs->req = nullptr;
+        }
+    }
+    else if (st == vp::IO_REQ_DONE && bs->entry->is_write)
+    {
+        printf("[%ld] %s REQRESUME name=%s\n", now, _this->logname.c_str(),
+            bs->entry->name.c_str());
+        _this->req_held = nullptr;
+        _this->outstanding++;
+        _this->complete_write_inline(bs, bs->req);
     }
     else if (st != vp::IO_REQ_DENIED)
     {
         _this->traces.assert(false,
-            "adapter must return GRANTED or DENIED on retry (got %d)", (int)st);
+            "unexpected req() status on retry (got %d)", (int)st);
     }
 }
 

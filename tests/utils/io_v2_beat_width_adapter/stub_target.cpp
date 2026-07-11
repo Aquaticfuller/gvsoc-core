@@ -19,8 +19,13 @@
  *   WRITE: per-beat requests, each at most beat_width bytes (POLICED — this
  *          is exactly what the width adapter must guarantee). The payload is
  *          checked against the addr-derived pattern (POLICES the adapter's
- *          repacking). Acked inline (IO_REQ_DONE + latency annotation) or,
- *          with async_ack=true, via GRANTED + one resp() later.
+ *          repacking). Per-burst write acknowledgement (io_v2.hpp "Write
+ *          acknowledgement"): a non-last beat is consumed and freed (GRANTED,
+ *          no resp ever); the last beat is acked inline (IO_REQ_DONE + status
+ *          + latency annotation, the master keeps the beat) or, with
+ *          async_ack=true, consumed too (GRANTED) and answered later by ONE
+ *          data-less size-0-pool ack for the whole burst (the incoming beats
+ *          are payload-pool objects and must not be recycled as the ack).
  *
  * Request-path back-pressure: the first deny_count requests are DENIED and
  * retried retry_delay cycles later (logged DENY / RETRY).
@@ -59,7 +64,17 @@ private:
         int64_t burst_id;
     };
 
-    struct PendingAck { vp::IoReq *req; int64_t resp_cycle; };
+    // Snapshot of a completed write burst awaiting its single data-less ack
+    // (async_ack mode). The burst's beats are already consumed and freed; the
+    // ack object is drawn from the size-0 pool at send time.
+    struct PendingAck {
+        uint64_t addr;            // burst base address (informational)
+        uint64_t size;            // burst total bytes (informational)
+        int64_t burst_id;
+        void *initiator;
+        vp::IoRespStatus status;
+        int64_t resp_cycle;
+    };
 
     vp::IoSlave in;
     vp::ClockEvent stream_event;
@@ -67,6 +82,7 @@ private:
     vp::ClockEvent retry_event;
     vp::Trace trace;
     vp::IoReqAllocator *beat_allocator;
+    vp::IoReqAllocator *ack_allocator;
     std::string logname;
     int beat_width = 0;
     int64_t latency = 0;
@@ -82,6 +98,13 @@ private:
     // Consumer back-pressure: the refused beat, re-sent from resp_retry.
     vp::IoReq *held_beat = nullptr;
     uint64_t held_size = 0;
+    // Write burst under reception (per-burst ack bookkeeping).
+    bool wr_open = false;
+    uint64_t wr_base = 0;
+    uint64_t wr_bytes = 0;
+    int64_t wr_burst_id = -1;
+    void *wr_initiator = nullptr;
+    vp::IoRespStatus wr_status = vp::IO_RESP_OK;
 };
 
 StubTarget::StubTarget(vp::ComponentConf &config)
@@ -107,6 +130,7 @@ StubTarget::StubTarget(vp::ComponentConf &config)
     this->size = (uint64_t)this->get_js_config()->get_child_int("size");
 
     this->beat_allocator = vp::IoReqAllocator::get(this->beat_width);
+    this->ack_allocator = vp::IoReqAllocator::get(0);
 }
 
 void StubTarget::reset(bool active)
@@ -114,7 +138,9 @@ void StubTarget::reset(bool active)
     if (active)
     {
         this->streams.clear();
+        // Pure snapshots — the ack objects are only allocated at send time.
         this->pending_acks.clear();
+        this->wr_open = false;
         this->deny_remaining = this->deny_count_cfg;
         if (this->held_beat != nullptr)
         {
@@ -167,14 +193,63 @@ vp::IoReqStatus StubTarget::req_handler(vp::Block *__this, vp::IoReq *req)
             _this->traces.assert(d[i] == (uint8_t)((addr + i) & 0xff),
                 "write data mismatch at addr 0x%lx byte %lu", addr, i);
         }
-        req->set_resp_status(_this->error ? vp::IO_RESP_INVALID : vp::IO_RESP_OK);
+
+        // Per-burst write acknowledgement. We consume (and free) beats, so
+        // they must be pool-backed; all beats of one burst must carry the
+        // same initiator, and is_first must open the burst.
+        _this->traces.assert(req->allocator != nullptr,
+            "write beat is not allocator-backed (addr=0x%lx)", addr);
+        if (req->is_first)
+        {
+            _this->traces.assert(!_this->wr_open,
+                "write burst opened while another is still open (addr=0x%lx)",
+                addr);
+            _this->wr_open = true;
+            _this->wr_base = addr;
+            _this->wr_bytes = 0;
+            _this->wr_burst_id = req->burst_id;
+            _this->wr_initiator = req->initiator;
+            _this->wr_status = vp::IO_RESP_OK;
+        }
+        else
+        {
+            _this->traces.assert(_this->wr_open,
+                "write-burst continuation without an open burst (addr=0x%lx)",
+                addr);
+            _this->traces.assert(_this->wr_initiator == req->initiator,
+                "write beats of one burst must carry the same initiator");
+        }
+        _this->wr_bytes += sz;
+        if (_this->error)
+        {
+            _this->wr_status = vp::IO_RESP_INVALID;
+        }
+
+        if (!req->is_last)
+        {
+            // Non-last beat: consume and free it; no resp() ever fires for it.
+            req->free();
+            return vp::IO_REQ_GRANTED;
+        }
+
+        // Last beat: the burst closes here.
+        _this->wr_open = false;
         if (!_this->async_ack)
         {
+            // Inline burst ack: the master keeps its beat; final status and
+            // latency are annotated on it.
+            req->set_resp_status(_this->wr_status);
             req->inc_latency(_this->latency);
             return vp::IO_REQ_DONE;
         }
+        // GRANTED + one data-less ack later. Snapshot the burst before
+        // consuming the beat; the ack is drawn from the size-0 pool (this
+        // beat is a payload-pool object and must NOT be recycled as the ack).
         int64_t resp_cycle = now + std::max((int64_t)1, _this->latency);
-        _this->pending_acks.push_back({req, resp_cycle});
+        PendingAck ack{_this->wr_base, _this->wr_bytes, _this->wr_burst_id,
+                       _this->wr_initiator, _this->wr_status, resp_cycle};
+        req->free();
+        _this->pending_acks.push_back(ack);
         _this->ack_event.enqueue(resp_cycle - now);
         return vp::IO_REQ_GRANTED;
     }
@@ -302,11 +377,27 @@ void StubTarget::ack_event_handler(vp::Block *__this, vp::ClockEvent *event)
     while (!_this->pending_acks.empty()
            && _this->pending_acks.front().resp_cycle <= now)
     {
-        vp::IoReq *req = _this->pending_acks.front().req;
+        PendingAck a = _this->pending_acks.front();
         _this->pending_acks.pop_front();
+
+        // The burst's single data-less ack (io_v2.hpp "The write ack"): a
+        // size-0-pool object the consumer (the adapter) frees. data is
+        // caller-managed on that pool — set it NULL on every allocation.
+        vp::IoReq *ack = _this->ack_allocator->alloc();
+        ack->prepare();
+        ack->set_addr(a.addr);
+        ack->set_data(nullptr);
+        ack->set_size(a.size);
+        ack->set_opcode(vp::WRITE);
+        ack->is_first = true;
+        ack->is_last = true;
+        ack->burst_id = a.burst_id;
+        ack->set_resp_status(a.status);
+        ack->initiator = a.initiator;
+
         printf("[%ld] %s WACK addr=0x%lx size=%lu\n", now, _this->logname.c_str(),
-            req->get_addr(), (unsigned long)req->get_size());
-        _this->traces.assert(_this->in.resp(req) == vp::IO_RESP_ACCEPTED,
+            a.addr, (unsigned long)a.size);
+        _this->traces.assert(_this->in.resp(ack) == vp::IO_RESP_ACCEPTED,
             "the adapter must accept downstream write acks");
     }
 

@@ -27,9 +27,12 @@
 //   beats, deny when the unpacked backlog is full) -> schedule_read_beat ->
 //   fsm_handler -> emit_read_beat (-> upstream, 1/cycle).
 // WRITE flow: submit_write (chop/pack payload into output_width chunks,
-//   DENY upstream while the chunk backlog is full) -> issue_pending_chunks
-//   (1/cycle downstream) -> [ack] -> ack_chunk -> schedule_job_acks ->
-//   fsm_handler -> emit_ack (round-trip the upstream request, 1/cycle).
+//   free the consumed upstream beat, DENY upstream while the chunk backlog is
+//   full) -> issue_pending_chunks (1/cycle downstream, one framed downstream
+//   burst per upstream burst) -> complete_chunk (GRANTED: chunk consumed by
+//   the target; last-chunk DONE or [burst ack] in resp_handler) ->
+//   complete_write_burst -> fsm_handler -> emit_ack (ONE data-less size-0-pool
+//   ack per burst, freed by the upstream master).
 // ===========================================================================
 
 
@@ -94,16 +97,21 @@ void IoV2BeatWidthAdapter::free_read_burst(ReadBurst *burst)
     this->read_burst_pool.push_back(burst);
 }
 
-IoV2BeatWidthAdapter::WriteJob *IoV2BeatWidthAdapter::alloc_job()
+IoV2BeatWidthAdapter::WriteBurst *IoV2BeatWidthAdapter::alloc_write_burst()
 {
-    if (!this->job_pool.empty())
+    if (!this->write_burst_pool.empty())
     {
-        WriteJob *job = this->job_pool.back();
-        this->job_pool.pop_back();
-        *job = WriteJob{};
-        return job;
+        WriteBurst *burst = this->write_burst_pool.back();
+        this->write_burst_pool.pop_back();
+        *burst = WriteBurst{};
+        return burst;
     }
-    return new WriteJob();
+    return new WriteBurst();
+}
+
+void IoV2BeatWidthAdapter::free_write_burst(WriteBurst *burst)
+{
+    this->write_burst_pool.push_back(burst);
 }
 
 IoV2BeatWidthAdapter::WriteChunk *IoV2BeatWidthAdapter::alloc_chunk()
@@ -119,12 +127,12 @@ IoV2BeatWidthAdapter::WriteChunk *IoV2BeatWidthAdapter::alloc_chunk()
         chunk = new WriteChunk();
     }
     chunk->req = nullptr;
+    chunk->burst = nullptr;
     chunk->addr = 0;
     chunk->fill = 0;
     chunk->is_first = false;
     chunk->is_last = false;
     chunk->burst_id = -1;
-    chunk->segs.clear();
     return chunk;
 }
 
@@ -147,11 +155,17 @@ vp::IoReqStatus IoV2BeatWidthAdapter::req_handler(vp::Block *__this, vp::IoReq *
         req, req->get_addr(), req->get_size(), req->get_is_write() ? 1 : 0,
         req->is_first ? 1 : 0, req->is_last ? 1 : 0, (long)req->burst_id);
 
-    if (req->get_is_write())
+    if (req->get_opcode() == vp::READ)
     {
-        return self->submit_write(req);
+        return self->submit_read(req);
     }
-    return self->submit_read(req);
+    // The write rules are keyed on opcode == WRITE, not get_is_write():
+    // atomics carry response data and keep the classic round-trip — but the
+    // width adapter cannot chop/repack them, so they are not supported here.
+    self->traces.assert(req->get_opcode() == vp::WRITE,
+        "atomic opcodes are not supported by the beat width adapter (req=%p)",
+        req);
+    return self->submit_write(req);
 }
 
 
@@ -159,13 +173,27 @@ vp::IoRespAck IoV2BeatWidthAdapter::resp_handler(vp::Block *__this, vp::IoReq *r
 {
     auto *self = static_cast<IoV2BeatWidthAdapter *>(__this);
 
-    // Write ack: one of our own chunk objects round-tripped by the downstream.
-    if (req->get_is_write())
+    // The downstream burst's single write ack: a DISTINCT data-less object
+    // (never one of our own chunks — those were consumed and freed by the
+    // target), correlated back to the burst record via initiator, which we
+    // copied onto every chunk. We initiated the downstream burst, so we free
+    // the ack. Keyed on opcode == WRITE per the io_v2.hpp write-ack rules.
+    if (req->get_opcode() == vp::WRITE)
     {
-        WriteChunk *chunk = (WriteChunk *)req->initiator;
-        self->traces.assert(chunk != nullptr && chunk->req == req,
-            "write ack does not round-trip our own chunk (req=%p)", req);
-        self->ack_chunk(chunk, req->get_resp_status(), req->get_full_latency());
+        self->traces.assert(req->is_last && req->get_data() == NULL,
+            "write ack must be a data-less is_last beat (req=%p)", req);
+        WriteBurst *burst = (WriteBurst *)req->initiator;
+        self->traces.assert(burst != nullptr
+            && std::find(self->live_bursts.begin(), self->live_bursts.end(),
+                         burst) != self->live_bursts.end(),
+            "write ack does not correlate to a live burst (req=%p)", req);
+        if (req->get_resp_status() == vp::IO_RESP_INVALID)
+        {
+            burst->status = vp::IO_RESP_INVALID;
+        }
+        int64_t latency = req->get_full_latency();
+        req->free();
+        self->complete_write_burst(burst, latency);
         self->reschedule_fsm();
         return vp::IO_RESP_ACCEPTED;
     }
@@ -193,15 +221,7 @@ void IoV2BeatWidthAdapter::retry_handler(vp::Block *__this, vp::IoRetryChannel c
         {
             int64_t now = self->clock.get_cycles();
             if (self->chunk_issue_cursor < now) self->chunk_issue_cursor = now;
-            if (st == vp::IO_REQ_DONE)
-            {
-                self->ack_chunk(chunk, chunk->req->get_resp_status(),
-                                chunk->req->get_full_latency());
-            }
-            else
-            {
-                self->chunks_in_flight.push_back(chunk);
-            }
+            self->complete_chunk(chunk, st);
         }
         self->reschedule_fsm();
     }
@@ -467,7 +487,8 @@ vp::IoReqStatus IoV2BeatWidthAdapter::submit_write(vp::IoReq *req)
     // Bound the un-issued downstream chunk backlog (the write FIFO): once it
     // is full, a wide upstream writer is throttled to the downstream's
     // one-beat-per-cycle bandwidth. The master holds the request and re-sends
-    // it on the retry(WRITE) we raise once the backlog drains.
+    // it on the retry(WRITE) we raise once the backlog drains. Checked before
+    // any burst bookkeeping, so a DENY never needs a rollback.
     if (this->chunk_queue.size() >= this->write_chunk_limit)
     {
         this->trace.msg(vp::Trace::LEVEL_TRACE,
@@ -476,6 +497,11 @@ vp::IoReqStatus IoV2BeatWidthAdapter::submit_write(vp::IoReq *req)
         return vp::IO_REQ_DENIED;
     }
 
+    // We consume and free the beat below, so it must be pool-backed
+    // (io_v2.hpp "Request allocation").
+    this->traces.assert(req->allocator != nullptr,
+        "write beat is not allocator-backed (req=%p) — unported master", req);
+
     // Write beats of one burst arrive back-to-back (bursts do not interleave
     // on a link): a burst-opening request must not land while the previous
     // burst is still being packed.
@@ -483,65 +509,102 @@ vp::IoReqStatus IoV2BeatWidthAdapter::submit_write(vp::IoReq *req)
         "new write burst started while the previous one is still packing (req=%p)",
         req);
 
-    WriteJob *job = this->alloc_job();
-    job->up_req = req;
-    job->addr = req->get_addr();
-    job->size = req->get_size();
-    job->data = req->get_data();
-    job->burst_id = req->burst_id;
-    job->up_first = req->is_first;
-    job->up_last = req->is_last;
-    this->live_jobs.push_back(job);
-
-    if (job->size == 0)
+    // Per-burst record: opened by the is_first beat, submission-closed by the
+    // is_last beat. It survives the beats (which are freed at submit) until
+    // the downstream burst completes and the single upstream ack is scheduled.
+    if (req->is_first || this->open_burst == nullptr)
     {
-        // Degenerate zero-size write: one zero-size downstream chunk, acked by
-        // one zero-size upstream ack.
+        if (!req->is_first)
+        {
+            this->trace.force_warning(
+                "Write-burst continuation without an open burst (req=%p) — "
+                "opening one\n", req);
+        }
+        else if (this->open_burst != nullptr)
+        {
+            this->trace.force_warning(
+                "Write burst opened while another is still accepting beats "
+                "(req=%p)\n", req);
+        }
+        this->open_burst = this->alloc_write_burst();
+        this->open_burst->base_addr = req->get_addr();
+        this->open_burst->burst_id = req->burst_id;
+        this->open_burst->initiator = req->initiator;
+        this->live_bursts.push_back(this->open_burst);
+    }
+    WriteBurst *burst = this->open_burst;
+    this->traces.assert(burst->initiator == req->initiator,
+        "write beats of one burst must carry the same initiator (req=%p)", req);
+
+    // Snapshot everything before freeing the beat (ownership travels with it,
+    // buffer included).
+    uint64_t addr = req->get_addr();
+    uint64_t size = req->get_size();
+    uint8_t *data = req->get_data();
+    bool up_first = req->is_first;
+    bool up_last = req->is_last;
+    int64_t burst_id = req->burst_id;
+
+    burst->total += size;
+    if (up_last)
+    {
+        burst->last_seen = true;
+        // Submission-complete: the next is_first opens a fresh burst even
+        // while this one still awaits its downstream completion (pipelining).
+        this->open_burst = nullptr;
+    }
+
+    if (size == 0)
+    {
+        // Degenerate zero-size write beat: one zero-size downstream chunk,
+        // completing (when up_last) into one zero-size upstream ack.
         this->traces.assert(this->cur_chunk == nullptr,
             "zero-size write inside a packed burst (req=%p)", req);
         this->cur_chunk = this->alloc_chunk();
         this->cur_chunk->req = this->out_beat_allocator->alloc();
-        this->cur_chunk->addr = job->addr;
-        this->cur_chunk->is_first = job->up_first;
-        this->cur_chunk->burst_id = job->burst_id;
-        this->cur_chunk->segs.push_back(ChunkSeg{job, 0});
-        this->finish_chunk(job->up_last);
+        this->cur_chunk->burst = burst;
+        this->cur_chunk->addr = addr;
+        this->cur_chunk->is_first = up_first;
+        this->cur_chunk->burst_id = burst_id;
+        this->finish_chunk(up_last);
     }
 
     // Chop/pack the payload into output_width chunks. The chunk payload is
-    // copied (allocator co-allocated) so the upstream buffer may be recycled
-    // as soon as we ack it.
+    // copied (allocator co-allocated): upstream buffers are not contiguous
+    // across beats, so the general repack needs its own storage.
+    // TODO(follow-up): a chunk whose byte range lies entirely inside one
+    // upstream beat could alias that beat's buffer (holding the unfreed beat
+    // alive instead of freeing it here) and skip the copy.
     uint64_t off = 0;
-    while (off < job->size)
+    while (off < size)
     {
         if (this->cur_chunk == nullptr)
         {
             this->cur_chunk = this->alloc_chunk();
             this->cur_chunk->req = this->out_beat_allocator->alloc();
-            this->cur_chunk->addr = job->addr + off;
-            this->cur_chunk->is_first = job->up_first && off == 0;
-            this->cur_chunk->burst_id = job->burst_id;
+            this->cur_chunk->burst = burst;
+            this->cur_chunk->addr = addr + off;
+            this->cur_chunk->is_first = up_first && off == 0;
+            this->cur_chunk->burst_id = burst_id;
         }
         WriteChunk *chunk = this->cur_chunk;
-        uint64_t copy = std::min(job->size - off,
+        uint64_t copy = std::min(size - off,
                                  (uint64_t)this->output_width - chunk->fill);
-        memcpy(chunk->req->get_data() + chunk->fill, job->data + off, copy);
+        memcpy(chunk->req->get_data() + chunk->fill, data + off, copy);
         chunk->fill += copy;
         off += copy;
-        if (!chunk->segs.empty() && chunk->segs.back().job == job)
-        {
-            chunk->segs.back().bytes += copy;
-        }
-        else
-        {
-            chunk->segs.push_back(ChunkSeg{job, copy});
-        }
-        bool burst_ends_here = job->up_last && off == job->size;
+        bool burst_ends_here = up_last && off == size;
         if (chunk->fill == (uint64_t)this->output_width || burst_ends_here)
         {
             this->finish_chunk(burst_ends_here);
         }
     }
+
+    // The payload is copied into our chunks: the beat is fully consumed —
+    // take ownership and free it right here, non-last and last beats alike
+    // (the single burst ack is emitted from the size-0 pool, never by
+    // recycling a beat).
+    req->free();
 
     this->issue_pending_chunks();
     this->reschedule_fsm();
@@ -585,7 +648,10 @@ void IoV2BeatWidthAdapter::issue_pending_chunks()
     r->is_first = chunk->is_first;
     r->is_last = chunk->is_last;
     r->burst_id = chunk->burst_id;
-    r->initiator = chunk;
+    // Every chunk of one downstream burst carries the SAME initiator — the
+    // burst record — so the burst's single data-less ack correlates back to
+    // it (io_v2.hpp "The write ack").
+    r->initiator = chunk->burst;
 
     this->trace.msg(vp::Trace::LEVEL_TRACE,
         "Issue write chunk (chunk=%p, addr=0x%lx, size=%lu, first=%d, last=%d)\n",
@@ -601,133 +667,127 @@ void IoV2BeatWidthAdapter::issue_pending_chunks()
         this->held_chunk = chunk;
         return;
     }
-    if (st == vp::IO_REQ_DONE)
-    {
-        this->ack_chunk(chunk, r->get_resp_status(), r->get_full_latency());
-        return;
-    }
-    this->chunks_in_flight.push_back(chunk);
+    this->complete_chunk(chunk, st);
 }
 
 
-void IoV2BeatWidthAdapter::ack_chunk(WriteChunk *chunk, vp::IoRespStatus status,
-                                     int64_t latency_cycles)
+// Downstream outcome (GRANTED or DONE) of an issued chunk, per the per-burst
+// write-ack contract.
+void IoV2BeatWidthAdapter::complete_chunk(WriteChunk *chunk, vp::IoReqStatus st)
 {
-    auto it = std::find(this->chunks_in_flight.begin(),
-                        this->chunks_in_flight.end(), chunk);
-    if (it != this->chunks_in_flight.end())
+    WriteBurst *burst = chunk->burst;
+    vp::IoReq *r = chunk->req;
+
+    if (st == vp::IO_REQ_GRANTED)
     {
-        this->chunks_in_flight.erase(it);
+        // The target consumed the chunk and frees it. A non-last chunk gets
+        // no resp at all; the last chunk's burst ack arrives in resp_handler,
+        // correlated by initiator. Either way the wrapper is done.
+        chunk->req = nullptr;
+        this->free_chunk(chunk);
+        return;
     }
 
-    for (ChunkSeg &seg : chunk->segs)
+    // Inline DONE: ownership never transferred — the chunk req is still ours.
+    bool is_last = chunk->is_last;
+    int64_t latency = r->get_full_latency();
+    if (r->get_resp_status() == vp::IO_RESP_INVALID)
     {
-        if (status == vp::IO_RESP_INVALID)
-        {
-            seg.job->status = vp::IO_RESP_INVALID;
-        }
-        seg.job->bytes_acked += seg.bytes;
-        this->schedule_job_acks(seg.job, latency_cycles);
+        burst->status = vp::IO_RESP_INVALID;
     }
-
-    chunk->req->free();
+    else
+    {
+        // On a non-last chunk an inline DONE is only legal as the INVALID
+        // escape hatch (io_v2.hpp "Error escape hatch").
+        this->traces.assert(is_last,
+            "inline DONE with OK status on a non-last write chunk (req=%p)", r);
+    }
+    r->free();
     chunk->req = nullptr;
     this->free_chunk(chunk);
+
+    if (is_last)
+    {
+        // Inline burst completion: final status and latency taken from the
+        // last chunk itself.
+        this->complete_write_burst(burst, latency);
+    }
+    // Aborted burst (non-last INVALID DONE): simplest behavior — latch the
+    // error and keep issuing the remaining chunks; the single final ack
+    // carries INVALID.
 }
 
 
-void IoV2BeatWidthAdapter::schedule_job_acks(WriteJob *job, int64_t latency_cycles)
+// The whole downstream burst has completed (last-chunk inline DONE or the
+// downstream burst ack): schedule the SINGLE upstream ack.
+//
+// TIMING: this is the "final stride only" degradation described in the file
+// header — the pre-change per-stride schedule cannot be reconstructed (the
+// downstream chunk acks that drove it no longer exist), so the ack is
+// scheduled from the burst completion with the pre-existing per-ack
+// arithmetic: ready = now + max(1, latency), serialized on ack_cursor.
+void IoV2BeatWidthAdapter::complete_write_burst(WriteBurst *burst,
+                                                int64_t latency_cycles)
 {
     int64_t now = this->clock.get_cycles();
+    if (this->ack_cursor < now)
+        this->ack_cursor = now;
+    int64_t ready = now + std::max((int64_t)1, latency_cycles);
+    if (ready <= this->ack_cursor)
+        ready = this->ack_cursor + 1;
+    this->ack_cursor = ready;
 
-    auto push_ack = [&](uint64_t offset, uint64_t size, bool done)
+    this->ack_pending.push_back(PendingAck{
+        burst->base_addr, burst->total, burst->burst_id,
+        burst->initiator, burst->status, ready,
+    });
+
+    this->trace.msg(vp::Trace::LEVEL_TRACE,
+        "Write burst complete (addr=0x%lx, size=%lu, status=%d, ack_ready=%ld)\n",
+        burst->base_addr, burst->total, burst->status, (long)ready);
+
+    // Everything the ack needs is snapshotted — release the record.
+    auto it = std::find(this->live_bursts.begin(), this->live_bursts.end(),
+                        burst);
+    if (it != this->live_bursts.end())
     {
-        if (this->ack_cursor < now)
-            this->ack_cursor = now;
-        int64_t ready = now + std::max((int64_t)1, latency_cycles);
-        if (ready <= this->ack_cursor)
-            ready = this->ack_cursor + 1;
-        this->ack_cursor = ready;
-
-        this->ack_pending.push_back(PendingAck{
-            job, offset, size,
-            job->up_first && offset == 0,
-            job->up_last && offset + size >= job->size,
-            done,
-            ready,
-        });
-    };
-
-    if (job->size == 0)
-    {
-        if (!job->zero_ack_scheduled)
-        {
-            job->zero_ack_scheduled = true;
-            push_ack(0, 0, true);
-        }
-        return;
+        this->live_bursts.erase(it);
     }
+    this->free_write_burst(burst);
 
-    // Upstream acks land at input_width boundaries within the request, each
-    // once the covering downstream chunks are all acked.
-    while (job->acks_scheduled < job->size)
-    {
-        uint64_t stride = std::min<uint64_t>(job->size - job->acks_scheduled,
-                                             (uint64_t)this->input_width);
-        if (job->bytes_acked < job->acks_scheduled + stride)
-        {
-            break;
-        }
-        push_ack(job->acks_scheduled, stride,
-                 job->acks_scheduled + stride == job->size);
-        job->acks_scheduled += stride;
-    }
+    this->reschedule_fsm();
 }
 
 
 void IoV2BeatWidthAdapter::emit_ack(const PendingAck &ack)
 {
-    WriteJob *job = ack.job;
-    vp::IoReq *r = job->up_req;
-
-    // Round-trip the upstream master's own request as the ack, mutated per
-    // beat (write acks carry no payload transfer; data/addr are set for the
-    // master's convenience, per the family convention).
-    r->set_addr(job->addr + ack.offset);
-    r->set_data(job->data != nullptr ? job->data + ack.offset : nullptr);
+    // The single per-burst upstream ack: a distinct data-less object drawn
+    // from the size-0 pool (data is caller-managed there — set it NULL on
+    // every allocation). The upstream master consumes the status and frees
+    // it. addr/size carry the burst base/total, informational only.
+    vp::IoReq *r = this->desc_allocator->alloc();
+    r->prepare();
+    r->set_addr(ack.addr);
+    r->set_data(nullptr);
     r->set_size(ack.size);
-    r->burst_id = job->burst_id;
-    r->is_first = ack.is_first;
-    r->is_last = ack.is_last;
-    r->set_resp_status(job->status);
+    r->set_opcode(vp::WRITE);
+    r->is_first = true;
+    r->is_last = true;
+    r->burst_id = ack.burst_id;
+    r->set_resp_status(ack.status);
+    r->initiator = ack.initiator;
 
     this->trace.msg(vp::Trace::LEVEL_TRACE,
-        "Emit write ack (req=%p, offset=%lu, size=%lu, first=%d, last=%d)\n",
-        r, ack.offset, ack.size, ack.is_first ? 1 : 0, ack.is_last ? 1 : 0);
-
-    // Job bookkeeping is done before sending: a held/re-sent ack never
-    // touches the job again.
-    if (ack.job_done)
-    {
-        this->release_job(job);
-    }
+        "Emit write burst ack (ack=%p, addr=0x%lx, size=%lu, status=%d)\n",
+        r, ack.addr, ack.size, ack.status);
 
     if (this->in.resp(r) == vp::IO_RESP_DENIED)
     {
+        // Upstream busy: the ack is ours until accepted — hold it and re-send
+        // it on resp_retry.
         this->resp_held = true;
         this->held_req = r;
     }
-}
-
-
-void IoV2BeatWidthAdapter::release_job(WriteJob *job)
-{
-    auto it = std::find(this->live_jobs.begin(), this->live_jobs.end(), job);
-    if (it != this->live_jobs.end())
-    {
-        this->live_jobs.erase(it);
-    }
-    this->job_pool.push_back(job);
 }
 
 
@@ -917,8 +977,12 @@ void IoV2BeatWidthAdapter::reset(bool active)
     this->read_cursor = -1;
     this->dn_read_blocked = false;
 
-    // Write side: chunks (queued, in flight, held or under construction) are
-    // ours; jobs reference the master's own request, which is left alone.
+    // Write side: chunks queued, held or under construction are ours
+    // (payload pool) — free them. Chunks GRANTED downstream belong to the
+    // target (which frees them) and are no longer tracked here. The upstream
+    // beats were already consumed and freed at submit; only the parked burst
+    // records remain, and pending acks are pure snapshots (the ack object is
+    // only allocated at emit time).
     auto drop_chunk = [&](WriteChunk *chunk)
     {
         if (chunk->req != nullptr)
@@ -935,27 +999,26 @@ void IoV2BeatWidthAdapter::reset(bool active)
     }
     for (WriteChunk *chunk : this->chunk_queue) drop_chunk(chunk);
     this->chunk_queue.clear();
-    for (WriteChunk *chunk : this->chunks_in_flight) drop_chunk(chunk);
-    this->chunks_in_flight.clear();
     if (this->held_chunk != nullptr)
     {
         drop_chunk(this->held_chunk);
         this->held_chunk = nullptr;
     }
-    for (WriteJob *job : this->live_jobs)
+    for (WriteBurst *burst : this->live_bursts)
     {
-        this->job_pool.push_back(job);
+        this->free_write_burst(burst);
     }
-    this->live_jobs.clear();
+    this->live_bursts.clear();
+    this->open_burst = nullptr;
     this->ack_pending.clear();
     this->chunk_issue_cursor = -1;
     this->ack_cursor = -1;
     this->up_write_blocked = false;
 
-    // A held (back-pressured) upstream beat: a read beat is allocator-backed
-    // and ours — free it; a write ack is the master's own request.
-    if (this->resp_held && this->held_req != nullptr
-        && !this->held_req->get_is_write())
+    // A held (back-pressured) upstream beat is ours either way: a read beat
+    // is an allocator-backed sub-object and a write burst ack is our own
+    // size-0-pool object — free it.
+    if (this->resp_held && this->held_req != nullptr)
     {
         this->held_req->free();
     }

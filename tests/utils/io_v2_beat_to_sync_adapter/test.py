@@ -41,7 +41,8 @@ def build_case(case_name: str) -> dict:
         }
 
     if case_name == 'w_multi':
-        # 32 B write -> 4 write-ack beats, all round-tripping the master's req.
+        # 32 B write submitted as 4 allocator-backed beats -> ONE data-less
+        # burst ack (per-burst ack contract).
         return {
             'target': dict(latency=1),
             'schedule': [dict(cycle=10, addr=BASE, size=32, is_write=True,
@@ -85,11 +86,12 @@ def build_case(case_name: str) -> dict:
         }
 
     if case_name == 'bp_write':
-        # 32 B write -> 4 write-ack beats; back-pressure the first and last.
+        # 32 B write -> ONE data-less burst ack (per-burst ack contract);
+        # back-pressure it once.
         return {
             'target': dict(latency=1),
             'schedule': [dict(cycle=10, addr=BASE, size=32, is_write=True,
-                              deny_beats=[0, 3], retry_delay=2, name='w0')],
+                              deny_beats=[0], retry_delay=2, name='w0')],
         }
 
     if case_name == 'bp_last':

@@ -13,6 +13,12 @@
  *
  * "deny_then_done": returns DENIED for the first `deny_count` matching beats, then
  * behaves like "done". Useful for mid-burst stall tests.
+ *
+ * With the `native_beat` property set the target implements the native
+ * beat-slave write contract (io_v2.hpp, "Write acknowledgement"): non-last
+ * write beats are consumed and freed (GRANTED, never resp()'d); the last
+ * beat answers inline DONE ("done" rules) or GRANTED plus one deferred
+ * data-less burst ack recycled from the consumed beat ("granted" rules).
  */
 
 #include <vp/vp.hpp>
@@ -52,6 +58,10 @@ private:
     vp::Trace trace;
     std::vector<Rule> rules;
     std::string logname;
+    bool native_beat = false;
+    // Native mode: payload bytes accumulated over the current write burst,
+    // reported (informationally) on the burst ack.
+    uint64_t wr_bytes = 0;
 
     struct Pending { vp::IoReq *req; int64_t due_cycle; };
     std::deque<Pending> pending_resps;
@@ -69,6 +79,7 @@ StubTarget::StubTarget(vp::ComponentConf &config)
 
     this->logname = this->get_js_config()->get_child_str("logname");
     if (this->logname.empty()) this->logname = this->get_name();
+    this->native_beat = this->get_js_config()->get_child_int("native_beat") != 0;
 
     js::Config *rules_cfg = this->get_js_config()->get("rules");
     if (rules_cfg != NULL)
@@ -124,6 +135,52 @@ vp::IoReqStatus StubTarget::req_handler(vp::Block *__this, vp::IoReq *req)
     else if (b == Behavior::DENY_THEN_GRANTED)
     {
         b = (r->deny_count > 0) ? (r->deny_count--, Behavior::DENIED) : Behavior::GRANTED;
+    }
+
+    // Native beat-target write contract (per-burst ack).
+    if (_this->native_beat && req->get_opcode() == vp::WRITE
+        && b != Behavior::DENIED && b != Behavior::DONE_INVALID)
+    {
+        _this->traces.assert(req->allocator != nullptr,
+            "native beat target got a non-pooled write beat (req=%p)", req);
+        if (req->is_first)
+        {
+            _this->wr_bytes = 0;
+        }
+        _this->wr_bytes += req->get_size();
+
+        if (!req->is_last)
+        {
+            // Consume and free; no resp ever for a non-last beat.
+            req->free();
+            return vp::IO_REQ_GRANTED;
+        }
+        if (b == Behavior::DONE)
+        {
+            // Inline burst ack: status on the beat, caller keeps it.
+            req->set_resp_status(vp::IO_RESP_OK);
+            return vp::IO_REQ_DONE;
+        }
+        // GRANTED: consume the last beat too and recycle it as the deferred
+        // data-less burst ack.
+        uint64_t total = _this->wr_bytes;
+        int64_t due = now + (r ? r->resp_delay : 0);
+        req->prepare();
+        req->set_data(nullptr);
+        req->set_size(total);
+        req->is_first = true;
+        req->is_last = true;
+        req->set_resp_status(vp::IO_RESP_OK);
+        Pending p{req, due};
+        auto it = _this->pending_resps.begin();
+        while (it != _this->pending_resps.end() && it->due_cycle <= due) ++it;
+        _this->pending_resps.insert(it, p);
+        int64_t head_due = _this->pending_resps.front().due_cycle;
+        int64_t delta = head_due - now;
+        if (delta <= 0) delta = 1;
+        if (_this->resp_event.is_enqueued()) _this->resp_event.cancel();
+        _this->resp_event.enqueue(delta);
+        return vp::IO_REQ_GRANTED;
     }
 
     switch (b)

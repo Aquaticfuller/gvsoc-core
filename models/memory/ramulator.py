@@ -108,7 +108,10 @@ class Ramulator(st.Component):
         ``IO_REQ_GRANTED`` and streams the response back as per-cycle beats (one
         ``beat_width`` slice per cycle, with ``is_first`` / ``is_last`` /
         ``burst_id`` set) as Ramulator completes the underlying DRAM
-        transactions. Writes are stored and acknowledged synchronously.
+        transactions. Write beats are consumed and freed at submit and the
+        burst is acknowledged once, with a single data-less ack that fires
+        after the same per-request DRAM pacing the per-beat ack stream had
+        (io_v2 per-burst write acknowledgement).
         """
         return st.SlaveItf(self, 'input',
                            signature=gvsoc.signature.IoV2Beat(self.beat_width))

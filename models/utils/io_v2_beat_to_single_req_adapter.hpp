@@ -35,9 +35,19 @@
  *   Contrast IoV2BeatAdapter, which is OOO-defensive (it serves IoV2BigPacket
  *   slaves that may legitimately reorder) and so reassembles per beat.
  *
- * Write path — unchanged from the general adapter: the whole write is forwarded
- * as one request and the single-beat response is spread into the per-beat
- * resp() stream by schedule_chunk() (queue) + emit_write_beat() (per-beat cursor).
+ * Write path — WRITES are acknowledged once per burst (AXI B-channel semantics,
+ * see io_v2.hpp "Write acknowledgement"). The adapter is the consumer of the
+ * master's allocator-backed write beats: each upstream beat is forwarded as its
+ * own downstream single-req request (single-beat framing — the single-req plane
+ * round-trips the object and never frees it); once a beat's downstream leg
+ * completes the adapter frees it (or parks it for recycling as the ack if it is
+ * the burst's last beat) and, when the whole burst has completed, emits a single
+ * data-less ack upstream. The per-beat ack-scheduling machinery
+ * (schedule_chunk() queue + emit_write_beat() cursor, first_ready/step pacing)
+ * is kept byte-for-byte as silent ticks (virtual acks), so the single real ack
+ * fires on exactly the cycle the last per-beat ack fired before the protocol
+ * change. Atomic opcodes (opcode != WRITE) are exempt: they carry response
+ * data, so they keep the classic round-trip of the master's own request.
  *
  * SingleReq contract checks (asserts/debug builds): each forwarded request is
  * answered by exactly one single-beat response covering its whole size, and read
@@ -48,27 +58,33 @@
  *   - submit() (the IoSlave "input" port's req callback) returns IO_REQ_GRANTED
  *     or IO_REQ_DENIED — never IO_REQ_DONE. An inline DONE from the downstream
  *     slave is converted to a scheduled per-beat resp() stream.
- *   - For each accepted submission, the upstream master receives exactly
+ *   - For each accepted READ submission, the upstream master receives exactly
  *     ceil(total_size / beat_width) resp() calls in cumulative byte order,
  *     with is_first=true on the first call, is_last=true on the last, and
  *     size / addr / burst_id / status set per beat. Read beats carry their data
  *     in their allocator-provided payload (the burst request is data-less).
  *     addr is the per-beat start address (burst_addr + cumulative bytes).
+ *   - Each accepted WRITE burst is answered by exactly ONE resp(): a data-less,
+ *     allocator-backed ack (is_first = is_last = true, burst_id / initiator
+ *     copied from the beats, status = the burst's OR-latched final status),
+ *     recycling the burst's consumed last beat as the ack object.
  *   - Per-beat ready cycle honours the slave's req->get_full_latency(): the LAST
- *     beat lands at now+latency so a bandwidth annotation is not double-counted
- *     by the per-beat spread.
+ *     (or only real) beat lands at now+latency so a bandwidth annotation is not
+ *     double-counted by the per-beat spread.
  *
  * Ownership (initiator-owned request convention): the upstream master owns its
- * burst request for the whole transaction and frees it itself (typically on the
- * last response); the adapter NEVER frees it. Each read beat delivered upstream is
- * a distinct allocator-backed object (IoReqAllocator, payload co-allocated) that
- * the master copies out of and frees with req->free() as it consumes it — the
- * master's request is never round-tripped as a read beat, even for a single-beat
- * read. (Writes still round-trip the master's own request as the single ack, which
- * the master frees/recycles as its own object.) Correlation back to the master's
- * per-request state is via req->initiator, copied onto every beat, not via object
- * identity — a beat master (e.g. the FloONoc NI) must therefore correlate by
- * req->initiator, not by assuming the response object is the one it sent.
+ * READ burst request for the whole transaction and frees it itself (typically on
+ * the last response); the adapter NEVER frees it. Each read beat delivered
+ * upstream is a distinct allocator-backed object (IoReqAllocator, payload
+ * co-allocated) that the master copies out of and frees with req->free() as it
+ * consumes it — the master's request is never round-tripped as a read beat, even
+ * for a single-beat read. WRITE beats travel the other way: the master's
+ * allocator-backed beats are consumed and freed by the adapter (ownership
+ * transfers on GRANTED, buffer included), and the initiator frees the single
+ * burst ack it receives. Correlation back to the master's per-request state is
+ * via req->initiator, copied onto every beat, not via object identity — a beat
+ * master (e.g. the FloONoc NI) must therefore correlate by req->initiator, not
+ * by assuming the response object is the one it sent.
  *
  * No public Handler API: the file is a private header for the component
  * implementation. The framework auto-inserts the component during the
@@ -107,34 +123,63 @@ public:
 private:
     vp::DebugMemIf *resolve_debug_mem();
 
-    // An accepted WRITE burst awaiting its ack-beat stream. The slave answers the
-    // whole write with a single response; we turn that into the per-beat ack stream
-    // the upstream beat master expects — but, like the read path, NOTHING is
-    // pre-expanded: each ack beat is generated on the fly from emitted_beats when
-    // its modeled ready cycle arrives (the HW holds the burst and emits one beat
-    // per cycle from a counter). Beat i is due at first_ready + i*step (step = the
-    // slave's per-beat time, so the last beat lands at the response's full latency).
+    // One upstream write burst in flight. Opened by the is_first beat,
+    // submission-closed by the is_last beat (last_seen), deleted when every
+    // beat has completed downstream and the ack stream has been scheduled.
     struct WriteBurst
     {
-        vp::IoReq *up_req;        // master write req, round-tripped as each ack beat
-        uint8_t   *base_data;     // snapshot of req->data (initiator buffer)
-        uint64_t   base_addr;     // snapshot of req->addr at submit time
-        uint64_t   total_size;
-        int64_t    burst_id;
-        vp::IoRespStatus status;
-        int        nb_beats;      // total==0 ? 1 : ceil(total/beat_width)
-        int        emitted_beats; // running cursor: beats already sent upstream
-        int64_t    first_ready;   // ready cycle of beat 0
-        int64_t    step;          // cycles between consecutive ack beats
+        bool last_seen = false;   // the is_last beat has been submitted
+        uint64_t total = 0;       // bytes submitted so far (final once last_seen)
+        uint64_t completed = 0;   // bytes whose downstream leg completed
+        uint64_t base_addr = 0;
+        int64_t burst_id = -1;    // snapshot from the opening beat
+        void *initiator = nullptr;
+        vp::IoRespStatus status = vp::IO_RESP_OK;
+        // The burst's is_last beat, parked at its downstream completion for
+        // recycling as the upstream ack (data-less, size-0-pool object).
+        vp::IoReq *last_beat = nullptr;
     };
 
-    // Per-in-flight WRITE-request progress, keyed by the upstream IoReq*. Alive
-    // from submit() until cumulative bytes routed reach total_size.
+    // The scheduled ack stream of one completed downstream write leg. This is
+    // the pre-burst-ack per-beat ack machinery kept as-is: each entry is
+    // generated on the fly from emitted_beats when its modeled ready cycle
+    // arrives — beat i is due at first_ready + i*step (step = the slave's
+    // per-beat time, so the last beat lands at the response's full latency).
+    // All entries are SILENT virtual acks (they only advance the cursor)
+    // except the final one of the stream that closes the burst, which emits
+    // the single recycled data-less burst ack — on exactly the cycle the last
+    // per-beat ack fired before the per-burst-ack protocol change. An atomic
+    // (classic round-trip) rides the same channel as a 1-beat stream whose
+    // final entry round-trips the master's own request.
+    struct WriteAckStream
+    {
+        int        nb_beats;      // size==0 ? 1 : ceil(size/beat_width)
+        int        emitted_beats; // running cursor: entries already consumed
+        int64_t    first_ready;   // ready cycle of entry 0
+        int64_t    step;          // cycles between consecutive entries
+        bool       closes_burst;  // final entry emits the real burst ack
+        bool       is_atomic;     // final entry round-trips the master's req
+        // Final-entry payload: the recycled last beat (closes_burst), the
+        // master's own request (is_atomic), or nullptr (all-silent stream).
+        vp::IoReq *ack;
+        // Burst ack fields, snapshot when the burst closed.
+        uint64_t   ack_addr;      // burst base address
+        uint64_t   ack_size;      // burst total byte count
+        int64_t    ack_burst_id;
+        vp::IoRespStatus ack_status;
+        void      *ack_initiator;
+    };
+
+    // Per-in-flight WRITE/atomic-request progress, keyed by the upstream
+    // IoReq*. Alive from submit() until cumulative bytes routed reach
+    // total_size.
     struct InFlight
     {
         uint64_t total_size;
         uint64_t bytes_routed;
         uint64_t burst_addr;      // snapshot of req->addr at submit time
+        bool burst_last;          // snapshot of req->is_last at submit time
+        WriteBurst *burst;        // owning burst record (nullptr for atomics)
     };
 
     // An accepted read burst, alive from accept until its last response has been
@@ -174,10 +219,10 @@ private:
     void reschedule_fsm();
 
     // Write path.
-    void schedule_chunk(vp::IoReq *req, uint8_t *data, uint64_t size,
-                        int64_t latency_cycles);
-    // Emit the front write burst's next ack beat (generated from its cursor).
-    void emit_write_beat(WriteBurst &b);
+    void schedule_chunk(vp::IoReq *req, uint64_t size, int64_t latency_cycles);
+    // Consume the front ack stream's next entry (generated from its cursor):
+    // silent tick, or the burst-final real ack.
+    void emit_write_beat(WriteAckStream &b);
 
     // Read path.
     bool issue_one_sub_read();
@@ -203,12 +248,17 @@ private:
     vp::IoMaster out;
     vp::ClockEvent fsm_event;
 
-    // WRITE bursts awaiting their ack-beat stream, drained FIFO from the front;
-    // each beat is generated on the fly from the front burst's cursor.
-    std::deque<WriteBurst> write_bursts;
+    // Scheduled write-ack streams (mostly silent ticks), drained FIFO from the
+    // front; each entry is generated on the fly from the front stream's cursor.
+    std::deque<WriteAckStream> ack_streams;
     // READ beats awaiting their ready cycle (the sub-read objects themselves).
     std::deque<ReadyBeat> read_pending;
     std::unordered_map<vp::IoReq *, InFlight> in_flight;
+    // The write burst currently accepting beats (nullptr between bursts:
+    // after an is_last submission and before the next is_first). Bursts may
+    // pipeline — several may await completion — but their beats never
+    // interleave on one binding, so a single open slot suffices.
+    WriteBurst *open_wr_burst = nullptr;
 
     // Ready cycle of the last read beat scheduled so far, so the read channel never
     // exceeds one beat per cycle while still letting a read and a write proceed in
@@ -257,15 +307,17 @@ private:
 
     // Response-path back-pressure: the upstream master refused our most recent
     // resp() beat. We hold that exact object and re-send it from
-    // resp_retry_in_handler. The adapter frees nothing (the initiator owns its
-    // request and the response objects). When the held beat finally lands we need
-    // to advance the right cursor: held_write means it is the front write burst's
-    // current ack beat (advance emitted_beats, pop if last); held_read_last means
-    // it is a read burst's last beat (release the in-flight slot).
+    // resp_retry_in_handler. When the held beat finally lands we need to
+    // advance the right cursor: held_write means it is the front ack stream's
+    // final entry (advance emitted_beats, pop the stream); held_read_last
+    // means it is a read burst's last beat (release the in-flight slot).
+    // held_ack_owned distinguishes, for reset(), an adapter-owned recycled
+    // burst ack (freed) from a master-owned atomic round-trip (left alone).
     bool resp_held = false;
     vp::IoReq *held_req = nullptr;
     bool held_read_last = false;
     bool held_write = false;
+    bool held_ack_owned = false;
 
     vp::Trace trace;
 };

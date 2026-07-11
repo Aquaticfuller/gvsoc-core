@@ -18,7 +18,8 @@
  * duration) is annotated, and IO_RESP_INVALID can be reported. It POLICES the
  * adapter with traces.assert: every request it receives is a single beat
  * (is_first && is_last — the adapter chops reads into beat-sized sub-reads and
- * forwards whole writes), addressed within range.
+ * forwards each write beat as its own single-beat request), addressed within
+ * range.
  *
  * Config keys: latency, duration, error(bool), async_resp(bool), deny_count,
  * retry_delay, base, size, logname.
@@ -125,8 +126,9 @@ vp::IoReqStatus StubTarget::req_handler(vp::Block *__this, vp::IoReq *req)
         req->is_first ? 1 : 0, req->is_last ? 1 : 0, (long)req->burst_id);
 
     // ---- Protocol assertions (the adapter behaves correctly) ----
-    // The adapter chops reads into beat-sized sub-reads and forwards writes as a
-    // single request, so a single-req slave always sees one single-beat access.
+    // The adapter chops reads into beat-sized sub-reads and forwards each write
+    // beat as its own single-beat request, so a single-req slave always sees
+    // one single-beat access.
     _this->traces.assert(req->is_first && req->is_last,
         "single-req slave must receive single-beat requests (first=%d last=%d)",
         req->is_first ? 1 : 0, req->is_last ? 1 : 0);

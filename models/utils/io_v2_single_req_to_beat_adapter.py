@@ -30,8 +30,11 @@ identity contract). Because a single-req master carries its per-request state
 itself, the adapter is stateless on the flow-control axis: any number of
 accesses may be outstanding concurrently (no single-outstanding serialisation
 like the collapse adapter), downstream DENYs propagate straight upstream and
-retries are forwarded as-is. Writes and atomics are forwarded as the master's
-own object, which legitimately round-trips as the ack.
+retries are forwarded as-is. Pure writes are forwarded as size-0 pool beats
+aliasing the master's payload (the beat target consumes and frees them; the
+burst's single data-less ack resolves the access — per-burst write
+acknowledgement, see io_v2.hpp); atomics are forwarded as the master's own
+object, which keeps the classic round-trip as the ack.
 """
 
 from config_tree import Config, cfg_field

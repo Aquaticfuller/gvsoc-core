@@ -20,11 +20,30 @@
  * io_v2 on the output port: IO_REQ_DONE/GRANTED/DENIED, retry() handshake,
  * no arg-stack. The control wire interface is identical to v1 and reuses the
  * v1 TrafficGenerator* types from generator.hpp (which does not include io.hpp).
+ *
+ * The output port is IoV2Any(beat_tolerant=True): it binds beat slaves RAW,
+ * so the generator is a beat-plane write master and follows the per-burst
+ * write-acknowledgement contract (io_v2.hpp "Write acknowledgement" +
+ * "Request allocation"):
+ *   - every outgoing request is drawn from the shared size-0 IoReqAllocator
+ *     pool (write beats cross a consumer-frees boundary on beat planes);
+ *   - a GRANTED write transfers ownership of the object (buffer included) to
+ *     the target, which consumes and frees it — the generator forgets the
+ *     pointer at GRANT and never dereferences it again;
+ *   - the burst (always submitted as a one-beat burst, is_first=is_last=true)
+ *     is acknowledged exactly once, either inline (IO_REQ_DONE) or with a
+ *     single data-less ack via resp() that the generator frees;
+ *   - correlation is by req->initiator, which carries a per-transfer
+ *     TransferRecord (beat slaves copy it onto their response beats/acks) —
+ *     never by object identity, since a consumed write beat may be recycled
+ *     (even as the ack itself) while its burst is still in flight.
+ * On non-beat (round-trip) planes the same objects simply come back through
+ * resp()/DONE and are freed by the generator, so one code path serves both.
  */
 
 #include <cstring>
 #include <stdexcept>
-#include <unordered_map>
+#include <unordered_set>
 #include <vp/vp.hpp>
 #include <vp/signal.hpp>
 #include <vp/itf/io_v2.hpp>
@@ -41,6 +60,25 @@ public:
     uint8_t *data;
 };
 
+// Per-in-flight-request record. It is the initiator handle carried by
+// req->initiator (and copied by beat slaves onto their distinct response
+// beats / burst acks), the read fill cursor, and — recycled through the
+// free_reqs queue — the outstanding-window token that paces the generator
+// (nb_pending_reqs) exactly as the embedded request objects did before the
+// pool port.
+class TransferRecord : public vp::QueueElem
+{
+public:
+    // Our pool-backed request. Forgotten (nullptr) as soon as ownership is
+    // gone: at GRANT for writes (the target frees it), at completion
+    // otherwise. Never dereferenced after that point.
+    vp::IoReq *req = nullptr;
+    uint8_t *data = nullptr;   // destination buffer slice (reads)
+    uint64_t size = 0;         // bytes covered by this request
+    uint64_t fill = 0;         // fill cursor for distinct read response beats
+    bool is_write = false;
+};
+
 class GeneratorV2 : public vp::Component, TrafficGenerator
 {
 public:
@@ -48,12 +86,13 @@ public:
     ~GeneratorV2();
 
 private:
+    void reset(bool active) override;
     void start_transfer() override;
     static void retry_meth(vp::Block *__this, vp::IoRetryChannel);
     static vp::IoRespAck response(vp::Block *__this, vp::IoReq *req);
     static void control_sync(vp::Block *__this, TrafficGeneratorConfig *config);
     static void fsm_handler(vp::Block *__this, vp::ClockEvent *event);
-    void handle_req_end(vp::IoReq *req, int64_t latency = 0);
+    void handle_req_end(TransferRecord *rec, int64_t latency = 0);
     void handle_step();
     void handle_transfer();
     void handle_post_transfer();
@@ -82,9 +121,14 @@ private:
     int64_t last_req_cyclestamp = 0;
 
     int nb_pending_reqs;
-    // Per-in-flight-request fill cursor for distinct read response beats
-    // (initiator-owned convention). Keyed by our own request object.
-    std::unordered_map<vp::IoReq *, uint64_t> fill_offset;
+    // Shared size-0 pool serving every outgoing request (fetched once at
+    // construction). data is caller-managed on this pool: set on every
+    // allocation.
+    vp::IoReqAllocator *req_allocator;
+    // Records of transfers currently in flight, for reset-time reclamation
+    // of the pool objects we still own.
+    std::unordered_set<TransferRecord *> outstanding;
+    // Recycled TransferRecord tokens (outstanding-window pacing).
     vp::Queue free_reqs;
     std::queue<TransferV2 *> transfers;
     TransferV2 *current_transfer = NULL;
@@ -135,6 +179,33 @@ GeneratorV2::GeneratorV2(vp::ComponentConf &config)
 
     this->nb_pending_reqs = this->get_js_config()->get_int("nb_pending_reqs");
     this->max_burst_size = this->get_js_config()->get_uint("max_burst_size");
+
+    // Requests cross consumer-frees boundaries on beat planes (write beats
+    // freed by the target, acks freed by us), so they must be pool-backed.
+    this->req_allocator = vp::IoReqAllocator::get(0);
+}
+
+void GeneratorV2::reset(bool active)
+{
+    if (active)
+    {
+        // Free the pool objects we still own: a DENIED-held request (never
+        // accepted by the slave) and the read descriptors of in-flight
+        // transfers (initiator-owned). Write requests granted away are the
+        // target's to free — their record's req pointer was already
+        // forgotten at GRANT, so it is never touched here. The records
+        // themselves follow the pre-existing start/end lifecycle.
+        for (TransferRecord *rec : this->outstanding)
+        {
+            if (rec->req != nullptr)
+            {
+                rec->req->free();
+                rec->req = nullptr;
+            }
+        }
+        this->outstanding.clear();
+        this->stalled_req = nullptr;
+    }
 }
 
 GeneratorV2::~GeneratorV2()
@@ -169,37 +240,65 @@ vp::IoRespAck GeneratorV2::response(vp::Block *__this, vp::IoReq *req)
     GeneratorV2 *_this = (GeneratorV2 *)__this;
     _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Received response (req: %p)\n", req);
 
-    // Big-packet master contract: tolerate all three response forms. A beat
-    // slave bound directly (e.g. the FlooNoC NI) answers a read with DISTINCT
-    // allocator-backed beats whose payload carries the data (initiator-owned
-    // convention); our own request comes back only for write acks and
-    // big-packet responses. Correlate by req->initiator (set at issue), copy
-    // each beat's payload into our buffer at the running fill cursor, free
-    // the beat, and complete our request on its last beat.
-    vp::IoReq *own = (vp::IoReq *)req->initiator;
-    if (own != req)
+    // Any-plane master contract: tolerate every response shape. Correlation
+    // is by req->initiator, which carries our per-transfer record (set at
+    // issue; beat slaves copy it onto their distinct response beats and onto
+    // the burst ack; round-trip planes preserve it on our own object) — never
+    // by object identity.
+    TransferRecord *rec = (TransferRecord *)req->initiator;
+
+    if (rec->is_write)
     {
-        // The fill cursor lives in our own map: remaining_size on the request
-        // is NOT ours to use — a slave (e.g. the FlooNoC NI) may use it for
-        // its own per-burst accounting on the very same object.
-        uint64_t &filled = _this->fill_offset[own];
-        if (!own->get_is_write() && req->get_size() > 0)
-        {
-            memcpy(own->get_data() + filled, req->get_data(), req->get_size());
-        }
-        filled += req->get_size();
-        bool last = req->is_last;
+        // Per-burst write ack (io_v2.hpp "Write acknowledgement"). Three
+        // shapes converge here:
+        //   - round-trip (non-beat) plane: our own object comes back;
+        //   - beat plane: a distinct data-less allocator-backed ack (the
+        //     object we sent is gone — the target consumed and freed it, so
+        //     rec->req was forgotten at GRANT and is not touched);
+        //   - beat plane, recycled: the target recycled our consumed beat as
+        //     the ack (same pointer — invisible by design).
+        // In all three the responded object now belongs to us: read the
+        // timing, free it, and complete the transfer.
+        _this->traces.assert(req->is_last,
+            "write burst acked with is_last == false (req=%p)", req);
         int64_t latency = req->get_latency();
         req->free();
-        if (last)
-        {
-            _this->fill_offset.erase(own);
-            _this->handle_req_end(own, latency);
-        }
+        _this->handle_req_end(rec, latency);
         return vp::IO_RESP_ACCEPTED;
     }
 
-    _this->handle_req_end(req, req->get_latency());
+    if (req == rec->req)
+    {
+        // Big-packet read response: our own object round-tripped and the
+        // slave filled our buffer in place. Recycle it to its pool.
+        int64_t latency = req->get_latency();
+        rec->req = nullptr;
+        req->free();
+        _this->handle_req_end(rec, latency);
+        return vp::IO_RESP_ACCEPTED;
+    }
+
+    // Distinct read response beat (initiator-owned convention, e.g. from the
+    // FlooNoC NI): copy the payload into our buffer at the record's fill
+    // cursor and free the beat. On the last beat, also free our own read
+    // descriptor — the initiator owns it, the slave never frees it — and
+    // complete the transfer. (The cursor lives in the record: remaining_size
+    // on the request is NOT ours to use — a slave may claim it for its own
+    // per-burst accounting on the very same object.)
+    if (req->get_size() > 0)
+    {
+        memcpy(rec->data + rec->fill, req->get_data(), req->get_size());
+    }
+    rec->fill += req->get_size();
+    bool last = req->is_last;
+    int64_t latency = req->get_latency();
+    req->free();
+    if (last)
+    {
+        rec->req->free();
+        rec->req = nullptr;
+        _this->handle_req_end(rec, latency);
+    }
     return vp::IO_RESP_ACCEPTED;
 }
 
@@ -228,8 +327,9 @@ void GeneratorV2::control_sync(vp::Block *__this, TrafficGeneratorConfig *config
 
         for (int i = 0; i < _this->nb_pending_reqs; i++)
         {
-            vp::IoReq *req = new vp::IoReq();
-            _this->free_reqs.push_back(req);
+            // Window tokens only: the request objects themselves are drawn
+            // from the shared pool at send time (see fsm_handler).
+            _this->free_reqs.push_back(new TransferRecord());
         }
 
         if (config->check)
@@ -388,8 +488,8 @@ void GeneratorV2::handle_end()
 
     for (int i = 0; i < this->nb_pending_reqs; i++)
     {
-        vp::IoReq *req = (vp::IoReq *)this->free_reqs.pop();
-        delete req;
+        TransferRecord *rec = (TransferRecord *)this->free_reqs.pop();
+        delete rec;
     }
 
     this->close_transfer();
@@ -408,6 +508,11 @@ void GeneratorV2::close_transfer()
 
 void GeneratorV2::try_send(vp::IoReq *req)
 {
+    // Snapshot the record BEFORE sending: a GRANTED write transfers
+    // ownership of the object to the target, which may free it synchronously
+    // inside req() — no field may be read after that point.
+    TransferRecord *rec = (TransferRecord *)req->initiator;
+
     this->signal_req_addr.set_and_release(req->get_addr());
     this->signal_req_size.set_and_release(req->get_size());
     this->signal_req_is_write.set_and_release(req->get_is_write());
@@ -416,18 +521,32 @@ void GeneratorV2::try_send(vp::IoReq *req)
 
     if (status == vp::IO_REQ_DENIED)
     {
-        // v2 deny: hold the req; we'll resend on retry().
+        // v2 deny: ownership stays with us — hold the req; we'll resend on
+        // retry().
         this->stalled = true;
         this->stalled_req = req;
     }
     else if (status == vp::IO_REQ_GRANTED)
     {
+        if (rec->is_write)
+        {
+            // Write beat granted: ownership (buffer included) went with it.
+            // On a beat plane the target consumes and frees it; on a
+            // round-trip plane it comes back through response(). Either way,
+            // forget the pointer — nothing may dereference it after GRANT.
+            rec->req = nullptr;
+        }
         this->fsm_event.enqueue();
     }
     else
     {
-        // IO_REQ_DONE: response is already complete in this call.
-        this->handle_req_end(req, req->get_latency() - 1);
+        // IO_REQ_DONE: inline completion (for a write, the inline burst
+        // ack) — we keep the object; recycle it to its pool and complete the
+        // transfer with the inline status/latency.
+        int64_t latency = req->get_latency() - 1;
+        rec->req = nullptr;
+        req->free();
+        this->handle_req_end(rec, latency);
     }
 }
 
@@ -447,8 +566,13 @@ void GeneratorV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
     if (!_this->stalled && _this->size > 0 && !_this->free_reqs.empty())
     {
-        vp::IoReq *req = (vp::IoReq *)_this->free_reqs.pop();
+        TransferRecord *rec = (TransferRecord *)_this->free_reqs.pop();
 
+        // Drawn per send from the shared size-0 pool: the object may end up
+        // freed by a beat target (write beat) so it cannot be an embedded
+        // object. data is caller-managed on this pool — set on every
+        // allocation (below); no other field is reinitialized on recycle.
+        vp::IoReq *req = _this->req_allocator->alloc();
         req->prepare();
 
         // Burst legalization, like an AXI DMA (iDMA HardwareLegalizer): a burst
@@ -468,15 +592,25 @@ void GeneratorV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         req->set_addr(_this->address);
         req->set_data(_this->data);
         req->set_is_write(_this->current_transfer->do_write);
-        // Back-reference for the initiator-owned convention: a beat slave
-        // answers a read with distinct beat objects carrying this pointer in
-        // req->initiator; the fill cursor lives in fill_offset (remaining_size
-        // is not ours to use — slaves may claim it on the same object).
-        req->initiator = req;
-        _this->fill_offset[req] = 0;
+        // Correlation handle for the initiator-owned convention: a beat
+        // slave answers a read with distinct beat objects — and a write
+        // burst with a single data-less ack — carrying this pointer in
+        // req->initiator. The per-transfer record (not the request pointer)
+        // is the key: a consumed write beat may be recycled by the pool
+        // while its ack is still in flight, so object identity is not a
+        // safe correlator. (remaining_size is not ours to use either —
+        // slaves may claim it on the same object.)
+        req->initiator = rec;
         req->is_first = true;
         req->is_last = true;
         req->burst_id = -1;
+
+        rec->req = req;
+        rec->data = _this->data;
+        rec->size = chunk;
+        rec->fill = 0;
+        rec->is_write = _this->current_transfer->do_write;
+        _this->outstanding.insert(rec);
 
         _this->trace.msg(vp::Trace::LEVEL_DEBUG, "Sending request (req: %p, address: 0x%llx, size: 0x%llx, packet_size: 0x%llx)\n",
             req, _this->address, chunk, _this->current_transfer->packet_size);
@@ -500,14 +634,16 @@ void GeneratorV2::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     }
 }
 
-void GeneratorV2::handle_req_end(vp::IoReq *req, int64_t latency)
+void GeneratorV2::handle_req_end(TransferRecord *rec, int64_t latency)
 {
-    this->pending_size -= req->get_size();
-    this->trace.msg(vp::Trace::LEVEL_DEBUG, "Handling req end (req: %p, size: 0x%x, pending_size: 0x%x, latency: %ld)\n",
-        req, req->get_size(), this->pending_size.get(), latency);
+    this->pending_size -= rec->size;
+    this->trace.msg(vp::Trace::LEVEL_DEBUG, "Handling req end (rec: %p, size: 0x%lx, pending_size: 0x%lx, latency: %ld)\n",
+        rec, rec->size, this->pending_size.get(), latency);
+
+    this->outstanding.erase(rec);
 
     if (latency < 0) latency = 0;
-    this->free_reqs.push_back(req, latency);
+    this->free_reqs.push_back(rec, latency);
     this->last_req_cyclestamp = this->clock.get_cycles() + latency;
 
     this->fsm_event.enqueue();

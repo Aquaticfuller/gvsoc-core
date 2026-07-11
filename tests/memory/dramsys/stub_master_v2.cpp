@@ -49,6 +49,13 @@ private:
         uint64_t addr;
         uint64_t size;
         bool     is_write;
+        // Write-burst bookkeeping (per-burst ack contract): the burst's
+        // is_first entry is the shared initiator of all its beats and
+        // records which entry carries is_last, so the single ack can
+        // resolve it.
+        ScheduleEntry *burst_last_entry = nullptr;
+        vp::IoRespStatus wr_status = vp::IO_RESP_OK;
+        uint64_t wr_latency = 0;
         std::string name;
         std::string data_hex;
         bool     is_first = true;
@@ -81,6 +88,11 @@ private:
 
     vp::Trace trace;
     vp::IoMaster out;
+    // Size-0 pool for write beats (consumed and freed downstream).
+    vp::IoReqAllocator *wr_allocator;
+    // First entry of the write burst currently being issued (shared
+    // initiator for all its beats).
+    ScheduleEntry *open_write_first = nullptr;
     vp::ClockEvent issue_event;
     vp::ClockEvent chain_event;
     vp::ClockEvent quit_event;
@@ -116,6 +128,7 @@ StubMasterV2::StubMasterV2(vp::ComponentConf &config)
     this->traces.new_trace("trace", &this->trace, vp::DEBUG);
     this->new_master_port("output", &this->out);
 
+    this->wr_allocator = vp::IoReqAllocator::get(0);
     this->logname = this->get_js_config()->get_child_str("logname");
     if (this->logname.empty()) this->logname = this->get_name();
 
@@ -164,7 +177,10 @@ StubMasterV2::StubMasterV2(vp::ComponentConf &config)
                 e->data[i] = (hexv(data_hex[i*2]) << 4) | hexv(data_hex[i*2+1]);
             }
 
-            e->req = new vp::IoReq(e->addr, e->data, e->size, e->is_write);
+            // Writes draw a pool beat per issue (the target frees it);
+            // reads keep a reusable own request (initiator-owned).
+            e->req = e->is_write ? nullptr
+                                 : new vp::IoReq(e->addr, e->data, e->size, false);
             this->schedule.push_back(e);
         }
     }
@@ -200,13 +216,15 @@ void StubMasterV2::log_done(const char *tag, ScheduleEntry *e)
     if (e->is_write)
     {
         // Writes: log the data we sent (data buffer holds the source bytes).
+        // Status/latency come from the entry's stash — the request object is
+        // gone once granted (target-freed under the per-burst ack contract).
         for (int i = 0; i < n; i++)
             snprintf(&hex[i*2], 3, "%02x", e->data[i]);
         uint8_t cksum = 0;
         for (uint64_t i = 0; i < e->size; i++) cksum ^= e->data[i];
         printf("[%ld] %s %s name=%s status=%d latency=%lu data=%s checksum=%02x\n",
             now, this->logname.c_str(), tag, e->name.c_str(),
-            (int)e->req->get_resp_status(), (unsigned long)e->req->get_latency(),
+            (int)e->wr_status, (unsigned long)e->wr_latency,
             hex, cksum);
     }
     else
@@ -274,16 +292,47 @@ void StubMasterV2::issue(ScheduleEntry *e)
         e->addr, (unsigned long)e->size, e->is_write ? 1 : 0,
         e->is_first ? 1 : 0, e->is_last ? 1 : 0, e->burst_id);
 
-    e->req->prepare();
+    if (e->is_write)
+    {
+        // Per-burst ack contract: all beats of one burst carry the same
+        // initiator — the burst's is_first entry — which records the
+        // is_last entry so the ack can resolve it. Run the burst
+        // bookkeeping only on the first issue of a beat: a DENIED beat is
+        // re-issued with its pool object (and initiator) intact, and must
+        // not reopen or re-close the burst.
+        if (e->req == nullptr)
+        {
+            if (e->is_first || this->open_write_first == nullptr)
+            {
+                this->open_write_first = e;
+            }
+            if (e->is_last)
+            {
+                this->open_write_first->burst_last_entry = e;
+            }
+            e->req = this->wr_allocator->alloc();
+            e->req->initiator = this->open_write_first;
+            if (e->is_last)
+            {
+                this->open_write_first = nullptr;
+            }
+        }
+        // prepare() preserves initiator; refresh the caller-managed fields.
+        e->req->prepare();
+        e->req->set_data(e->data);
+    }
+    else
+    {
+        e->req->prepare();
+        e->req->data = e->data;
+        e->req->initiator = e;
+    }
     e->req->set_addr(e->addr);
     e->req->set_size(e->size);
     e->req->set_is_write(e->is_write);
-    e->req->data = e->data;
     e->req->is_first = e->is_first;
     e->req->is_last  = e->is_last;
     e->req->burst_id = e->burst_id;
-    // Back-reference so response beats (distinct objects) correlate to this entry.
-    e->req->initiator = e;
     // Reset the read-side accumulator for this issue.
     e->bytes_received = 0;
     e->checksum = 0;
@@ -294,16 +343,41 @@ void StubMasterV2::issue(ScheduleEntry *e)
     this->nb_inflight++;
     this->sig_pending      = this->nb_inflight;
 
+    bool wr = e->is_write;
+    bool wr_last = e->is_last;
     vp::IoReqStatus st = this->out.req(e->req);
     switch (st)
     {
         case vp::IO_REQ_DONE:
+            if (wr)
+            {
+                // Inline completion: burst ack on a last beat (or the
+                // DONE+INVALID escape hatch). The master keeps the beat —
+                // recycle it to the pool.
+                e->wr_status = e->req->get_resp_status();
+                e->wr_latency = e->req->get_latency();
+                e->req->free();
+                e->req = nullptr;
+            }
             this->log_done("DONE", e);
             this->mark_resolved(e);
             this->release_if_idle();
             break;
         case vp::IO_REQ_GRANTED:
             printf("[%ld] %s GRANTED name=%s\n", now, this->logname.c_str(), e->name.c_str());
+            if (wr)
+            {
+                // Ownership transferred: the target frees the beat. Non-last
+                // beats get no response at all — they are complete from the
+                // master's point of view once accepted; the burst's last
+                // entry stays pending until the single ack.
+                e->req = nullptr;
+                if (!wr_last)
+                {
+                    this->mark_resolved(e);
+                    this->release_if_idle();
+                }
+            }
             break;
         case vp::IO_REQ_DENIED:
             printf("[%ld] %s DENIED name=%s\n", now, this->logname.c_str(), e->name.c_str());
@@ -356,6 +430,26 @@ vp::IoRespAck StubMasterV2::resp_handler(vp::Block *__this, vp::IoReq *req)
 
     int64_t now = _this->clock.get_cycles();
 
+    // Write burst ack: a single distinct data-less object whose initiator is
+    // the burst's first entry; resolve the entry carrying is_last.
+    if (req->get_opcode() == vp::WRITE)
+    {
+        ScheduleEntry *last = e->burst_last_entry ? e->burst_last_entry : e;
+        if (!req->is_last || req->get_data() != nullptr)
+        {
+            printf("[%ld] %s ERROR malformed write burst ack (last=%d data=%p)\n",
+                now, _this->logname.c_str(), req->is_last ? 1 : 0, req->get_data());
+            abort();
+        }
+        last->wr_status = req->get_resp_status();
+        last->wr_latency = req->get_latency();
+        req->free();
+        _this->log_done("RESP", last);
+        _this->mark_resolved(last);
+        _this->release_if_idle();
+        return vp::IO_RESP_ACCEPTED;
+    }
+
     // Accumulate this beat's data into the read-side checksum/preview.
     uint64_t beat_size = req->size;
     uint8_t *beat_data = req->data;
@@ -386,11 +480,11 @@ vp::IoRespAck StubMasterV2::resp_handler(vp::Block *__this, vp::IoReq *req)
         _this->mark_resolved(e);
         _this->release_if_idle();
     }
-    // Free the distinct read-beat objects we consume; never our own request
-    // object (reused across issues, round-tripped as the write ack).
+    // Free the distinct read-beat objects we consume (allocator-backed —
+    // return them to their pool); never our own request object.
     if (req != e->req)
     {
-        delete req;
+        req->free();
     }
     return vp::IO_RESP_ACCEPTED;
 }

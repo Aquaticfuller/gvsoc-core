@@ -7,18 +7,26 @@
 // memory.ramulator — GVSoC wrapper around Ramulator 2.x (cycle-level DRAM
 // simulator) used as a timing engine, on the io_v2 *beat* protocol (IoV2Beat).
 //
-// Protocol (matches the IoV2Beat contract):
-//   - The master sends ONE request for the whole burst (read or write), with
-//     the full burst size and burst_id.
-//   - The wrapper returns IO_REQ_GRANTED and answers with a stream of beats:
+// Protocol (matches the IoV2Beat contract, incl. the per-burst write
+// acknowledgement — see io_v2.hpp "Write acknowledgement"):
+//   - Read : the master sends ONE data-less request for the whole burst.
+//     The wrapper returns IO_REQ_GRANTED and answers with a stream of beats:
 //     ceil(size / beat_width) per-cycle resp() calls, one beat_width slice per
 //     cycle, with is_first / is_last / burst_id set. beat_width is the
 //     interconnect/DRAM transaction width (Ramulator's get_tx_bytes()).
-//       * Read : each beat carries that slice of read data.
-//       * Write: the data is stored up front; each beat is the per-cycle ack
-//                (write data is consumed one beat per cycle).
-//
-// So both directions are: one whole-burst request in, beats out, one per cycle.
+//   - Write: beats arrive as requests — either one request carrying the whole
+//     payload (big-packet-form write = a one-beat burst) or N per-beat
+//     requests (beat-form write). Each accepted beat is consumed at submit
+//     (payload copied into the backing store) and GRANTED: a non-last beat is
+//     freed right away, the burst-final beat (is_last) is parked. The burst
+//     is acknowledged exactly ONCE, with a single data-less allocator-backed
+//     ack — the parked last beat recycled — via resp(). Every beat still
+//     occupies its slot in the per-cycle ack pacing as a SILENT virtual tick
+//     (same cursors, head-of-queue and 1-beat/cycle rate as the former
+//     per-beat ack stream), so the single ack fires on exactly the cycle the
+//     last per-beat ack fired before the protocol change.
+//   - Atomic opcodes (opcode != WRITE/READ) keep the classic per-request
+//     round-trip: the master's own object comes back through resp().
 //
 // Timing: a permanent ClockEvent ticks the Ramulator memory system every cycle
 // (no idle optimization in this MVP — intentional). Each whole-burst request is
@@ -86,18 +94,21 @@ public:
     void on_dram_command(const ramulator_bridge::DramCommand &cmd) override;
 
 private:
-    // One in-flight whole-burst request (read or write). The master submits one
-    // request with the full size; the wrapper drains its DRAM transactions from
-    // Ramulator and streams the response back beat by beat. A read burst is
-    // data-less (beat protocol): its functional data is snapshot into the
-    // read_data staging buffer at submit and travels upstream inside distinct
-    // allocator-backed beats; the master's request is never touched (req /
-    // master_data are only used on the write-ack path, which round-trips the
-    // master's own request).
+    // One in-flight request (a whole read burst / big-packet-form write, or a
+    // single beat of a beat-form write burst — pacing is per REQUEST: each
+    // request gets its own Inflight and drains its own DRAM transactions).
+    // A read burst is data-less (beat protocol): its functional data is
+    // snapshot into the read_data staging buffer at submit and travels
+    // upstream inside distinct allocator-backed beats; the master's request
+    // is never touched. A WRITE beat is consumed at submit: a non-last beat
+    // is freed immediately (req == nullptr, silent virtual-ack entry), the
+    // burst-final beat (burst_last) is parked in req and later recycled as
+    // the burst's single data-less ack (owns_req). Atomic opcodes keep the
+    // classic round-trip of the master's own object through req/master_data.
     struct Inflight
     {
         vp::IoReq *req;
-        uint8_t *master_data;   // snapshot of req->get_data() at submit (writes)
+        uint8_t *master_data;   // snapshot of req->get_data() at submit (atomics)
         std::vector<uint8_t> read_data; // staging for read bursts
         void *initiator;        // snapshot of req->initiator at submit
         uint64_t total_size;    // snapshot of req->get_size() at submit
@@ -111,6 +122,10 @@ private:
         int tx_injected;        // transactions pushed into Ramulator so far
         int tx_done;            // transactions completed so far
         bool emitted_done;      // true once the last beat has been emitted
+        // Per-burst write-ack bookkeeping (io_v2.hpp "Write acknowledgement").
+        vp::IoReqOpcode opcode = vp::READ; // snapshot of req->get_opcode()
+        bool burst_last = false; // snapshot of req->is_last at submit (writes)
+        bool owns_req = false;   // parked burst-final write beat: ours to free
     };
 
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req);
@@ -262,7 +277,14 @@ RamulatorModel::RamulatorModel(vp::ComponentConf &config)
 
 RamulatorModel::~RamulatorModel()
 {
-    for (auto *infl : this->inflight_queue) delete infl;
+    for (auto *infl : this->inflight_queue)
+    {
+        // A parked burst-final write beat is ours (consumed, awaiting
+        // recycling as the ack) — return it to its pool. Silent write entries
+        // hold no master object; read/atomic requests are master-owned.
+        if (infl->owns_req && infl->req != nullptr) infl->req->free();
+        delete infl;
+    }
     if (this->frontend) this->frontend->finalize();
     if (this->memory_system) this->memory_system->finalize();
     if (this->mem_data) free(this->mem_data);
@@ -344,7 +366,15 @@ void RamulatorModel::reset(bool active)
 {
     if (active)
     {
-        for (auto *infl : this->inflight_queue) delete infl;
+        for (auto *infl : this->inflight_queue)
+        {
+            // Same ownership rules as the destructor: only a parked
+            // burst-final write beat (owns_req) is ours to free — silent
+            // write entries hold no master object, and read / atomic
+            // requests belong to the master.
+            if (infl->owns_req && infl->req != nullptr) infl->req->free();
+            delete infl;
+        }
         this->inflight_queue.clear();
         this->retry_pending = false;
         if (this->tick_event.is_enqueued()) this->tick_event.cancel();
@@ -361,9 +391,14 @@ vp::IoReqStatus RamulatorModel::req_handler(vp::Block *__this, vp::IoReq *req)
 {
     RamulatorModel *_this = (RamulatorModel *)__this;
 
+    // Snapshot every field we may still need BEFORE anything else: on the
+    // write path GRANTED transfers beat ownership (buffer included) to us
+    // and the beat is freed below (io_v2.hpp "Write-beat ownership").
     uint64_t offset = req->get_addr() & _this->truncate_mask;
     uint64_t req_size = req->get_size();
     uint8_t *data = req->get_data();
+    vp::IoReqOpcode opcode = req->get_opcode();
+    bool burst_last = req->is_last;
 
     _this->trace.msg("Burst (addr: 0x%llx, offset: 0x%llx, size: 0x%llx, write: %d, burst_id: %lld)\n",
         (unsigned long long)req->get_addr(), (unsigned long long)offset,
@@ -371,6 +406,8 @@ vp::IoReqStatus RamulatorModel::req_handler(vp::Block *__this, vp::IoReq *req)
 
     if (offset + req_size > _this->size)
     {
+        // Error escape hatch (io_v2.hpp): inline DONE + INVALID is legal on
+        // any beat — the master keeps the beat and aborts the burst.
         _this->trace.force_warning_no_error(
             "Out-of-bound burst (offset: 0x%llx, size: 0x%llx, memSize: 0x%llx)\n",
             (unsigned long long)offset, (unsigned long long)req_size,
@@ -390,10 +427,13 @@ vp::IoReqStatus RamulatorModel::req_handler(vp::Block *__this, vp::IoReq *req)
         /*bytes_filled=*/0, /*bytes_emitted=*/0,
         /*tx_total=*/num_tx, /*tx_injected=*/0, /*tx_done=*/0, /*emitted_done=*/false,
     };
+    infl->opcode = opcode;
+    infl->burst_last = burst_last;
 
     // Back-pressure is Ramulator's: if its controller buffer can't even take the
-    // first transaction, deny (nothing committed) and retry() when a slot frees.
-    // There is no wrapper request queue and no artificial outstanding cap.
+    // first transaction, deny (nothing committed, ownership not transferred)
+    // and retry() when a slot frees. There is no wrapper request queue and no
+    // artificial outstanding cap.
     if (!_this->inject_one(infl))
     {
         delete infl;
@@ -406,8 +446,37 @@ vp::IoReqStatus RamulatorModel::req_handler(vp::Block *__this, vp::IoReq *req)
     // its data is snapshot into the staging buffer and streamed back inside
     // allocator-backed beats over the next cycles. Remaining transactions are
     // injected by the tick handler as Ramulator's buffer drains.
-    if (req->get_is_write())
+    if (opcode == vp::WRITE)
     {
+        // Write beat consumed (per-burst ack contract, io_v2.hpp "Write
+        // acknowledgement"): copy the payload now, then take ownership.
+        _this->traces.assert(req->allocator != nullptr,
+            "write beat is not allocator-backed (req=%p) — unported master", req);
+        if (data) memcpy(&_this->mem_data[offset], data, req_size);
+        if (!burst_last)
+        {
+            // Non-last beat of a beat-form burst: never resp()'d — free it
+            // back to its pool right away. Its Inflight stays behind as a
+            // SILENT virtual ack that paces the queue exactly as its
+            // per-beat ack did, but emits nothing upstream.
+            infl->req = nullptr;
+            infl->master_data = nullptr;
+            req->free();
+        }
+        else
+        {
+            // Burst-final beat (a big-packet-form write is a one-beat
+            // burst): consumed too, but parked for recycling as the burst's
+            // single data-less ack in emit_one_beat.
+            infl->owns_req = true;
+        }
+    }
+    else if (opcode != vp::READ)
+    {
+        // Atomic opcode: exempt from the per-burst ack rules — classic
+        // round-trip of the master's own object through resp(). Only the
+        // store side is modeled (no read-modify-write / old-value return),
+        // matching the previous behavior.
         if (data) memcpy(&_this->mem_data[offset], data, req_size);
     }
     else
@@ -479,9 +548,12 @@ void RamulatorModel::maybe_retry()
 }
 
 
-// Emit at most one beat per cycle for the head in-flight burst, with is_first /
-// is_last / burst_id set (read data slice / write ack), mutating the request
-// fields per beat as the io_v2 beat contract allows.
+// Emit at most one beat per cycle for the head in-flight request, with
+// is_first / is_last / burst_id set. Reads stream distinct data beats; a
+// WRITE burst is acknowledged exactly once (per-burst ack) — every beat's
+// slot in this per-cycle pacing is kept as a silent virtual tick, and only
+// the final beat of the request whose submitted beat carried is_last
+// materializes the resp(); atomics round-trip the master's own request.
 void RamulatorModel::emit_one_beat()
 {
     if (this->inflight_queue.empty()) return;
@@ -496,11 +568,65 @@ void RamulatorModel::emit_one_beat()
     bool is_first = (infl->bytes_emitted == 0);
     bool is_last = (infl->bytes_emitted + beat_size == infl->total_size);
 
-    vp::IoReq *req;
-    if (infl->type == Ramulator::Request::Type::Write)
+    if (infl->type == Ramulator::Request::Type::Write
+        && infl->opcode == vp::WRITE)
     {
-        // Write ack: round-trip the master's own request, mutated per beat.
-        req = infl->req;
+        // WRITE: acked once per BURST (io_v2.hpp "Write acknowledgement").
+        // The per-beat cursors, head-of-queue rule and 1-beat/cycle rate are
+        // exactly what the former per-beat ack stream was — kept as silent
+        // virtual ticks — so the single materialized ack below fires on the
+        // cycle the last per-beat ack fired before the protocol change.
+        // Pacing is per REQUEST: each beat-form beat has its own Inflight
+        // and drains independently; only the request whose submitted beat
+        // carried is_last (burst_last) materializes an ack, on its final
+        // virtual tick.
+        if (infl->burst_last && is_last)
+        {
+            // Recycle the parked burst-final beat as the single data-less
+            // allocator-backed ack. The initiator frees it.
+            vp::IoReq *ack = infl->req;
+            infl->req = nullptr;
+            infl->owns_req = false;
+            ack->prepare();
+            ack->set_data(nullptr);
+            // addr/size are informational on an ack. Beats of one burst are
+            // not correlated across requests here (each request paces
+            // independently), so they carry this request's own base / byte
+            // count: the exact burst base / total for a big-packet-form
+            // write (one-beat burst), the last beat's addr / size for a
+            // beat-form burst.
+            ack->set_addr(infl->burst_addr);
+            ack->set_size(infl->total_size);
+            ack->set_opcode(vp::WRITE);
+            ack->is_first = true;
+            ack->is_last = true;
+            ack->burst_id = infl->burst_id;
+            ack->initiator = infl->initiator;
+            // Status: the only INVALID source (out-of-bound) is reported
+            // inline at submit, so a parked beat always acks OK (prepare()
+            // reset it above).
+
+            this->trace.msg("Write burst ack RESP addr=0x%llx burst_id=%lld size=%llu\n",
+                (unsigned long long)ack->addr, (long long)infl->burst_id,
+                (unsigned long long)infl->total_size);
+
+            this->in_itf.resp(ack);
+        }
+        else
+        {
+            this->trace.msg("Write virtual ack tick addr=0x%llx burst_id=%lld size=%llu (%llu/%llu, silent)\n",
+                (unsigned long long)(infl->burst_addr + infl->bytes_emitted),
+                (long long)infl->burst_id, (unsigned long long)beat_size,
+                (unsigned long long)(infl->bytes_emitted + beat_size),
+                (unsigned long long)infl->total_size);
+        }
+    }
+    else if (infl->type == Ramulator::Request::Type::Write)
+    {
+        // Atomic opcode: classic round-trip — the master's own request comes
+        // back through resp(), mutated per beat (exempt from the per-burst
+        // write-ack rules, it carries response semantics).
+        vp::IoReq *req = infl->req;
         req->addr = infl->burst_addr + infl->bytes_emitted;
         req->data = infl->master_data + infl->bytes_emitted;
         req->size = beat_size;
@@ -508,13 +634,21 @@ void RamulatorModel::emit_one_beat()
         req->is_first = is_first;
         req->is_last = is_last;
         req->status = vp::IO_RESP_OK;
+
+        this->trace.msg("Beat RESP addr=0x%llx burst_id=%lld size=%llu first=%d last=%d (%llu/%llu)\n",
+            (unsigned long long)req->addr, (long long)infl->burst_id,
+            (unsigned long long)beat_size, is_first, is_last,
+            (unsigned long long)(infl->bytes_emitted + beat_size),
+            (unsigned long long)infl->total_size);
+
+        this->in_itf.resp(req);
     }
     else
     {
         // Read beat: distinct allocator-backed object whose co-allocated
         // payload carries the data slice; the terminal master copies it out
         // and frees it. The master's data-less burst request is never touched.
-        req = this->beat_allocator->alloc();
+        vp::IoReq *req = this->beat_allocator->alloc();
         req->prepare();
         req->set_addr(infl->burst_addr + infl->bytes_emitted);
         req->set_size(beat_size);
@@ -525,15 +659,16 @@ void RamulatorModel::emit_one_beat()
         req->is_first = is_first;
         req->is_last = is_last;
         req->initiator = infl->initiator;
+
+        this->trace.msg("Beat RESP addr=0x%llx burst_id=%lld size=%llu first=%d last=%d (%llu/%llu)\n",
+            (unsigned long long)req->addr, (long long)infl->burst_id,
+            (unsigned long long)beat_size, is_first, is_last,
+            (unsigned long long)(infl->bytes_emitted + beat_size),
+            (unsigned long long)infl->total_size);
+
+        this->in_itf.resp(req);
     }
 
-    this->trace.msg("Beat RESP addr=0x%llx burst_id=%lld size=%llu first=%d last=%d (%llu/%llu)\n",
-        (unsigned long long)req->addr, (long long)infl->burst_id,
-        (unsigned long long)beat_size, is_first, is_last,
-        (unsigned long long)(infl->bytes_emitted + beat_size),
-        (unsigned long long)infl->total_size);
-
-    this->in_itf.resp(req);
     infl->bytes_emitted += beat_size;
 
     if (is_last)

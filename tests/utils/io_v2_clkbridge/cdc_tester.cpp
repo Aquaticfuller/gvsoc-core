@@ -17,6 +17,24 @@
  * fires up to N requests back-to-back from a pool of slots, demonstrating
  * pipelining when the bridge under test has depth>=N.
  *
+ * `burst_beats` selects the beat mode (0 = off, the historic big-packet
+ * mode above). When > 0 the tester is a beat-plane master following the
+ * io_v2 per-burst write-acknowledgement contract (io_v2.hpp, "Write
+ * acknowledgement"):
+ *
+ *   - Each write access is a burst of `burst_beats` beats of `access_size`
+ *     bytes, one beat per cycle, each an allocator-backed (size-0 pool)
+ *     request whose data points into the slot buffer. A GRANTED beat is
+ *     gone (the target consumes and frees it; the buffer stays valid while
+ *     the beat is unfreed); the burst completes with ONE ack: inline DONE
+ *     on the last beat (the tester keeps and frees its beat) or a single
+ *     data-less ack via resp() that the tester frees. Acks are correlated
+ *     by initiator (the slot), never by object identity.
+ *   - Each read access is one data-less burst request (freed downstream);
+ *     the response arrives as distinct pool-backed beats the tester copies
+ *     out, verifies and frees.
+ *   - A DENIED beat is held unchanged and re-sent after retry().
+ *
  * Cross-tester quit coordination is unchanged: each tester pulses
  * `done_out` when its sequence completes; receiving the partner's pulse
  * on `done_in` plus being locally done causes engine->quit().
@@ -54,7 +72,12 @@ private:
         bool     is_write;
         uint8_t  data[64];
         uint8_t  expected[64];
+        // Big-packet mode only: the tester's own round-tripped request.
         vp::IoReq req;
+        // Beat mode only:
+        uint64_t beat_cursor = 0;    // write submission cursor (bytes)
+        uint64_t resp_cursor = 0;    // read response fill cursor (bytes)
+        vp::IoReq *held = nullptr;   // DENIED beat, held for the retry re-send
     };
 
     static vp::IoRespAck out_resp(vp::Block *__this, vp::IoReq *req);
@@ -78,6 +101,19 @@ private:
     void finish_local();
     void try_quit(int status);
 
+    // Beat mode:
+    bool beat_mode() const { return this->burst_beats > 0; }
+    uint64_t burst_bytes() const
+    {
+        return this->beat_mode() ? this->burst_beats * this->access_size
+                                 : this->access_size;
+    }
+    bool issue_beat_step();
+    void start_burst(int slot_idx, uint64_t index, bool is_write);
+    void send_current_beat();
+    void complete_slot(Slot &s);
+    vp::IoRespAck beat_resp(vp::IoReq *req);
+
     void fail(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
     void pass();
 
@@ -96,6 +132,7 @@ private:
     uint32_t pattern_seed;
     int64_t  quit_after_cycles;
     int      pipeline_burst;
+    int      burst_beats;        // 0 = big-packet mode, >0 = beat mode
 
     // State:
     Phase phase;
@@ -108,6 +145,13 @@ private:
 
     Slot slots[MAX_BURST];
     int  in_flight_count = 0;
+
+    // Beat-mode state: slot whose burst is currently being submitted (beats
+    // of one burst never interleave with another on the binding), or -1.
+    int issuing_slot = -1;
+    // Size-0 pool for write beats / data-less read burst requests: they
+    // cross a consumer-frees boundary, so they must be allocator-backed.
+    vp::IoReqAllocator *beat_pool = nullptr;
 };
 
 
@@ -145,6 +189,19 @@ CDCTester::CDCTester(vp::ComponentConf &config)
     if (this->pipeline_burst < 1) this->pipeline_burst = 1;
     if (this->pipeline_burst > MAX_BURST) this->pipeline_burst = MAX_BURST;
 
+    js::Config *bb = cfg->get("burst_beats");
+    this->burst_beats = bb != nullptr ? bb->get_int() : 0;
+    if (this->burst_beats < 0) this->burst_beats = 0;
+    if (this->beat_mode())
+    {
+        if (this->burst_bytes() > sizeof(this->slots[0].data))
+        {
+            this->trace.fatal("burst_beats*access_size %lu exceeds slot buffer (%zu)\n",
+                              this->burst_bytes(), sizeof(this->slots[0].data));
+        }
+        this->beat_pool = vp::IoReqAllocator::get(0);
+    }
+
     for (int i = 0; i < MAX_BURST; i++)
     {
         this->slots[i].req.set_data(this->slots[i].data);
@@ -164,7 +221,20 @@ void CDCTester::reset(bool active)
         this->failed = false;
         this->retry_pending = false;
         this->in_flight_count = 0;
-        for (int i = 0; i < MAX_BURST; i++) this->slots[i].active = false;
+        this->issuing_slot = -1;
+        for (int i = 0; i < MAX_BURST; i++)
+        {
+            Slot &s = this->slots[i];
+            s.active = false;
+            s.beat_cursor = 0;
+            s.resp_cursor = 0;
+            // A held (DENIED) beat is still ours — return it to its pool.
+            if (s.held != nullptr)
+            {
+                s.held->free();
+                s.held = nullptr;
+            }
+        }
         this->start_cycle = this->clock.get_cycles();
         printf("[%ld] %s START accesses=%lu access_size=%lu base=0x%lx seed=0x%x burst=%d\n",
             this->clock.get_cycles(), this->logname.c_str(),
@@ -272,6 +342,8 @@ bool CDCTester::issue_into_slot(int slot_idx, uint64_t index, bool is_write)
 
 bool CDCTester::issue_next_if_possible()
 {
+    if (this->beat_mode()) return this->issue_beat_step();
+
     if (this->retry_pending) return false;
     if (this->in_flight_count >= this->pipeline_burst) return false;
     if (this->cursor >= this->nb_accesses) return false;
@@ -284,6 +356,236 @@ bool CDCTester::issue_next_if_possible()
         this->cursor++;
     }
     return ok;
+}
+
+
+// ---- Beat mode -------------------------------------------------------------
+
+bool CDCTester::issue_beat_step()
+{
+    // At most one beat is issued per step (one beat per cycle);
+    // send_current_beat() reschedules the step for the next beat, so this
+    // always returns false to break the caller's issue loop.
+    if (this->retry_pending) return false;
+
+    if (this->issuing_slot < 0)
+    {
+        if (this->in_flight_count >= this->pipeline_burst) return false;
+        if (this->cursor >= this->nb_accesses) return false;
+        int slot_idx = this->find_free_slot();
+        if (slot_idx < 0) return false;
+        this->start_burst(slot_idx, this->cursor, this->phase == PHASE_WRITE);
+        this->cursor++;
+    }
+
+    this->send_current_beat();
+    return false;
+}
+
+
+void CDCTester::start_burst(int slot_idx, uint64_t index, bool is_write)
+{
+    Slot &s = this->slots[slot_idx];
+    uint64_t bytes = this->burst_bytes();
+    uint64_t off = index * bytes;
+
+    for (uint64_t i = 0; i < bytes; i++)
+        s.expected[i] = this->pattern_byte(off + i);
+    for (uint64_t i = 0; i < bytes; i++)
+        s.data[i] = is_write ? s.expected[i] : 0xee;   // 0xee = read poison
+
+    s.active      = true;
+    s.index       = index;
+    s.is_write    = is_write;
+    s.beat_cursor = 0;
+    s.resp_cursor = 0;
+    s.held        = nullptr;
+    this->in_flight_count++;
+    this->issuing_slot = slot_idx;
+
+    printf("[%ld] %s %-5s idx=%lu addr=0x%lx slot=%d beats=%d\n",
+        this->clock.get_cycles(), this->logname.c_str(),
+        is_write ? "WRITE" : "READ",
+        index, this->base + off, slot_idx, this->burst_beats);
+}
+
+
+void CDCTester::complete_slot(Slot &s)
+{
+    s.active = false;
+    this->in_flight_count--;
+    this->schedule_step(1);
+}
+
+
+void CDCTester::send_current_beat()
+{
+    Slot &s = this->slots[this->issuing_slot];
+    uint64_t bytes = this->burst_bytes();
+    uint64_t burst_addr = this->base + s.index * bytes;
+
+    vp::IoReq *beat = s.held;
+    if (beat == nullptr)
+    {
+        beat = this->beat_pool->alloc();
+        beat->prepare();
+        if (s.is_write)
+        {
+            // Allocator-backed write beat: data points into the slot buffer
+            // (valid as long as the beat is unfreed — no copy).
+            beat->set_addr(burst_addr + s.beat_cursor);
+            beat->set_size(this->access_size);
+            beat->set_data(s.data + s.beat_cursor);
+            beat->set_opcode(vp::WRITE);
+            beat->is_first = s.beat_cursor == 0;
+            beat->is_last  = s.beat_cursor + this->access_size >= bytes;
+        }
+        else
+        {
+            // Data-less read burst request (beat-plane read convention);
+            // freed downstream, the payload comes back as distinct beats.
+            beat->set_addr(burst_addr);
+            beat->set_size(bytes);
+            beat->set_data(nullptr);
+            beat->set_opcode(vp::READ);
+            beat->is_first = true;
+            beat->is_last  = true;
+        }
+        beat->burst_id  = (int64_t)s.index;
+        beat->initiator = &s;
+    }
+
+    // Snapshot before req(): GRANTED transfers ownership of a write beat.
+    bool was_last = beat->is_last;
+
+    vp::IoReqStatus st = this->out.req(beat);
+
+    if (st == vp::IO_REQ_DENIED)
+    {
+        // Hold the exact object unchanged, re-send after retry().
+        s.held = beat;
+        this->retry_pending = true;
+        return;
+    }
+    s.held = nullptr;
+
+    if (s.is_write)
+    {
+        if (st == vp::IO_REQ_DONE)
+        {
+            // The inline burst ack: only legal on the last beat (or as the
+            // inline-INVALID escape hatch). The tester keeps the beat and,
+            // being its allocator, returns it to the pool.
+            vp::IoRespStatus status = beat->get_resp_status();
+            beat->free();
+            if (!was_last)
+            {
+                this->fail("DONE on non-last write beat idx=%lu (status=%d)",
+                           s.index, (int)status);
+                return;
+            }
+            if (status != vp::IO_RESP_OK)
+            {
+                this->fail("inline write ack INVALID idx=%lu", s.index);
+                return;
+            }
+            this->issuing_slot = -1;
+            this->complete_slot(s);
+            return;
+        }
+        // GRANTED: the beat (buffer included) now belongs downstream — never
+        // touch it again. Non-last beats get no response at all; the burst's
+        // single ack arrives via out_resp once the last beat is consumed.
+        s.beat_cursor += this->access_size;
+        if (was_last)
+        {
+            this->issuing_slot = -1;   // submission done; await the ack
+        }
+        this->schedule_step(1);
+    }
+    else
+    {
+        if (st == vp::IO_REQ_DONE)
+        {
+            vp::IoRespStatus status = beat->get_resp_status();
+            beat->free();
+            this->fail("inline DONE on a data-less read idx=%lu (status=%d)",
+                       s.index, (int)status);
+            return;
+        }
+        // GRANTED: the request is gone (freed downstream); response beats
+        // arrive via out_resp, correlated by initiator.
+        this->issuing_slot = -1;
+        this->schedule_step(1);
+    }
+}
+
+
+vp::IoRespAck CDCTester::beat_resp(vp::IoReq *req)
+{
+    Slot *s = static_cast<Slot *>(req->initiator);
+    int slot_idx = (int)(s - this->slots);
+    if (slot_idx < 0 || slot_idx >= MAX_BURST || !s->active)
+    {
+        this->fail("resp with unknown initiator (req=%p)", (void *)req);
+        return vp::IO_RESP_ACCEPTED;
+    }
+
+    if (req->get_resp_status() != vp::IO_RESP_OK)
+    {
+        req->free();
+        this->fail("async resp INVALID idx=%lu is_write=%d",
+                   s->index, s->is_write ? 1 : 0);
+        return vp::IO_RESP_ACCEPTED;
+    }
+
+    if (req->get_opcode() == vp::WRITE)
+    {
+        // The burst's single data-less ack (possibly our own recycled last
+        // beat — correlation is by initiator, never by object identity).
+        // The initiator consumes the status and frees the ack.
+        if (req->get_data() != nullptr)
+        {
+            this->fail("write burst ack carries data idx=%lu", s->index);
+        }
+        req->free();
+        this->complete_slot(*s);
+        return vp::IO_RESP_ACCEPTED;
+    }
+
+    // Read response beat: copy the payload out at the running offset, free
+    // the beat, verify the whole burst on the last one.
+    bool last = req->is_last;
+    uint64_t size = req->get_size();
+    if (s->resp_cursor + size > this->burst_bytes())
+    {
+        req->free();
+        this->fail("read beats overflow burst idx=%lu", s->index);
+        return vp::IO_RESP_ACCEPTED;
+    }
+    if (size > 0)
+    {
+        memcpy(s->data + s->resp_cursor, req->get_data(), size);
+        s->resp_cursor += size;
+    }
+    req->free();
+
+    if (last)
+    {
+        if (s->resp_cursor != this->burst_bytes())
+        {
+            this->fail("short read burst idx=%lu (%lu/%lu bytes)",
+                       s->index, s->resp_cursor, this->burst_bytes());
+            return vp::IO_RESP_ACCEPTED;
+        }
+        if (memcmp(s->data, s->expected, this->burst_bytes()) != 0)
+        {
+            this->fail("read mismatch idx=%lu (beat)", s->index);
+            return vp::IO_RESP_ACCEPTED;
+        }
+        this->complete_slot(*s);
+    }
+    return vp::IO_RESP_ACCEPTED;
 }
 
 
@@ -339,6 +641,8 @@ vp::IoRespAck CDCTester::out_resp(vp::Block *__this, vp::IoReq *req)
 {
     CDCTester *_this = (CDCTester *)__this;
     if (_this->failed) return vp::IO_RESP_ACCEPTED;
+
+    if (_this->beat_mode()) return _this->beat_resp(req);
 
     int slot_idx = _this->find_slot_for_req(req);
     if (slot_idx < 0)

@@ -20,6 +20,14 @@
  * The master emits one beat per cycle until the burst is done, then idles until the
  * next schedule entry. Denied beats go back to a retry queue and are re-issued on
  * retry().
+ *
+ * Write bursts follow the per-burst ack contract (io_v2.hpp, "Write
+ * acknowledgement"): beats are size-0-pool objects aliasing a per-burst
+ * buffer, every beat of a burst carries the same initiator (the WrBurst
+ * record), granted beats are forgotten (the target frees them), and the
+ * burst completes on either the last beat's inline DONE or the single
+ * data-less ack, which the master frees. The stub polices the contract:
+ * a write resp that is not a well-formed burst ack aborts the test.
  */
 
 #include <vp/vp.hpp>
@@ -47,6 +55,14 @@ private:
         std::string name;
     };
 
+    // Per-write-burst record; carried as the initiator on every beat of the
+    // burst and echoed back on the burst ack.
+    struct WrBurst {
+        BurstEntry *burst;
+        uint8_t *buffer;         // backing store for all beats' payload
+        int last_idx;            // nb_beats-1, for ack logging
+    };
+
     struct Beat {
         uint64_t addr;
         bool is_first;
@@ -55,6 +71,7 @@ private:
         BurstEntry *burst;
         vp::IoReq *req;
         uint8_t *data;
+        WrBurst *wb;             // writes only
     };
 
     static vp::IoRespAck resp_handler(vp::Block *__this, vp::IoReq *req);
@@ -66,6 +83,11 @@ private:
     void try_send(Beat *beat);
 
     vp::IoMaster out;
+    // Size-0 pool serving the write beats (data caller-managed, aliasing the
+    // burst buffer).
+    vp::IoReqAllocator *wr_allocator;
+    // Write burst currently being emitted (created on its first beat).
+    WrBurst *open_wb = nullptr;
     vp::ClockEvent issue_event;
     vp::ClockEvent quit_event;
     vp::Trace trace;
@@ -85,6 +107,7 @@ StubMaster::StubMaster(vp::ComponentConf &config)
 {
     this->traces.new_trace("trace", &this->trace, vp::DEBUG);
     this->new_master_port("output", &this->out);
+    this->wr_allocator = vp::IoReqAllocator::get(0);
 
     this->logname = this->get_js_config()->get_child_str("logname");
     if (this->logname.empty()) this->logname = this->get_name();
@@ -140,9 +163,16 @@ void StubMaster::try_send(Beat *beat)
     beat->req->is_first = beat->is_first;
     beat->req->is_last = beat->is_last;
     beat->req->burst_id = beat->burst->burst_id;
-    // Stash ourselves in initiator BEFORE req(). The router saves/restores it across
-    // the round-trip so resp_handler will see `beat` back.
-    beat->req->initiator = beat;
+    // Initiator BEFORE req(): the per-burst WrBurst record for writes (the
+    // contract requires the same initiator on every beat of a burst, and the
+    // burst ack echoes it); the per-beat record for reads.
+    beat->req->initiator = beat->burst->is_write ? (void *)beat->wb
+                                                 : (void *)beat;
+
+    // Snapshot before req(): a granted write beat belongs to the target and
+    // must not be touched afterwards.
+    bool is_write = beat->burst->is_write;
+    bool is_last = beat->is_last;
 
     vp::IoReqStatus st = this->out.req(beat->req);
     switch (st)
@@ -151,14 +181,38 @@ void StubMaster::try_send(Beat *beat)
             printf("[%ld] %s DONE name=%s#%d status=%d\n",
                 now, this->logname.c_str(), beat->burst->name.c_str(), beat->idx,
                 (int)beat->req->get_resp_status());
-            delete[] beat->data;
-            delete beat->req;
-            delete beat;
+            if (is_write)
+            {
+                // Inline burst ack (last beat) or DONE+INVALID escape hatch:
+                // either way the master keeps the beat — recycle it to the
+                // pool. The burst record dies with its last beat when no ack
+                // is expected anymore.
+                beat->req->free();
+                if (is_last)
+                {
+                    delete[] beat->wb->buffer;
+                    delete beat->wb;
+                }
+                delete beat;
+            }
+            else
+            {
+                delete[] beat->data;
+                delete beat->req;
+                delete beat;
+            }
             break;
         case vp::IO_REQ_GRANTED:
             printf("[%ld] %s GRANTED name=%s#%d\n",
                 now, this->logname.c_str(), beat->burst->name.c_str(), beat->idx);
-            // Beat is in-flight; resp_handler will free the Beat when it arrives.
+            if (is_write)
+            {
+                // Ownership transferred: the beat is the chain's now (the
+                // terminating target frees it); the burst ack will carry the
+                // WrBurst record in its initiator. Only the wrapper dies.
+                delete beat;
+            }
+            // Reads: resp_handler frees the Beat when the response arrives.
             break;
         case vp::IO_REQ_DENIED:
             printf("[%ld] %s DENIED name=%s#%d\n",
@@ -176,10 +230,32 @@ void StubMaster::emit_next_beat(BurstEntry *burst)
     beat->is_last = (beat->idx == burst->nb_beats - 1);
     beat->addr = burst->base_addr + (uint64_t)beat->idx * burst->stride;
     beat->burst = burst;
-    beat->data = new uint8_t[burst->size];
-    for (uint64_t i = 0; i < burst->size; i++) beat->data[i] = 0;
-    beat->req = new vp::IoReq(beat->addr, beat->data, burst->size, burst->is_write);
-    // set first/last/burst_id in try_send, which runs right now.
+    beat->wb = nullptr;
+
+    if (burst->is_write)
+    {
+        if (beat->is_first)
+        {
+            this->open_wb = new WrBurst();
+            this->open_wb->burst = burst;
+            this->open_wb->buffer = new uint8_t[burst->size * burst->nb_beats]();
+            this->open_wb->last_idx = burst->nb_beats - 1;
+        }
+        beat->wb = this->open_wb;
+        beat->data = this->open_wb->buffer + (uint64_t)beat->idx * burst->size;
+        beat->req = this->wr_allocator->alloc();
+        beat->req->prepare();
+        beat->req->set_data(beat->data);
+        beat->req->set_is_write(true);
+        if (beat->is_last) this->open_wb = nullptr;
+    }
+    else
+    {
+        beat->data = new uint8_t[burst->size];
+        for (uint64_t i = 0; i < burst->size; i++) beat->data[i] = 0;
+        beat->req = new vp::IoReq(beat->addr, beat->data, burst->size, false);
+    }
+    // set addr/size/first/last/burst_id in try_send, which runs right now.
     this->try_send(beat);
 }
 
@@ -230,10 +306,41 @@ vp::IoRespAck StubMaster::resp_handler(vp::Block *__this, vp::IoReq *req)
 {
     StubMaster *_this = (StubMaster *)__this;
     int64_t now = _this->clock.get_cycles();
+    bool is_last = req->is_last;
+
+    // Write burst ack: a distinct data-less object carrying the WrBurst
+    // record in its initiator. Exactly one per burst; police the shape.
+    if (req->get_opcode() == vp::WRITE)
+    {
+        WrBurst *wb = (WrBurst *)req->initiator;
+        const char *name = wb ? wb->burst->name.c_str() : "?";
+        int idx = wb ? wb->last_idx : -1;
+        printf("[%ld] %s RESP name=%s#%d size=%lu first=%d last=%d status=%d\n",
+            now, _this->logname.c_str(), name, idx,
+            (unsigned long)req->get_size(),
+            req->is_first ? 1 : 0, is_last ? 1 : 0,
+            (int)req->get_resp_status());
+        if (!is_last || req->get_data() != nullptr)
+        {
+            printf("[%ld] %s ERROR malformed write burst ack (last=%d data=%p)\n",
+                now, _this->logname.c_str(), is_last ? 1 : 0, req->get_data());
+            abort();
+        }
+        req->free();
+        if (wb)
+        {
+            delete[] wb->buffer;
+            delete wb;
+        }
+        return vp::IO_RESP_ACCEPTED;
+    }
+
+    // Read response beats (initiator-owned request convention): distinct
+    // allocator-backed objects freed here; our own burst request (beat->req)
+    // and Beat record are freed on the stream's last beat.
     Beat *beat = (Beat *)req->initiator;
     const char *name = beat ? beat->burst->name.c_str() : "?";
     int idx = beat ? beat->idx : -1;
-    bool is_last = req->is_last;
     printf("[%ld] %s RESP name=%s#%d size=%lu first=%d last=%d status=%d\n",
         now, _this->logname.c_str(), name, idx,
         (unsigned long)req->get_size(),
@@ -243,16 +350,9 @@ vp::IoRespAck StubMaster::resp_handler(vp::Block *__this, vp::IoReq *req)
     {
         return vp::IO_RESP_ACCEPTED;
     }
-    // Two response-ownership cases (initiator-owned request convention, see
-    // io_v2_beat_adapter):
-    //  - req == beat->req: a write ack — the adapter round-trips our own request
-    //    object as the single ack. We own it and free it on the last beat.
-    //  - req != beat->req: a read answers our burst with distinct adapter-allocated
-    //    beat objects (one per beat, single- or multi-beat). We free each received
-    //    beat object, and on the last beat free our own burst request (beat->req)
-    //    too — the adapter never frees it — plus our Beat bookkeeping.
     if (req == beat->req)
     {
+        // Own object round-tripped (e.g. INVALID error response).
         if (is_last)
         {
             delete[] beat->data;
@@ -262,7 +362,7 @@ vp::IoRespAck StubMaster::resp_handler(vp::Block *__this, vp::IoReq *req)
     }
     else
     {
-        delete req;
+        req->free();
         if (is_last)
         {
             delete[] beat->data;

@@ -7,6 +7,7 @@
 #include "io_v2_beat_to_single_req_adapter.hpp"
 
 #include <algorithm>
+#include <set>
 
 // ===========================================================================
 // Method roster / call graph
@@ -26,14 +27,16 @@
 //   issue_one_sub_read / issue_pending_sub_reads  — generate & send sub-reads
 //   complete_read_beat / emit_read_beat           — read response -> upstream beat
 //   on_read_burst_complete                        — free a burst slot
-//   schedule_chunk (queue burst) / emit_write_beat (cursor) — WRITE path
+//   schedule_chunk (queue ack stream) / emit_write_beat (cursor) — WRITE path
 //   reschedule_fsm                                — (re)arm fsm_event
 //
 // Typical READ flow:  req_handler (queue burst) -> issue_pending_sub_reads ->
 //   issue_one_sub_read (1/cycle) -> [downstream] -> resp_handler / inline DONE ->
 //   complete_read_beat (schedule) -> fsm_handler -> emit_read_beat (-> upstream).
-// Typical WRITE flow: req_handler (forward whole) -> schedule_chunk (spread acks)
-//   -> fsm_handler -> emit_write_beat (cursor, -> upstream).
+// Typical WRITE flow: req_handler (track burst, forward beat) -> [downstream] ->
+//   schedule_chunk (free/park beat, queue mostly-silent ack stream) ->
+//   fsm_handler -> emit_write_beat (cursor; only the burst-final entry emits
+//   the single recycled data-less ack upstream).
 // ===========================================================================
 
 
@@ -74,8 +77,10 @@ IoV2BeatToSingleReqAdapter::IoV2BeatToSingleReqAdapter(vp::ComponentConf &config
 // IO_REQ_DENIED (back-pressure; the master re-sends on retry) — never DONE.
 //   READ : queue the whole burst (bounded by max_read_bursts) and kick issuing;
 //          the per-beat sub-reads are generated later, one per cycle.
-//   WRITE: forward the whole request as-is to the downstream slave and turn its
-//          single response into the per-beat ack stream (schedule_chunk).
+//   WRITE: track the beat in its per-burst record and forward it as its own
+//          downstream single-req request; the burst is acknowledged upstream
+//          exactly once, when its last beat's downstream leg completes
+//          (schedule_chunk). Atomics keep the classic round-trip.
 vp::IoReqStatus IoV2BeatToSingleReqAdapter::req_handler(vp::Block *__this, vp::IoReq *req)
 {
     auto *self = static_cast<IoV2BeatToSingleReqAdapter *>(__this);
@@ -116,30 +121,126 @@ vp::IoReqStatus IoV2BeatToSingleReqAdapter::req_handler(vp::Block *__this, vp::I
         return vp::IO_REQ_GRANTED;
     }
 
-    // WRITE: forwarded as-is. Register the in-flight slot before forwarding so
-    // the slave can respond inline or same-stack.
     uint64_t burst_addr = req->get_addr();
-    auto inserted = self->in_flight.emplace(req, InFlight{size, 0, burst_addr});
+
+    // Atomic opcodes (LR/SC/SWAP/...) are exempt from the per-burst write ack:
+    // they carry response data, so they keep the classic round-trip — the
+    // master's own request comes back via resp() and nobody else frees it.
+    // Keyed on opcode, not get_is_write() (true for every non-READ opcode).
+    if (req->get_opcode() != vp::WRITE)
+    {
+        auto inserted = self->in_flight.emplace(req,
+            InFlight{size, 0, burst_addr, false, nullptr});
+        if (!inserted.second)
+        {
+            self->trace.force_warning(
+                "Resubmit of in-flight req (req=%p) — resetting bookkeeping\n", req);
+            inserted.first->second = InFlight{size, 0, burst_addr, false, nullptr};
+        }
+
+        vp::IoReqStatus st = self->out.req(req);
+
+        if (st == vp::IO_REQ_DONE)
+        {
+            // get_full_latency() = head latency + bandwidth occupancy
+            // (duration), the latter max-combined across hops.
+            self->schedule_chunk(req, size, req->get_full_latency());
+            return vp::IO_REQ_GRANTED;
+        }
+        if (st == vp::IO_REQ_DENIED)
+        {
+            self->in_flight.erase(req);
+        }
+        return st;
+    }
+
+    // WRITE beat. Under the per-burst ack contract the adapter is the consumer
+    // of the master's allocator-backed write beats: it forwards each beat as
+    // its own downstream single-req request (the single-req plane round-trips
+    // the object, never frees it), frees the beat once its downstream leg
+    // completes, and acknowledges the burst upstream exactly once.
+    bool beat_first = req->is_first;
+    bool beat_last = req->is_last;
+
+    self->traces.assert(req->allocator != nullptr,
+        "write beat is not allocator-backed (req=%p) — unported master", req);
+
+    if (req->is_first || self->open_wr_burst == nullptr)
+    {
+        if (!req->is_first)
+        {
+            self->trace.force_warning(
+                "Write-burst continuation without an open burst (req=%p) — "
+                "opening one\n", req);
+        }
+        else if (self->open_wr_burst != nullptr)
+        {
+            self->trace.force_warning(
+                "Write burst opened while another is still accepting beats "
+                "(req=%p)\n", req);
+        }
+        self->open_wr_burst = new WriteBurst();
+        self->open_wr_burst->base_addr = burst_addr;
+        self->open_wr_burst->burst_id = req->burst_id;
+        self->open_wr_burst->initiator = req->initiator;
+    }
+    WriteBurst *burst = self->open_wr_burst;
+    self->traces.assert(burst->initiator == req->initiator,
+        "write beats of one burst must carry the same initiator (req=%p)", req);
+
+    burst->total += size;
+    if (beat_last)
+    {
+        burst->last_seen = true;
+        // Submission-complete: the next is_first opens a fresh burst even
+        // while this one still awaits downstream completions (pipelining).
+        self->open_wr_burst = nullptr;
+    }
+
+    auto inserted = self->in_flight.emplace(req,
+        InFlight{size, 0, burst_addr, beat_last, burst});
     if (!inserted.second)
     {
         self->trace.force_warning(
             "Resubmit of in-flight req (req=%p) — resetting bookkeeping\n", req);
-        inserted.first->second = InFlight{size, 0, burst_addr};
+        inserted.first->second = InFlight{size, 0, burst_addr, beat_last, burst};
     }
+
+    // The downstream plane is not a beat binding: each forwarded beat is an
+    // independent single-beat request there. Normalise the framing (the
+    // upstream framing was snapshot above; the recycled ack rebuilds its own).
+    req->is_first = true;
+    req->is_last = true;
 
     vp::IoReqStatus st = self->out.req(req);
 
     if (st == vp::IO_REQ_DONE)
     {
-        // Sync big-packet — req->data is already consumed. Synthesize the
-        // per-beat resp() stream now. get_full_latency() = head latency +
-        // bandwidth occupancy (duration), the latter max-combined across hops.
-        self->schedule_chunk(req, req->get_data(), size, req->get_full_latency());
+        // Inline completion — req->data is already consumed. Run the (now
+        // mostly silent) ack scheduling so the burst ack fires on the cycle
+        // the last per-beat ack fired before the protocol change.
+        self->schedule_chunk(req, size, req->get_full_latency());
         return vp::IO_REQ_GRANTED;
     }
     if (st == vp::IO_REQ_DENIED)
     {
+        // Ownership never transferred: restore the beat's framing and roll
+        // the bookkeeping back — the master re-sends this same beat from
+        // retry().
+        req->is_first = beat_first;
+        req->is_last = beat_last;
         self->in_flight.erase(req);
+        burst->total -= size;
+        if (beat_last)
+        {
+            burst->last_seen = false;
+            self->open_wr_burst = burst;
+        }
+        if (burst->total == 0 && burst->completed == 0 && beat_first)
+        {
+            delete burst;
+            self->open_wr_burst = nullptr;
+        }
     }
     return st;
 }
@@ -172,15 +273,14 @@ vp::IoRespAck IoV2BeatToSingleReqAdapter::resp_handler(vp::Block *__this, vp::Io
         return vp::IO_RESP_ACCEPTED;
     }
 
-    // Not the oldest read → it must be a WRITE async response (tracked in
-    // in_flight). A read response that is not the FIFO front means the slave
+    // Not the oldest read → it must be a WRITE/atomic async response (tracked
+    // in in_flight). A read response that is not the FIFO front means the slave
     // reordered, which the single-req contract forbids — catch it loudly.
     self->traces.assert(self->in_flight.find(req) != self->in_flight.end(),
         "SingleReq slave responded out of order or for an unknown request "
         "(req=%p) — read responses must arrive in issue order", req);
 
-    self->schedule_chunk(req, req->get_data(), req->get_size(),
-                         req->get_full_latency());
+    self->schedule_chunk(req, req->get_size(), req->get_full_latency());
     return vp::IO_RESP_ACCEPTED;
 }
 
@@ -429,14 +529,21 @@ void IoV2BeatToSingleReqAdapter::on_read_burst_complete()
 }
 
 
-// WRITE path. Spread a single whole-write response into the per-beat ack stream
-// the upstream beat master expects. Called from req_handler() (inline DONE write)
-// and resp_handler() (async write response). Each ack beat round-trips the
-// master's own request object (see emit_write_beat); beats are emitted 1/cycle so the last
-// lands at now+full_latency. Also enforces the SingleReq contract (one response
-// per request, covering its whole size) in asserts builds.
-void IoV2BeatToSingleReqAdapter::schedule_chunk(vp::IoReq *req, uint8_t *data,
-                                     uint64_t size, int64_t latency_cycles)
+// WRITE path. Completion of one forwarded write beat's (or atomic's) downstream
+// leg. Called from req_handler() (inline DONE) and resp_handler() (async
+// response of the lent object). Latches the beat's status into its burst,
+// consumes the beat (frees it, or parks it for recycling as the ack if it is
+// the burst's last beat) and queues its ack stream — the per-beat pacing
+// arithmetic is UNCHANGED (entries 1/cycle, the last landing at
+// now+full_latency), but every entry is a silent virtual ack except the final
+// entry of the stream that closes the burst, which emits the single recycled
+// data-less burst ack — on exactly the cycle the last per-beat ack fired
+// before the per-burst-ack protocol change. Atomics queue a 1-entry stream
+// that round-trips the master's own request. Also enforces the SingleReq
+// contract (one response per request, covering its whole size) in asserts
+// builds.
+void IoV2BeatToSingleReqAdapter::schedule_chunk(vp::IoReq *req, uint64_t size,
+                                     int64_t latency_cycles)
 {
     auto it = this->in_flight.find(req);
     if (it == this->in_flight.end())
@@ -453,7 +560,9 @@ void IoV2BeatToSingleReqAdapter::schedule_chunk(vp::IoReq *req, uint8_t *data,
             req, size);
         return;
     }
-    InFlight &inf = it->second;
+    // Snapshot: the entry is erased (and the beat freed/parked) below, before
+    // the stream is built.
+    InFlight inf = it->second;
 
     // SingleReq contract: the whole request is answered by exactly one
     // single-beat response (this call) covering its full size. A multi-beat slave
@@ -469,72 +578,141 @@ void IoV2BeatToSingleReqAdapter::schedule_chunk(vp::IoReq *req, uint8_t *data,
     if (n <= 0) n = 1;
 
     // Bandwidth model: the slave's latency annotation is the time-to-completion of
-    // the whole chunk. step is the per-beat slave time so the LAST beat lands at
-    // now+latency; first_ready is when beat 0 is due. Nothing is pre-expanded — the
-    // burst is queued and fsm_handler emits one beat per cycle from its cursor.
+    // the whole chunk. step is the per-beat slave time so the LAST entry lands at
+    // now+latency; first_ready is when entry 0 is due. Nothing is pre-expanded — the
+    // stream is queued and fsm_handler consumes one entry per cycle from its cursor.
     int64_t step = (n > 1) ? std::max((int64_t)1, latency_cycles / n) : (int64_t)1;
     int64_t first_ready = now + latency_cycles - (int64_t)(n - 1) * step;
     if (first_ready < now + 1) first_ready = now + 1;
 
-    this->write_bursts.push_back(WriteBurst{
-        req,
-        data,
-        inf.burst_addr,
-        size,
-        req->burst_id,
-        req->get_resp_status(),
-        n,
-        0,
-        first_ready,
-        step,
+    WriteBurst *burst = inf.burst;
+
+    if (burst == nullptr)
+    {
+        // Atomic (classic round-trip): the master's own request goes back
+        // upstream, carrying its response data and status. It rides the write
+        // ack channel as a 1-entry stream (n == 1 — atomics fit one beat).
+        this->in_flight.erase(it);
+        this->ack_streams.push_back(WriteAckStream{
+            n, 0, first_ready, step,
+            false, true,
+            req,
+            0, 0, -1, vp::IO_RESP_OK, nullptr,
+        });
+        this->trace.msg(vp::Trace::LEVEL_TRACE,
+            "Queue atomic round-trip (req=%p, size=%lu, ready=%ld)\n",
+            req, size, (long)first_ready);
+        this->reschedule_fsm();
+        return;
+    }
+
+    if (req->get_resp_status() == vp::IO_RESP_INVALID)
+    {
+        burst->status = vp::IO_RESP_INVALID;
+    }
+
+    bool req_completes = (inf.bytes_routed + size >= inf.total_size);
+    // The burst closes when this chunk completes its last outstanding bytes
+    // and the is_last beat has been submitted (last_seen is set at submit
+    // time, so out-of-order downstream completions cannot lose the close).
+    bool burst_closes = req_completes && burst->last_seen
+        && (burst->completed + inf.total_size == burst->total);
+
+    // Retire the beat before scheduling so the burst's last beat is parked
+    // (available for recycling as the ack) by the time the stream is built.
+    if (req_completes)
+    {
+        this->in_flight.erase(it);
+        burst->completed += inf.total_size;
+        if (inf.burst_last)
+        {
+            burst->last_beat = req;
+        }
+        else
+        {
+            req->free();
+        }
+    }
+    else
+    {
+        it->second.bytes_routed += size;
+    }
+
+    this->ack_streams.push_back(WriteAckStream{
+        n, 0, first_ready, step,
+        burst_closes, false,
+        burst_closes ? burst->last_beat : nullptr,
+        burst->base_addr, burst->total, burst->burst_id, burst->status,
+        burst->initiator,
     });
 
     this->trace.msg(vp::Trace::LEVEL_TRACE,
-        "Queue write ack burst (req=%p, size=%lu, beats=%d, first_ready=%ld, step=%ld)\n",
-        req, size, n, (long)first_ready, (long)step);
+        "Queue write ack stream (req=%p, size=%lu, entries=%d, first_ready=%ld, "
+        "step=%ld, closes_burst=%d)\n",
+        req, size, n, (long)first_ready, (long)step, burst_closes ? 1 : 0);
 
-    this->in_flight.erase(it);
+    if (burst_closes)
+    {
+        delete burst;
+    }
 
     this->reschedule_fsm();
 }
 
 
-// WRITE path. Generate and forward the front write burst's NEXT ack beat from its
-// cursor (b.emitted_beats) — extracted on the fly, nothing pre-expanded. Called by
-// fsm_handler() once the beat's ready cycle has arrived. The ack reuses the
-// master's own request object (writes are one-resp-per-req, no aliasing). On
-// upstream back-pressure the beat is held (held_write) and re-sent from
-// resp_retry_in_handler, which advances the cursor when it finally lands; on accept
-// the cursor advances here.
-void IoV2BeatToSingleReqAdapter::emit_write_beat(WriteBurst &b)
+// WRITE path. Consume the front ack stream's NEXT entry from its cursor
+// (b.emitted_beats) — extracted on the fly, nothing pre-expanded. Called by
+// fsm_handler() once the entry's ready cycle has arrived. Non-final entries
+// (and the final entry of a stream that does not close its burst) are SILENT
+// virtual acks: they advance the cursor and emit nothing, pacing the channel
+// exactly as the per-beat acks did. The burst-final entry emits the single
+// data-less burst ack, recycling the burst's consumed last beat (see
+// io_v2.hpp, "The write ack"); an atomic stream's final entry round-trips the
+// master's own request instead. On upstream back-pressure the emitted object
+// is held (held_write) and re-sent from resp_retry_in_handler, which advances
+// the cursor when it finally lands; on accept the cursor advances here.
+void IoV2BeatToSingleReqAdapter::emit_write_beat(WriteAckStream &b)
 {
     int i = b.emitted_beats;
-    uint64_t offset = (uint64_t)i * (uint64_t)this->beat_width;
-    uint64_t beat = b.total_size > offset
-        ? std::min<uint64_t>(b.total_size - offset, (uint64_t)this->beat_width)
-        : 0;
+    bool final_entry = (i == b.nb_beats - 1);
 
-    vp::IoReq *req = b.up_req;
-    req->set_addr(b.base_addr + offset);
-    req->set_data(b.base_data + offset);
-    req->set_size(beat);
-    req->burst_id = b.burst_id;
-    req->is_first = (i == 0);
-    req->is_last  = (i == b.nb_beats - 1);
-    req->set_resp_status(b.status);
+    if (!final_entry || (!b.closes_burst && !b.is_atomic))
+    {
+        this->trace.msg(vp::Trace::LEVEL_TRACE,
+            "Consume write tick (entry=%d/%d)\n", i, b.nb_beats);
+        b.emitted_beats++;
+        return;
+    }
+
+    vp::IoReq *r = b.ack;
+    if (!b.is_atomic)
+    {
+        r->prepare();
+        r->set_addr(b.ack_addr);
+        r->set_data(nullptr);
+        r->set_size(b.ack_size);
+        r->burst_id = b.ack_burst_id;
+        r->is_first = true;
+        r->is_last = true;
+        r->set_resp_status(b.ack_status);
+        r->initiator = b.ack_initiator;
+    }
 
     this->trace.msg(vp::Trace::LEVEL_TRACE,
-        "Emit write ack (req=%p, beat=%d/%d, offset=%lu, size=%lu, first=%d, last=%d)\n",
-        req, i, b.nb_beats, offset, beat, req->is_first ? 1 : 0, req->is_last ? 1 : 0);
+        "Emit write %s (req=%p, addr=0x%lx, size=%lu, status=%d)\n",
+        b.is_atomic ? "atomic round-trip" : "burst ack",
+        r, r->get_addr(), (unsigned long)r->get_size(),
+        (int)r->get_resp_status());
 
-    if (this->in.resp(req) == vp::IO_RESP_DENIED)
+    if (this->in.resp(r) == vp::IO_RESP_DENIED)
     {
-        // Upstream busy: hold the master's own request and re-send it on
-        // resp_retry. Do NOT advance the cursor — resp_retry advances it once the
-        // held beat is accepted. A write ack frees nothing.
+        // Upstream busy: hold the ack and re-send it on resp_retry. Do NOT
+        // advance the cursor — resp_retry advances it once the held ack is
+        // accepted.
         this->resp_held = true;
-        this->held_req = req;
+        this->held_req = r;
         this->held_write = true;
+        this->held_ack_owned = !b.is_atomic;
         this->held_read_last = false;
         return;
     }
@@ -567,13 +745,13 @@ void IoV2BeatToSingleReqAdapter::resp_retry_in_handler(vp::Block *__this,
     // The held beat just landed. Advance the matching cursor:
     if (self->held_write)
     {
-        // Front write burst's current ack beat: advance it, drop the burst once
-        // its last beat has been accepted.
-        WriteBurst &b = self->write_bursts.front();
+        // Front ack stream's final entry: advance it and drop the stream (the
+        // real ack is always a stream's final entry).
+        WriteAckStream &b = self->ack_streams.front();
         b.emitted_beats++;
         if (b.emitted_beats >= b.nb_beats)
         {
-            self->write_bursts.pop_front();
+            self->ack_streams.pop_front();
         }
     }
     else if (self->held_read_last)
@@ -585,6 +763,7 @@ void IoV2BeatToSingleReqAdapter::resp_retry_in_handler(vp::Block *__this,
     self->held_req = nullptr;
     self->held_read_last = false;
     self->held_write = false;
+    self->held_ack_owned = false;
     // Resume draining the rest of the beats (next cycle — one beat per cycle).
     self->reschedule_fsm();
 }
@@ -611,20 +790,22 @@ void IoV2BeatToSingleReqAdapter::fsm_handler(vp::Block *__this, vp::ClockEvent *
         self->emit_read_beat(rb);
     }
 
-    // Emit the front write burst's next ack beat (independent channel), at most one
-    // per cycle, generated on the fly from its cursor. The burst is dropped once
-    // its last beat has been sent; a backlog drains one beat per cycle (reschedule
-    // re-arms for now+1 while a due beat remains).
-    if (!self->resp_held && !self->write_bursts.empty())
+    // Consume the front ack stream's next entry (independent channel), at most
+    // one per cycle, generated on the fly from its cursor — silent virtual
+    // acks and the burst-final real ack pace identically, so the ack fires on
+    // the same cycle the last per-beat ack did. The stream is dropped once its
+    // last entry has been consumed; a backlog drains one entry per cycle
+    // (reschedule re-arms for now+1 while a due entry remains).
+    if (!self->resp_held && !self->ack_streams.empty())
     {
-        WriteBurst &b = self->write_bursts.front();
+        WriteAckStream &b = self->ack_streams.front();
         int64_t ready = b.first_ready + (int64_t)b.emitted_beats * b.step;
         if (ready <= now)
         {
             self->emit_write_beat(b);
             if (!self->resp_held && b.emitted_beats >= b.nb_beats)
             {
-                self->write_bursts.pop_front();
+                self->ack_streams.pop_front();
             }
         }
     }
@@ -659,9 +840,9 @@ void IoV2BeatToSingleReqAdapter::reschedule_fsm()
     {
         next = std::min(next, this->read_pending.front().ready_cycle);
     }
-    if (!this->write_bursts.empty())
+    if (!this->ack_streams.empty())
     {
-        const WriteBurst &b = this->write_bursts.front();
+        const WriteAckStream &b = this->ack_streams.front();
         next = std::min(next, b.first_ready + (int64_t)b.emitted_beats * b.step);
     }
     // A burst still to issue (head of the issue chain; room in the window, not
@@ -723,13 +904,56 @@ void IoV2BeatToSingleReqAdapter::debug_mem_regions(std::vector<vp::DebugMemRegio
 
 // Component reset hook, called by the framework (active=true on entering reset).
 // Drops all queued work and frees the objects the adapter still owns (in-flight
-// sub-reads and not-yet-emitted read beats); the master-owned burst requests are
-// not freed here. Re-initialises the pacing cursors and cancels fsm_event.
+// sub-reads, not-yet-emitted read beats, and the consumed write beats of live
+// bursts — lent, parked or recycled); the master-owned read burst requests and
+// atomic round-trips are not freed here. Re-initialises the pacing cursors and
+// cancels fsm_event.
 void IoV2BeatToSingleReqAdapter::reset(bool active)
 {
     if (active)
     {
-        this->write_bursts.clear();
+        // Scheduled ack streams: a burst-closing stream carries the parked
+        // (recycled) last beat as its pending ack — return it to its pool. An
+        // atomic stream's object is the master's own request, left alone;
+        // silent streams carry nothing.
+        for (auto &b : this->ack_streams)
+        {
+            if (b.closes_burst && !b.is_atomic && b.ack != nullptr)
+            {
+                b.ack->free();
+            }
+        }
+        this->ack_streams.clear();
+        // Live write bursts: the one still accepting beats plus any awaiting
+        // downstream completions (referenced by in_flight). Their in-flight
+        // beats were lent to the downstream (which never frees them) — the
+        // adapter consumes them here. A parked last beat is freed with its
+        // burst. Atomic in-flight entries (burst == nullptr) are the master's
+        // own requests, left alone.
+        {
+            std::set<WriteBurst *> bursts;
+            if (this->open_wr_burst != nullptr)
+            {
+                bursts.insert(this->open_wr_burst);
+            }
+            for (auto &kv : this->in_flight)
+            {
+                if (kv.second.burst != nullptr)
+                {
+                    kv.first->free();
+                    bursts.insert(kv.second.burst);
+                }
+            }
+            for (WriteBurst *b : bursts)
+            {
+                if (b->last_beat != nullptr)
+                {
+                    b->last_beat->free();
+                }
+                delete b;
+            }
+            this->open_wr_burst = nullptr;
+        }
         this->in_flight.clear();
         this->issue_bursts.clear();
         this->drain_bursts.clear();
@@ -751,9 +975,11 @@ void IoV2BeatToSingleReqAdapter::reset(bool active)
         }
         this->read_pending.clear();
         this->sub_read_denied = false;
-        // A held (back-pressured) read beat is allocator-backed and ours —
-        // free it; a held write ack is the master's own request, left alone.
-        if (this->resp_held && !this->held_write && this->held_req != nullptr)
+        // A held (back-pressured) read beat or recycled burst ack is
+        // allocator-backed and ours — free it; a held atomic round-trip is the
+        // master's own request, left alone.
+        if (this->resp_held && this->held_req != nullptr
+            && (!this->held_write || this->held_ack_owned))
         {
             this->held_req->free();
         }
@@ -761,6 +987,7 @@ void IoV2BeatToSingleReqAdapter::reset(bool active)
         this->held_req = nullptr;
         this->held_read_last = false;
         this->held_write = false;
+        this->held_ack_owned = false;
         this->read_last_sched_cycle = -1;
         this->read_issue_last_cycle = -1;
         if (this->fsm_event.is_enqueued())

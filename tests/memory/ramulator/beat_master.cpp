@@ -155,6 +155,12 @@ void BeatMaster::reset(bool active)
     }
 }
 
+static vp::IoReq *_pool_alloc(BeatMaster *m, void *unused)
+{
+    (void)m; (void)unused;
+    return vp::IoReqAllocator::get(0)->alloc();
+}
+
 void BeatMaster::send_burst(Entry *entry)
 {
     int64_t now = this->clock.get_cycles();
@@ -184,7 +190,18 @@ void BeatMaster::send_burst(Entry *entry)
         bs->buffer = nullptr;
     }
 
-    bs->req = new vp::IoReq(entry->addr, bs->buffer, entry->size, entry->is_write);
+    // Writes: a size-0-pool one-beat burst the target consumes and frees
+    // (per-burst write-ack contract); expect a single data-less ack.
+    // Reads: our own data-less descriptor (initiator-owned, freed by us).
+    if (entry->is_write)
+    {
+        bs->req = _pool_alloc(this, bs);
+        bs->expected_beats = 1;
+    }
+    else
+    {
+        bs->req = new vp::IoReq(entry->addr, bs->buffer, entry->size, false);
+    }
 
     if (!this->quiet)
         printf("[%ld] %s SEND name=%s addr=0x%lx size=%lu write=%d burst_id=%ld expect_beats=%d\n",
@@ -205,11 +222,23 @@ vp::IoReqStatus BeatMaster::issue(BurstState *bs)
     bs->req->set_size(e->size);
     bs->req->set_is_write(e->is_write);
     bs->req->prepare();
+    if (e->is_write)
+    {
+        // Size-0 pool object: data is caller-managed, set on every issue.
+        bs->req->set_data(bs->buffer);
+    }
     bs->req->is_first = true;
     bs->req->is_last = true;
     bs->req->burst_id = e->burst_id;
     bs->req->initiator = bs;
-    return this->out.req(bs->req);
+    vp::IoReqStatus st = this->out.req(bs->req);
+    if (e->is_write && st == vp::IO_REQ_GRANTED)
+    {
+        // Ownership transferred: the target frees the beat; the burst ack
+        // (distinct, data-less) correlates back via initiator.
+        bs->req = nullptr;
+    }
+    return st;
 }
 
 void BeatMaster::handle_status(BurstState *bs, vp::IoReqStatus st)
@@ -225,11 +254,23 @@ void BeatMaster::handle_status(BurstState *bs, vp::IoReqStatus st)
         this->denied.push_back(bs);
         return;
     }
-    // IO_REQ_DONE: answered inline (e.g. a DRAMSys write ack). No beats.
+    // IO_REQ_DONE: answered inline (a last write beat's inline burst ack, or
+    // an error). The master keeps the beat — recycle it to its pool.
     int64_t now = this->clock.get_cycles();
     printf("[%ld] %s DONE name=%s status=%d\n", now, this->logname.c_str(),
         bs->entry->name.c_str(), (int)bs->req->get_resp_status());
+    if (bs->entry->is_write)
+    {
+        bs->req->free();
+    }
+    else
+    {
+        delete bs->req;
+    }
+    delete[] bs->buffer;
+    delete bs;
     this->outstanding--;
+    this->bursts_done++;
 }
 
 void BeatMaster::issue_handler(vp::Block *__this, vp::ClockEvent *event)
@@ -290,8 +331,9 @@ vp::IoRespAck BeatMaster::resp_handler(vp::Block *__this, vp::IoReq *req)
     if (!_this->quiet)
     {
         char hex[17] = { 0 };
-        int n = req->get_size() < 8 ? (int)req->get_size() : 8;
         uint8_t *d = req->get_data();
+        int n = (d != nullptr && req->get_size() < 8) ? (int)req->get_size()
+                : (d != nullptr ? 8 : 0);
         for (int i = 0; i < n; i++) snprintf(&hex[i * 2], 3, "%02x", d[i]);
 
         printf("[%ld] %s RESP name=%s beat=%d/%d addr=0x%lx size=%lu first=%d last=%d status=%d data=%s\n",
@@ -303,7 +345,14 @@ vp::IoRespAck BeatMaster::resp_handler(vp::Block *__this, vp::IoReq *req)
         // ---- Beat-stream protocol assertions (skip in quiet speed runs) ----
         _this->traces.assert(req->burst_id == e->burst_id,
             "beat burst_id %ld != expected %ld", (long)req->burst_id, (long)e->burst_id);
-        if (bs->beats_seen == 0)
+        if (e->is_write)
+        {
+            // Per-burst ack contract: exactly one data-less ack.
+            _this->traces.assert(req->is_last && req->get_data() == nullptr,
+                "malformed write burst ack (last=%d, data=%p)",
+                req->is_last ? 1 : 0, req->get_data());
+        }
+        else if (bs->beats_seen == 0)
             _this->traces.assert(req->is_first, "first beat must have is_first=1");
         else
             _this->traces.assert(!req->is_first, "non-first beat must have is_first=0");
@@ -315,9 +364,10 @@ vp::IoRespAck BeatMaster::resp_handler(vp::Block *__this, vp::IoReq *req)
     bs->beats_seen++;
     bool last = req->is_last;
 
-    // Read beats are distinct allocator-backed objects — free each back to
-    // its pool. Write acks round-trip our own descriptor (req == bs->req),
-    // which we free once on the last ack below (initiator-owned convention).
+    // Read beats and the write burst ack are distinct allocator-backed
+    // objects — free each back to its pool (our own read descriptor is
+    // freed separately below; the write descriptor was consumed by the
+    // target at grant time).
     if (req != bs->req)
     {
         req->free();
@@ -328,7 +378,10 @@ vp::IoRespAck BeatMaster::resp_handler(vp::Block *__this, vp::IoReq *req)
         if (!_this->quiet)
             _this->traces.assert(bs->beats_seen == bs->expected_beats,
                 "got %d beats, expected %d", bs->beats_seen, bs->expected_beats);
-        delete bs->req;
+        if (bs->req != nullptr)
+        {
+            delete bs->req;
+        }
         delete[] bs->buffer;
         delete bs;
         _this->outstanding--;

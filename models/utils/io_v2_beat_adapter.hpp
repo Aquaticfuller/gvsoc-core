@@ -17,7 +17,7 @@
  *   - submit() (the IoSlave "input" port's req callback) returns IO_REQ_GRANTED
  *     or IO_REQ_DENIED — never IO_REQ_DONE. An inline DONE from the downstream
  *     slave is converted to a scheduled per-beat resp() stream.
- *   - For each accepted submission, the upstream master receives exactly
+ *   - For each accepted READ submission, the upstream master receives exactly
  *     ceil(total_size / beat_width) resp() calls in cumulative byte order,
  *     with is_first=true on the first call, is_last=true on the last, and
  *     size / addr / burst_id / status set per beat. Read beats are distinct
@@ -26,6 +26,16 @@
  *     payload out and frees each beat. addr is set to the per-beat start
  *     address (= burst_addr + cumulative emitted bytes); see the io_v2.hpp
  *     contract note about per-beat addr.
+ *   - WRITES are acknowledged once per burst (AXI B-channel semantics, see
+ *     io_v2.hpp "Write acknowledgement"). The adapter is the consumer of the
+ *     master's allocator-backed write beats: it forwards each beat
+ *     downstream (the big-packet plane round-trips it, never frees it),
+ *     frees the beat once its downstream leg completes, and emits a single
+ *     data-less ack upstream — recycling the burst's last beat as the ack —
+ *     when the whole burst has completed. The per-beat ack-scheduling
+ *     arithmetic is kept as silent ticks (virtual acks) so the single real
+ *     ack fires on exactly the cycle the last per-beat ack fired before the
+ *     protocol change.
  *   - Per-beat ready cycle honours the slave's req->latency annotation. A
  *     sync DONE / async big resp covering M beats spreads them at
  *     now+latency, now+latency+1, … so the LAST beat lands at now+latency
@@ -70,6 +80,11 @@ private:
     vp::DebugMemIf *resolve_debug_mem();
 
     // One scheduled beat, sitting in the pending deque until its ready cycle.
+    // Read entries carry req = the upstream burst request and beat = the
+    // completed sub-read forwarded upstream. Write entries carry
+    // req = nullptr: they are silent virtual-ack ticks (they only pace the
+    // write cursor), except the burst-final one, which carries the recycled
+    // last beat in `beat` and emits it as the single data-less burst ack.
     struct PendingBeat
     {
         vp::IoReq *req;
@@ -83,10 +98,32 @@ private:
         vp::IoRespStatus status;
         // burst_id snapshot — see file header.
         int64_t  burst_id;
-        // Read path only: the allocator-backed sub-read object, forwarded
+        // Read path: the allocator-backed sub-read object, forwarded
         // upstream as the response beat (its co-allocated payload holds the
-        // read data). nullptr on the write path (writes round-trip req).
+        // read data). Write path: the recycled ack object (burst-final
+        // entry) or nullptr (silent entry).
         vp::IoReq *beat = nullptr;
+        // Write path only: silent virtual-ack tick (no upstream resp).
+        bool silent = false;
+        // Write path only: initiator carried onto the burst ack.
+        void *initiator = nullptr;
+    };
+
+    // One upstream write burst in flight. Opened by the is_first beat,
+    // submission-closed by the is_last beat (last_seen), deleted when every
+    // beat has completed downstream and the ack entry has been scheduled.
+    struct WriteBurst
+    {
+        bool last_seen = false;   // the is_last beat has been submitted
+        uint64_t total = 0;       // bytes submitted so far (final once last_seen)
+        uint64_t completed = 0;   // bytes whose downstream leg completed
+        uint64_t base_addr = 0;
+        int64_t burst_id = -1;    // snapshot from the opening beat
+        void *initiator = nullptr;
+        vp::IoRespStatus status = vp::IO_RESP_OK;
+        // The burst's is_last beat, parked at its downstream completion for
+        // recycling as the upstream ack (data-less, size-0-pool object).
+        vp::IoReq *last_beat = nullptr;
     };
 
     // Per-in-flight-request progress. Keyed by the upstream IoReq*; alive
@@ -97,6 +134,8 @@ private:
         uint64_t total_size;
         uint64_t bytes_routed;
         uint64_t burst_addr;      // snapshot of req->addr at submit time
+        bool burst_last;          // snapshot of req->is_last at submit time
+        WriteBurst *burst;        // owning burst record
     };
 
     // One beat-sized downstream sub-read to perform for an in-flight read
@@ -123,8 +162,10 @@ private:
     static void            resp_retry_in_handler(vp::Block *__this, vp::IoRetryChannel channel);
     static void            fsm_handler(vp::Block *__this, vp::ClockEvent *event);
 
-    void schedule_chunk(vp::IoReq *req, uint8_t *data, uint64_t size,
-                        int64_t latency_cycles);
+    void schedule_chunk(vp::IoReq *req, uint64_t size, int64_t latency_cycles);
+    // Atomics keep the classic round-trip: relay the downstream completion as
+    // one upstream resp() of the master's own object (never freed here).
+    void schedule_atomic(vp::IoReq *req, int64_t latency_cycles);
     void reschedule_fsm();
     void emit_beat(const PendingBeat &ev);
 
@@ -146,6 +187,11 @@ private:
     vp::ClockEvent fsm_event;
     std::deque<PendingBeat> pending;
     std::unordered_map<vp::IoReq *, InFlight> in_flight;
+    // The write burst currently accepting beats (nullptr between bursts:
+    // after an is_last submission and before the next is_first). Bursts may
+    // pipeline — several may await completion — but their beats never
+    // interleave on one binding, so a single open slot suffices.
+    WriteBurst *open_wr_burst = nullptr;
     // Ready cycle of the last beat scheduled so far, tracked separately for the
     // read and write channels. New beats on a channel are forced to be at least
     // one cycle after the previous beat on that *same* channel, so each channel
@@ -211,6 +257,9 @@ private:
     // initiator owns it (initiator-owned request convention).
     bool resp_held = false;
     vp::IoReq *held_req = nullptr;
+    // Whether the held object is adapter-owned (read beat / recycled write
+    // ack — freeable on reset) or the master's own atomic object (not ours).
+    bool held_is_ours = false;
 
     vp::Trace trace;
 };

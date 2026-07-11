@@ -462,6 +462,34 @@ def build_case(case: str):
             nb_masters=2,
         )
 
+    if case == 'write_inline_ack_native':
+        # Native IoV2Beat target bound raw (no adapter). 4-beat write burst;
+        # the target consumes+frees non-last beats and answers the LAST beat
+        # with an inline DONE — the router must synthesize the burst ack
+        # itself (synth-ack queue) and deliver it through the response FSM.
+        return dict(
+            config=beat_cfg(max_input_pending_size=64),
+            schedule=[burst(cycle=10, addr=t0_base, size=4, nb_beats=4,
+                            burst_id=1, name='W', is_write=True)],
+            targets=[('t0', t0_base, window, ok)],
+            nb_masters=1,
+            native_beat_width=4,
+        )
+
+    if case == 'write_granted_ack_native':
+        # Same shape but the native target GRANTs the last beat too and
+        # produces the data-less burst ack itself after resp_delay cycles —
+        # exercising the router's write-ack path in resp_muxed.
+        rules_t0 = [rule(behavior='granted', resp_delay=5)]
+        return dict(
+            config=beat_cfg(max_input_pending_size=64),
+            schedule=[burst(cycle=10, addr=t0_base, size=4, nb_beats=4,
+                            burst_id=1, name='W', is_write=True)],
+            targets=[('t0', t0_base, window, rules_t0)],
+            nb_masters=1,
+            native_beat_width=4,
+        )
+
     if case == 'fifo_overflow':
         # Force the router's input FIFO to fill: target denies the first beat once
         # with a long retry_delay, so the output stalls and beats back up in the
@@ -597,7 +625,8 @@ class Chip(gvsoc.systree.Component):
             mb.o_OUTPUT(router.i_INPUT(1))
 
         for (tname, base, size, rules) in spec['targets']:
-            tgt = StubTarget(self, tname, rules=rules, logname=tname)
+            tgt = StubTarget(self, tname, rules=rules, logname=tname,
+                             native_beat_width=spec.get('native_beat_width', 0))
             clock.o_CLOCK(tgt.i_CLOCK())
             router.o_MAP(tgt.i_INPUT(), RouterMapping(name=tname, base=base, size=size))
 

@@ -17,29 +17,40 @@
  *             stream). The router emits one upstream resp() per response beat;
  *             the slot stays alive until the response stream's is_last.
  *   - Writes: N forward req() beats per burst (size <= width each), with
- *             per-beat is_first/is_last/burst_id from the master. Each forward
- *             produces exactly one upstream resp() (the upstream slave answers
- *             one beat per req for writes).
+ *             per-beat is_first/is_last/burst_id from the master. The burst is
+ *             acknowledged exactly ONCE (AXI B-channel semantics, see
+ *             io_v2.hpp "Write acknowledgement"): the router passes the
+ *             master's beats through unchanged (ownership travels with the
+ *             beat — the downstream consumer frees them), and forwards the
+ *             single data-less burst ack back upstream when it arrives. A
+ *             native beat slave answering the last beat with an inline DONE
+ *             has its ack synthesized by the router (the beat it still owns
+ *             is recycled as the ack) through the response FSM.
  *
  * Per-burst routing table: a fixed-size table (`max_pending_bursts` entries).
  * On is_first of a burst the input allocates a slot; subsequent beats (writes
  * only) reuse it. The slot holds the originating input, the translated output,
- * the burst's direction-channel and the master's original burst_id. On forward
- * we remap beat.burst_id to the slot index; the downstream slave (or auto-
- * inserted adapter) echoes it back on response; the response handler looks up
+ * the burst's direction-channel, the master's original burst_id and the
+ * write-burst accounting for the ack (base addr, total bytes, latched error
+ * status). On forward we remap beat.burst_id to the slot index; the
+ * downstream slave (or auto-inserted adapter) echoes it back on the response
+ * (read beats and the write burst ack alike); the response handler looks up
  * the slot in O(1) via the remapped id.
  *
- * Master-side is_last preservation: when the framework auto-inserts an
- * IoV2BeatAdapter on the path, the adapter mutates ``req->is_last`` per resp()
- * to reflect position within the response stream. That destroys the master's
- * per-forward is_last (which the router needs to decide when a write burst is
- * done). We snapshot ``req->is_last`` per forward into the slot's
- * ``pending_master_is_last`` deque and pop it on the matching resp.
+ * Master-side is_last preservation (reads/atomics only): when the framework
+ * auto-inserts an IoV2BeatAdapter on the path, the adapter mutates
+ * ``req->is_last`` per resp() to reflect position within the response stream.
+ * That destroys the master's per-forward is_last (which the router needs to
+ * decide when the burst is done). We snapshot ``req->is_last`` per forward
+ * into the slot's ``pending_master_is_last`` deque and pop it on the matching
+ * resp. Pure write beats produce no per-forward response, so nothing is
+ * pushed for them — the burst completes on its single ack.
  *
  * Throughput: 1 forward beat per cycle per (output, channel) on the forward
  * side; 1 response beat per cycle per output on the response side (paced by
  * the adapter). Burst atomicity: an output channel locked to an input on
- * is_first forward stays locked until is_last response.
+ * is_first forward stays locked until the burst ack (write) / is_last
+ * response (read).
  */
 
 #include <climits>
@@ -73,11 +84,19 @@ struct BurstEntry
     int channel = 0;                   // resolved direction-channel for this burst
     int64_t original_burst_id = -1;    // master's burst_id, restored on response
     // Snapshot of req->is_last as the master submitted each forward beat into
-    // this slot. Used to detect burst completion in the resp handler because
-    // an auto-inserted IoV2BeatAdapter may overwrite req->is_last with the
-    // per-response-beat value. Pop on each resp whose resp_is_last_of_chunk
-    // is true; peek otherwise (multi-beat read response).
+    // this slot — reads and atomics only (pure write beats produce no
+    // per-forward response). Used to detect burst completion in the resp
+    // handler because an auto-inserted IoV2BeatAdapter may overwrite
+    // req->is_last with the per-response-beat value. Pop on each resp whose
+    // resp_is_last_of_chunk is true; peek otherwise (multi-beat read
+    // response).
     std::deque<bool> pending_master_is_last;
+    // Write-burst accounting for the single burst ack: master-side base
+    // address of the first beat, cumulative forwarded payload bytes, and the
+    // OR-latched error status (any rejected beat flips it to INVALID).
+    uint64_t base_addr = 0;
+    uint64_t total_bytes = 0;
+    vp::IoRespStatus status = vp::IO_RESP_OK;
 };
 
 class OutputPort
@@ -246,6 +265,11 @@ private:
     // output whose target input is still busy this cycle re-stalls and is
     // retried again on the next response-FSM tick.
     void drive_stalled_resps();
+    // Deliver due synthesized write-burst acks (produced when a native beat
+    // slave answered the burst's last beat with an inline DONE, or on a
+    // decode error), honouring the per-(input, channel) one-beat-per-cycle
+    // response pacing.
+    void deliver_synth_acks();
     int channel_of(bool is_write) const
     {
         return this->cfg.shared_rw_channel ? 0 : (is_write ? 1 : 0);
@@ -271,6 +295,15 @@ private:
     std::vector<InputPort *> inputs;
     std::vector<OutputPort *> entries;
     std::vector<BurstEntry> burst_table;
+    // Synthesized write-burst acks awaiting delivery (recycled last beats;
+    // see deliver_synth_acks). Drained by the response FSM.
+    struct SynthAck
+    {
+        vp::IoReq *ack;
+        int slot_idx;
+        int64_t ready;
+    };
+    std::deque<SynthAck> synth_acks;
     vp::ClockEvent fsm_event;
     vp::ClockEvent resp_fsm_event;
     int round_robin_next = 0;
@@ -500,6 +533,9 @@ void RouterBeat::free_burst_slot(int slot_idx)
     slot.output_id = -1;
     slot.original_burst_id = -1;
     slot.pending_master_is_last.clear();
+    slot.base_addr = 0;
+    slot.total_bytes = 0;
+    slot.status = vp::IO_RESP_OK;
 }
 
 void RouterBeat::schedule_fsm()
@@ -540,40 +576,104 @@ vp::IoReqStatus RouterBeat::forward_beat(InputPort *in, OutputPort *out,
     // restores burst_id from slot.original_burst_id.
     uint64_t original_addr = beat->get_addr();
     int64_t original_burst_id = beat->burst_id;
-    // Snapshot the fields the GUI log needs; the access is logged only once it
-    // is actually accepted (below). A denied forward is re-tried later and must
-    // not show up as a separate access at the denied address.
+    // Snapshot everything we still need after the forward. A granted pure
+    // write beat is consumed (and possibly freed) by the downstream inside
+    // req(), so the beat must not be dereferenced after a successful forward.
+    // The access is logged only once it is actually accepted (below): a
+    // denied forward is re-tried later and must not show up as a separate
+    // access at the denied address.
     uint64_t log_size     = beat->get_size();
     bool     log_is_write = beat->get_is_write();
     bool     log_first    = beat->is_first;
     bool     log_last     = beat->is_last;
+    bool     is_pure_write = beat->get_opcode() == vp::WRITE;
     beat->set_addr(original_addr - out->remove_offset + out->add_offset);
     beat->burst_id = slot_idx;
 
     // Snapshot the master's is_last so the resp handler can detect burst
-    // completion. The downstream (or auto-inserted IoV2BeatAdapter) is free to
-    // overwrite req->is_last with a per-response-beat value, so we cannot rely
-    // on reading it back from the request later.
-    slot.pending_master_is_last.push_back(beat->is_last);
+    // completion — reads and atomics only: a pure write burst produces no
+    // per-forward response, just the single burst ack. The downstream (or
+    // auto-inserted IoV2BeatAdapter) is free to overwrite req->is_last with a
+    // per-response-beat value, so we cannot rely on reading it back later.
+    if (!is_pure_write)
+    {
+        slot.pending_master_is_last.push_back(log_last);
+    }
 
     vp::IoReqStatus st = out->bus.req(beat);
-    // An IoV2Beat-side master never surfaces IO_REQ_DONE: an auto-inserted
-    // IoV2BeatAdapter converts inline DONE into a scheduled beat-callback
-    // stream, and a directly-bound IoV2Beat slave is required to respond
-    // asynchronously per beat. Assert defensively in case the contract is
-    // violated at runtime.
-    vp_assert(st != vp::IO_REQ_DONE, &this->trace,
-        "IoV2Beat master must not surface IO_REQ_DONE\n");
+
+    if (st == vp::IO_REQ_DONE)
+    {
+        // Only a pure write beat may legally complete inline on the beat
+        // plane: the last beat's inline burst ack (native beat slave fast
+        // path), or the DONE + IO_RESP_INVALID escape hatch on a malformed
+        // beat. Reads and atomics must respond asynchronously (an
+        // auto-inserted IoV2BeatAdapter converts inline DONEs for them).
+        vp_assert(is_pure_write, &this->trace,
+            "IoV2Beat master must not surface IO_REQ_DONE on reads/atomics\n");
+        vp_assert(log_last || beat->get_resp_status() == vp::IO_RESP_INVALID,
+            &this->trace,
+            "inline DONE on a non-last write beat must carry IO_RESP_INVALID\n");
+
+        out->log_access(original_addr, log_size, log_is_write, log_first, log_last);
+        in->pending.pop_front();
+        in->pending_bytes -= log_size;
+        if (in->pending.empty()) in->head_cycle.set(INT64_MAX);
+
+        if (beat->get_resp_status() == vp::IO_RESP_INVALID)
+        {
+            slot.status = vp::IO_RESP_INVALID;
+        }
+        slot.total_bytes += log_size;
+
+        if (log_last)
+        {
+            // Inline burst ack: DONE keeps ownership with the caller, so the
+            // router owns the beat — recycle it as the upstream ack,
+            // delivered through the response FSM so it honours the
+            // per-(input, channel) response pacing and lands at
+            // now + full_latency, like a downstream-produced ack would.
+            int64_t lat = beat->get_full_latency();
+            beat->prepare();
+            beat->set_addr(slot.base_addr);
+            beat->set_data(nullptr);
+            beat->set_size(slot.total_bytes);
+            beat->is_first = true;
+            beat->is_last = true;
+            beat->burst_id = slot.original_burst_id;
+            beat->set_resp_status(slot.status);
+            this->synth_acks.push_back(SynthAck{beat, slot_idx,
+                this->clock.get_cycles() + std::max((int64_t)1, lat)});
+            this->schedule_resp_fsm();
+        }
+        else
+        {
+            // Escape hatch on a mid-burst beat: the burst continues and its
+            // ack will carry IO_RESP_INVALID. The router owns the rejected
+            // beat — release it.
+            beat->free();
+        }
+        // The FIFO advanced either way — report GRANTED to the arbitration
+        // caller (DONE never leaks upstream of the router).
+        return vp::IO_REQ_GRANTED;
+    }
 
     if (st == vp::IO_REQ_GRANTED)
     {
         // Accepted: log the access now (once), at the master-side address.
+        // Use the snapshots — a granted pure write beat now belongs to the
+        // downstream consumer and may already be freed.
         out->log_access(original_addr, log_size, log_is_write, log_first, log_last);
         in->pending.pop_front();
         // Mirror the directional accounting from req_muxed.
-        in->pending_bytes -= beat->get_is_write() ? beat->get_size() : 0;
+        in->pending_bytes -= log_is_write ? log_size : 0;
         if (in->pending.empty()) in->head_cycle.set(INT64_MAX);
-        // Slot stays alive until the resp handler fires for the burst's is_last.
+        if (is_pure_write)
+        {
+            slot.total_bytes += log_size;
+        }
+        // Slot stays alive until the burst ack (write) / is_last response
+        // (read) fires in the resp handler.
     }
     else // IO_REQ_DENIED
     {
@@ -582,7 +682,10 @@ vp::IoReqStatus RouterBeat::forward_beat(InputPort *in, OutputPort *out,
         // output until retry().
         beat->set_addr(original_addr);
         beat->burst_id = original_burst_id;
-        slot.pending_master_is_last.pop_back();
+        if (!is_pure_write)
+        {
+            slot.pending_master_is_last.pop_back();
+        }
     }
 
     return st;
@@ -670,6 +773,9 @@ vp::IoReqStatus RouterBeat::req_muxed(vp::Block *__this, vp::IoReq *req, int por
         slot.output_id = -1;                          // decoded later by fsm
         slot.channel = _this->channel_of(is_write);
         slot.original_burst_id = req->burst_id;
+        slot.base_addr = req->get_addr();
+        slot.total_bytes = 0;
+        slot.status = vp::IO_RESP_OK;
 
         // Lock the input only while a multi-beat burst is mid-stream so its
         // continuation beats can find their slot. Single-beat bursts
@@ -749,21 +855,58 @@ void RouterBeat::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 !_this->entries[mapping->id]->bus.is_bound())
             {
                 _this->stat_errors++;
-                beat->set_resp_status(vp::IO_RESP_INVALID);
+                bool err_is_pure_write = beat->get_opcode() == vp::WRITE;
+                bool err_is_last = beat->is_last;
+                uint64_t err_size = beat->get_size();
                 in->pending.pop_front();
                 // Mirror the directional accounting from req_muxed.
-                in->pending_bytes -= beat->get_is_write() ? beat->get_size() : 0;
+                in->pending_bytes -= beat->get_is_write() ? err_size : 0;
                 if (in->pending.empty()) in->head_cycle.set(INT64_MAX);
-                // Free the burst (it never actually got routed).
-                _this->free_burst_slot(slot_idx);
-                // If this beat opened a multi-beat burst that's now dead,
-                // also clear the input's in-progress tracker so a future
-                // multi-beat burst can start.
-                if (in->active_multi_beat_slot == slot_idx)
+
+                if (!err_is_pure_write)
                 {
-                    in->active_multi_beat_slot = -1;
+                    // Reads / atomics: round-trip the master's request as a
+                    // single INVALID response, as before.
+                    beat->set_resp_status(vp::IO_RESP_INVALID);
+                    // Free the burst (it never actually got routed).
+                    _this->free_burst_slot(slot_idx);
+                    // If this beat opened a multi-beat burst that's now
+                    // dead, also clear the input's in-progress tracker so a
+                    // future multi-beat burst can start.
+                    if (in->active_multi_beat_slot == slot_idx)
+                    {
+                        in->active_multi_beat_slot = -1;
+                    }
+                    in->itf.resp(beat);
                 }
-                in->itf.resp(beat);
+                else
+                {
+                    // Pure write beat: consume it (the router owns granted
+                    // beats), latch the error, and complete the burst with
+                    // an INVALID ack once its last beat has been consumed.
+                    // The slot stays alive (output_id remains -1) so the
+                    // burst's remaining beats drain through this same path.
+                    slot.status = vp::IO_RESP_INVALID;
+                    slot.total_bytes += err_size;
+                    if (err_is_last)
+                    {
+                        beat->prepare();
+                        beat->set_addr(slot.base_addr);
+                        beat->set_data(nullptr);
+                        beat->set_size(slot.total_bytes);
+                        beat->is_first = true;
+                        beat->is_last = true;
+                        beat->burst_id = slot.original_burst_id;
+                        beat->set_resp_status(vp::IO_RESP_INVALID);
+                        _this->synth_acks.push_back(SynthAck{beat, slot_idx,
+                            now + 1});
+                        _this->schedule_resp_fsm();
+                    }
+                    else
+                    {
+                        beat->free();
+                    }
+                }
                 _this->wake_denied_masters();
                 continue;
             }
@@ -867,28 +1010,48 @@ vp::IoRespAck RouterBeat::resp_muxed(vp::Block *__this, vp::IoReq *req, int port
     // issues a new request from its resp callback can reuse it.
     in->resp_used_cycle[ch] = now;
 
-    // Per-response-beat is_last (from the adapter or a native beat slave) —
-    // tells us whether the current in-flight request's response stream is
-    // complete. Distinct from the master's per-forward is_last (stored in
-    // slot.pending_master_is_last); both must be true for the burst itself
-    // to be done.
-    bool resp_is_last_of_chunk = req->is_last;
-    bool master_is_last;
-    if (resp_is_last_of_chunk)
+    // A pure write response is the burst's single data-less ack (AXI B
+    // semantics): it completes the burst unconditionally. Reads and atomics
+    // keep the per-response-beat accounting: is_last (from the adapter or a
+    // native beat slave) tells us whether the current in-flight request's
+    // response stream is complete, and the master's per-forward is_last
+    // (slot.pending_master_is_last) whether the burst itself is done.
+    bool is_write_ack = req->get_opcode() == vp::WRITE;
+    bool burst_done;
+    if (is_write_ack)
     {
-        master_is_last = slot.pending_master_is_last.front();
-        slot.pending_master_is_last.pop_front();
+        vp_assert(req->is_last, &_this->trace,
+            "write burst ack must carry is_last\n");
+        vp_assert(req->get_data() == nullptr, &_this->trace,
+            "write burst ack must be data-less\n");
+        burst_done = true;
     }
     else
     {
-        master_is_last = slot.pending_master_is_last.front();
+        bool resp_is_last_of_chunk = req->is_last;
+        bool master_is_last;
+        if (resp_is_last_of_chunk)
+        {
+            master_is_last = slot.pending_master_is_last.front();
+            slot.pending_master_is_last.pop_front();
+        }
+        else
+        {
+            master_is_last = slot.pending_master_is_last.front();
+        }
+        burst_done = resp_is_last_of_chunk && master_is_last;
     }
-    bool burst_done = resp_is_last_of_chunk && master_is_last;
 
     // Restore burst_id to the master's original (everything else — data,
     // size, is_first, is_last, status — is already the per-beat value the
     // upstream master expects).
     req->burst_id = slot.original_burst_id;
+    // Merge any error latched on the forward path (escape-hatch rejected
+    // beat) into the burst ack's status.
+    if (is_write_ack && slot.status == vp::IO_RESP_INVALID)
+    {
+        req->set_resp_status(vp::IO_RESP_INVALID);
+    }
 
     if (burst_done)
     {
@@ -979,10 +1142,61 @@ void RouterBeat::drive_stalled_resps()
     }
 }
 
+void RouterBeat::deliver_synth_acks()
+{
+    int64_t now = this->clock.get_cycles();
+    bool pending_left = false;
+
+    for (auto it = this->synth_acks.begin(); it != this->synth_acks.end(); )
+    {
+        if (it->ready > now)
+        {
+            pending_left = true;
+            ++it;
+            continue;
+        }
+        BurstEntry &slot = this->burst_table[it->slot_idx];
+        InputPort *in = slot.input;
+        int ch = slot.channel;
+        // Same per-(input, channel) one-beat-per-cycle pacing as resp_muxed.
+        if (in->resp_used_cycle[ch] == now)
+        {
+            pending_left = true;
+            ++it;
+            continue;
+        }
+        in->resp_used_cycle[ch] = now;
+
+        vp::IoReq *ack = it->ack;
+        int slot_idx = it->slot_idx;
+        it = this->synth_acks.erase(it);
+
+        if (slot.output_id >= 0)
+        {
+            this->entries[slot.output_id]->elected_input[ch] = nullptr;
+        }
+        this->free_burst_slot(slot_idx);
+
+        vp::IoRespAck st = in->itf.resp(ack);
+        vp_assert(st != vp::IO_RESP_DENIED, &this->trace,
+            "upstream master denied a response beat (not yet supported)\n");
+        (void)st;
+
+        this->wake_denied_masters();
+        this->schedule_fsm();
+    }
+
+    if (pending_left)
+    {
+        this->schedule_resp_fsm();
+    }
+}
+
 void RouterBeat::resp_fsm_handler(vp::Block *__this, vp::ClockEvent * /*event*/)
 {
     RouterBeat *_this = (RouterBeat *)__this;
     _this->drive_stalled_resps();
+    _this->deliver_synth_acks();
 }
 
 void RouterBeat::retry_muxed(vp::Block *__this, int port, vp::IoRetryChannel channel)

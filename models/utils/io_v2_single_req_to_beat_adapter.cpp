@@ -30,11 +30,21 @@
 //     Flow control is stateless: a downstream DENY propagates straight
 //     upstream (the master holds its own request, per the single-req
 //     contract) and retry() is forwarded as-is.
-//   - Any downstream request for writes and atomics: the master's own object
-//     is forwarded unchanged. Write beats legitimately round-trip as the ack
-//     with data pointing into the master's buffer (io_v2.hpp), so the ack
-//     path is a pure pass-through — and atomics keep data / second_data
+//   - Any downstream request for atomics: the master's own object is
+//     forwarded unchanged. Atomics keep the classic round-trip (the object
+//     comes back via resp(), nobody frees it) and keep data / second_data
 //     without any copying.
+//
+// Pure WRITES are write-beat production (io_v2.hpp "Write acknowledgement"):
+// a beat target consumes and FREES a granted write beat, so the master's own
+// object must not travel the beat plane. Each write forwards a size-0
+// allocator-backed beat whose data aliases the master's payload
+// (is_first = is_last = true — a big-packet-form write is a one-beat burst,
+// acked once per burst). An inline DONE leaves the beat ours (status/timing
+// relayed onto the master's request, beat freed here); a GRANTED transfers
+// the beat to the target, whose single burst ack — a DISTINCT data-less
+// allocator-backed object carrying our context in initiator — resolves the
+// access in out_resp (the adapter frees the ack).
 //
 // Timing: zero added latency, no clock events. A read completes (one resp
 // upstream) on the cycle its last beat arrives; inline DONEs are relayed
@@ -45,8 +55,9 @@
 // per-context downstream read request is a plain embedded member — it never
 // crosses a consumer-frees boundary (nothing downstream frees an initiator's
 // request, and it is never round-tripped as a read beat), so it needs no
-// allocator. Contexts are pooled; a transaction allocates nothing in steady
-// state.
+// allocator. Downstream write beats DO cross one (the target frees them), so
+// they come from the size-0 pool. Contexts are pooled; a read or atomic
+// allocates nothing in steady state and a write only recycles pool beats.
 
 #include <algorithm>
 #include <cstring>
@@ -75,12 +86,16 @@ public:
     IoV2SingleReqToBeatAdapterConfig cfg;
 
 private:
-    // One in-flight read. The downstream request is embedded: we are its
-    // initiator (nothing downstream frees it, it never comes back as a read
-    // beat), so no allocator is involved. Response beats carry `this` context
-    // through their initiator field, so any number of reads can be in flight
-    // and responses may even arrive out of order across contexts.
-    struct ReadCtx
+    // One in-flight read or write. For reads the downstream request is
+    // embedded (dn): we are its initiator (nothing downstream frees it, it
+    // never comes back as a read beat), so no allocator is involved. For
+    // writes dn is unused — the downstream beat comes from the size-0 pool
+    // (the target frees it) and only the context correlates the burst ack
+    // back to the master's request. Response beats / acks carry `this`
+    // context through their initiator field, so any number of accesses can
+    // be in flight and responses may even arrive out of order across
+    // contexts.
+    struct AccessCtx
     {
         vp::IoReq dn;
         vp::IoReq *up = nullptr;
@@ -90,14 +105,16 @@ private:
         // streams several beats and the cursor reassembles them.
         uint64_t filled = 0;
         bool expect_single = false;
+        // Pure write in flight: resolved by the burst ack, not read beats.
+        bool is_write = false;
     };
 
     static vp::IoReqStatus in_req(vp::Block *__this, vp::IoReq *req);
     static vp::IoRespAck   out_resp(vp::Block *__this, vp::IoReq *req);
     static void            out_retry(vp::Block *__this, vp::IoRetryChannel channel);
 
-    ReadCtx *alloc_ctx();
-    void retire_ctx(ReadCtx *ctx);
+    AccessCtx *alloc_ctx();
+    void retire_ctx(AccessCtx *ctx);
 
     vp::Trace trace;
 
@@ -106,8 +123,12 @@ private:
                      &IoV2SingleReqToBeatAdapter::out_resp};
 
     int beat_width;
-    std::vector<ReadCtx *> live;       // in-flight reads, for reset cleanup
-    std::vector<ReadCtx *> ctx_pool;   // freelist (process-lifetime)
+    // Size-0 pool serving the downstream write beats (data aliases the
+    // master's payload) — the beat target frees a granted write beat, so it
+    // must be allocator-backed.
+    vp::IoReqAllocator *zero_allocator;
+    std::vector<AccessCtx *> live;     // in-flight accesses, for reset cleanup
+    std::vector<AccessCtx *> ctx_pool; // freelist (process-lifetime)
 };
 
 
@@ -118,27 +139,30 @@ IoV2SingleReqToBeatAdapter::IoV2SingleReqToBeatAdapter(vp::ComponentConf &config
 
     this->beat_width = (int)this->cfg.beat_width;
 
+    this->zero_allocator = vp::IoReqAllocator::get(0);
+
     this->new_slave_port("input", &this->in);
     this->new_master_port("output", &this->out);
 }
 
 
-IoV2SingleReqToBeatAdapter::ReadCtx *IoV2SingleReqToBeatAdapter::alloc_ctx()
+IoV2SingleReqToBeatAdapter::AccessCtx *IoV2SingleReqToBeatAdapter::alloc_ctx()
 {
     if (!this->ctx_pool.empty())
     {
-        ReadCtx *ctx = this->ctx_pool.back();
+        AccessCtx *ctx = this->ctx_pool.back();
         this->ctx_pool.pop_back();
         ctx->up = nullptr;
         ctx->filled = 0;
         ctx->expect_single = false;
+        ctx->is_write = false;
         return ctx;
     }
-    return new ReadCtx();
+    return new AccessCtx();
 }
 
 
-void IoV2SingleReqToBeatAdapter::retire_ctx(ReadCtx *ctx)
+void IoV2SingleReqToBeatAdapter::retire_ctx(AccessCtx *ctx)
 {
     auto it = std::find(this->live.begin(), this->live.end(), ctx);
     if (it != this->live.end())
@@ -157,11 +181,68 @@ vp::IoReqStatus IoV2SingleReqToBeatAdapter::in_req(vp::Block *__this, vp::IoReq 
         "Submit (req=%p, addr=0x%lx, size=%lu, opcode=%d)\n",
         req, req->get_addr(), req->get_size(), (int)req->get_opcode());
 
-    // WRITE / atomic (any non-READ opcode): forward the master's own request
-    // unchanged. Per the beat protocol a write round-trips back to us as the
-    // ack (out_resp forwards it upstream) and its data may keep pointing into
-    // the master's buffer — so the three downstream outcomes map 1:1 to the
-    // three upstream ones: DONE is relayed inline (timing annotations already
+    // Pure WRITE: the beat target consumes and FREES a granted write beat
+    // (io_v2.hpp "Write acknowledgement"), so the master's own object must
+    // not travel the beat plane. Forward a size-0 pool beat whose data
+    // aliases the master's payload (no copy — the buffer is valid as long
+    // as the beat is unfreed). is_first = is_last = true: a big-packet-form
+    // write is a one-beat burst, acknowledged once per burst.
+    if (req->get_opcode() == vp::WRITE)
+    {
+        AccessCtx *ctx = self->alloc_ctx();
+        ctx->up = req;
+        ctx->is_write = true;
+
+        vp::IoReq *beat = self->zero_allocator->alloc();
+        beat->prepare();
+        beat->set_addr(req->get_addr());
+        beat->set_size(req->get_size());
+        // Size-0 pool: data is caller-managed, set on EVERY allocation.
+        beat->set_data(req->get_data());
+        beat->set_opcode(vp::WRITE);
+        beat->is_first = true;
+        beat->is_last = true;
+        beat->burst_id = req->burst_id;
+        beat->initiator = ctx;
+
+        vp::IoReqStatus st = self->out.req(beat);
+
+        if (st == vp::IO_REQ_DENIED)
+        {
+            // Stateless back-pressure: the master holds its own request
+            // (single-req contract) and re-sends it on the retry we forward
+            // from out_retry — this attempt's beat is dead (ownership never
+            // transferred on DENIED).
+            beat->free();
+            self->ctx_pool.push_back(ctx);
+            return vp::IO_REQ_DENIED;
+        }
+        if (st == vp::IO_REQ_DONE)
+        {
+            // Inline burst ack: the beat is still ours. Relay status and
+            // full timing onto the master's request — identity contract
+            // preserved, timing identical to the old inline relay — and
+            // recycle the beat.
+            req->set_resp_status(beat->get_resp_status());
+            req->set_latency(beat->get_full_latency());
+            beat->free();
+            self->ctx_pool.push_back(ctx);
+            return vp::IO_REQ_DONE;
+        }
+
+        // GRANTED: the target owns the beat (it consumes and frees it); the
+        // burst ack arrives in out_resp as a DISTINCT data-less object
+        // carrying our context in initiator.
+        self->live.push_back(ctx);
+        return vp::IO_REQ_GRANTED;
+    }
+
+    // ATOMIC (any other non-READ opcode): forward the master's own request
+    // unchanged. Atomics carry response data, so they keep the classic
+    // round-trip — the object comes back to us as the ack (out_resp forwards
+    // it upstream) and its data / second_data keep pointing into the
+    // master's buffer. The three downstream outcomes map 1:1 to the three
+    // upstream ones: DONE is relayed inline (timing annotations already
     // landed on the master's object), GRANTED resolves via the ack, and a
     // DENY leaves the master holding its own request until the retry we
     // forward.
@@ -181,7 +262,7 @@ vp::IoReqStatus IoV2SingleReqToBeatAdapter::in_req(vp::Block *__this, vp::IoReq 
         "single-req read carries no destination buffer (req=%p, size=%lu)",
         req, req->get_size());
 
-    ReadCtx *ctx = self->alloc_ctx();
+    AccessCtx *ctx = self->alloc_ctx();
     ctx->up = req;
     ctx->expect_single = req->get_size() <= (uint64_t)self->beat_width;
 
@@ -230,9 +311,36 @@ vp::IoRespAck IoV2SingleReqToBeatAdapter::out_resp(vp::Block *__this, vp::IoReq 
 {
     auto *self = static_cast<IoV2SingleReqToBeatAdapter *>(__this);
 
-    // Write / atomic ack: the master's own request round-tripped by the
-    // downstream — hand it straight back. A single-req master consumes its
-    // response synchronously, so the upstream resp() cannot be denied.
+    // Write burst ack: a DISTINCT data-less allocator-backed object (the
+    // size-0 beat we forwarded was consumed and freed by the target),
+    // carrying our context in initiator. Latch the burst's final status onto
+    // the master's own request, free the ack, and hand the master back its
+    // request — as for reads. A single-req master consumes its response
+    // synchronously, so the upstream resp() cannot be denied.
+    if (req->get_opcode() == vp::WRITE)
+    {
+        AccessCtx *ctx = (AccessCtx *)req->initiator;
+        self->traces.assert(ctx != nullptr && ctx->up != nullptr && ctx->is_write,
+            "write burst ack with no live write access (ack=%p)", req);
+        self->traces.assert(req->is_last && req->get_data() == nullptr,
+            "malformed write burst ack (ack=%p, last=%d)",
+            req, req->is_last ? 1 : 0);
+
+        vp::IoReq *up = ctx->up;
+        up->set_resp_status(req->get_resp_status());
+        req->free();
+        self->retire_ctx(ctx);
+
+        self->trace.msg(vp::Trace::LEVEL_TRACE,
+            "Complete write (req=%p, addr=0x%lx, size=%lu)\n",
+            up, up->get_addr(), up->get_size());
+        self->traces.assert(self->in.resp(up) == vp::IO_RESP_ACCEPTED,
+            "single-req master must accept its response (req=%p)", up);
+        return vp::IO_RESP_ACCEPTED;
+    }
+
+    // Atomic ack: the master's own request round-tripped by the downstream —
+    // hand it straight back.
     if (req->get_is_write())
     {
         self->traces.assert(self->in.resp(req) == vp::IO_RESP_ACCEPTED,
@@ -245,9 +353,9 @@ vp::IoRespAck IoV2SingleReqToBeatAdapter::out_resp(vp::Block *__this, vp::IoReq 
     // payload out, free the beat, and on the last beat give the master back
     // its own request — the allocation-convention translation this adapter
     // exists for.
-    ReadCtx *ctx = (ReadCtx *)req->initiator;
-    self->traces.assert(ctx != nullptr && ctx->up != nullptr,
-        "read beat with no live access (beat=%p)", req);
+    AccessCtx *ctx = (AccessCtx *)req->initiator;
+    self->traces.assert(ctx != nullptr && ctx->up != nullptr && !ctx->is_write,
+        "read beat with no live read access (beat=%p)", req);
     self->traces.assert(req != &ctx->dn,
         "downstream round-tripped our read request as a beat (req=%p)", req);
     self->traces.assert(!ctx->expect_single || (req->is_first && req->is_last),
@@ -339,9 +447,12 @@ void IoV2SingleReqToBeatAdapter::reset(bool active)
 {
     if (active)
     {
-        // The upstream requests are the master's own; the downstream requests
-        // are embedded in the contexts. Nothing to free — just recycle.
-        for (ReadCtx *ctx : this->live)
+        // The upstream requests are the master's own; the downstream read
+        // requests are embedded in the contexts, and in-flight downstream
+        // write beats are the target's (it consumes and frees them; a DENIED
+        // beat was already freed synchronously in in_req). Nothing to free —
+        // just recycle the contexts, writes exactly like reads.
+        for (AccessCtx *ctx : this->live)
         {
             this->ctx_pool.push_back(ctx);
         }

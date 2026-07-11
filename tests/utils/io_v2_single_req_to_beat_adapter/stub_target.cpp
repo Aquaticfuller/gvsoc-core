@@ -17,10 +17,16 @@
  *          FIFO order (this is what lets the pipelined test prove the adapter
  *          keeps multiple accesses outstanding). error=true answers reads
  *          inline with IO_REQ_DONE + IO_RESP_INVALID instead.
- *   WRITE: the payload is checked against the addr-derived pattern. Acked
- *          inline (IO_REQ_DONE + latency annotation) or, with async_ack=true,
- *          via GRANTED + one resp() later — round-tripping the request object
- *          (which is the MASTER's own object, forwarded by the adapter).
+ *   WRITE: per-burst acknowledgement (io_v2.hpp "Write acknowledgement").
+ *          Each beat is an allocator-backed size-0-pool object whose data
+ *          aliases the sender's buffer; the payload is checked against the
+ *          addr-derived pattern. A non-last beat is consumed and freed
+ *          (GRANTED, no resp ever). The last beat (the adapter sends one-beat
+ *          bursts, is_first=is_last) is acked inline (IO_REQ_DONE + status +
+ *          latency annotation; the caller keeps its beat) or, with
+ *          async_ack=true, consumed via GRANTED and recycled into the burst's
+ *          single data-less ack sent by one resp() later (the initiator frees
+ *          it). Atomics keep the classic round-trip of the sender's object.
  *
  * Request-path back-pressure: the first deny_count requests are DENIED and
  * retried retry_delay cycles later (logged DENY / RETRY).
@@ -106,6 +112,16 @@ void StubTarget::reset(bool active)
     if (active)
     {
         this->streams.clear();
+        // Recycled pure-write acks in the queue are ours (the consumed
+        // beats, waiting to be resp()'d); atomic acks are the sender's own
+        // object and must not be freed.
+        for (auto &a : this->pending_acks)
+        {
+            if (a.req->get_opcode() == vp::WRITE)
+            {
+                a.req->free();
+            }
+        }
         this->pending_acks.clear();
         this->deny_remaining = this->deny_count_cfg;
         this->stream_event.cancel();
@@ -141,14 +157,60 @@ vp::IoReqStatus StubTarget::req_handler(vp::Block *__this, vp::IoReq *req)
 
     if (is_write)
     {
-        // The payload must carry the addr-derived pattern (the master's own
-        // buffer, forwarded untouched by the adapter).
+        // Consume the payload: it must carry the addr-derived pattern (it
+        // aliases the master's buffer — valid while the beat is unfreed).
         uint8_t *d = req->get_data();
         for (uint64_t i = 0; i < sz; i++)
         {
             _this->traces.assert(d[i] == (uint8_t)((addr + i) & 0xff),
                 "write data mismatch at addr 0x%lx byte %lu", addr, i);
         }
+
+        if (req->get_opcode() == vp::WRITE)
+        {
+            // A write beat crosses a consumer-frees boundary: it must be
+            // allocator-backed (POLICED — an unported producer would hand us
+            // an object we would corrupt the heap by freeing).
+            _this->traces.assert(req->allocator != nullptr,
+                "write beat is not allocator-backed (req=%p)", req);
+
+            // Per-burst write acknowledgement (io_v2.hpp): a non-last beat is
+            // consumed and freed, never resp()'d.
+            if (!req->is_last)
+            {
+                req->free();
+                return vp::IO_REQ_GRANTED;
+            }
+
+            // Last beat — the adapter sends one-beat bursts, so the burst
+            // total equals this beat's size.
+            vp::IoRespStatus status =
+                _this->error ? vp::IO_RESP_INVALID : vp::IO_RESP_OK;
+            if (!_this->async_ack)
+            {
+                // Inline burst ack: the caller keeps its beat.
+                req->set_resp_status(status);
+                req->inc_latency(_this->latency);
+                return vp::IO_REQ_DONE;
+            }
+            // Async: consume the beat and recycle it as the burst's single
+            // data-less ack (the contract allows recycling the consumed
+            // size-0 last beat; the initiator frees the ack after resp()).
+            // addr / burst_id / initiator are kept from the beat.
+            req->prepare();
+            req->set_data(nullptr);
+            req->set_size(sz);
+            req->is_first = true;
+            req->is_last = true;
+            req->set_resp_status(status);
+            int64_t resp_cycle = now + std::max((int64_t)1, _this->latency);
+            _this->pending_acks.push_back({req, resp_cycle});
+            _this->ack_event.enqueue(resp_cycle - now);
+            return vp::IO_REQ_GRANTED;
+        }
+
+        // Atomic: classic round-trip — the sender's own object comes back
+        // via resp() (or inline DONE), nobody frees it.
         req->set_resp_status(_this->error ? vp::IO_RESP_INVALID : vp::IO_RESP_OK);
         if (!_this->async_ack)
         {
