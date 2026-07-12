@@ -21,9 +21,20 @@ import gvsoc.signature
 class GeneratorV2(gvsoc.systree.Component):
     """v2 traffic generator (io_v2 output)."""
 
-    def __init__(self, parent, name, nb_pending_reqs=64, max_burst_size=0):
+    def __init__(self, parent, name, nb_pending_reqs=64, max_burst_size=0,
+                 width: int = 0):
 
         super().__init__(parent, name)
+
+        # Beat width of the plane this generator drives, used for the output
+        # port's IoV2Beat signature. Must match the bound slave port's width
+        # so the bind is direct: the generator measures the path's bandwidth
+        # and must see the raw response beat stream, unmodified by adapters.
+        if width <= 0:
+            raise RuntimeError(
+                f'{name}: GeneratorV2 requires width= (the beat width of '
+                f'the port it drives) for its IoV2Beat output signature')
+        self._width = width
 
         self.add_property('nb_pending_reqs', nb_pending_reqs)
         # Legalize generated bursts like an AXI DMA: no burst exceeds
@@ -37,10 +48,11 @@ class GeneratorV2(gvsoc.systree.Component):
         return gvsoc.systree.SlaveItf(self, 'control', signature='wire<TrafficGeneratorConfig>')
 
     def o_OUTPUT(self, itf: gvsoc.systree.SlaveItf):
-        # Beat-tolerant terminal master: the generator natively consumes raw
+        # Beat-plane terminal master: the generator natively consumes raw
         # per-beat response streams (it measures the path's bandwidth, so the
-        # stream must reach it unmodified) — direct bind against beat slaves,
-        # no collapse adapter. This also makes it a beat-plane WRITE master:
-        # its pool-backed write requests follow the per-burst acknowledgement
-        # contract (consumed/freed by the target, one data-less ack back).
-        self.itf_bind('output', itf, signature=gvsoc.signature.IoV2Any(beat_tolerant=True))
+        # stream must reach it unmodified) and its pool-backed write requests
+        # follow the per-burst acknowledgement contract (consumed/freed by
+        # the target, one data-less ack back). Its runtime packet_size chunks
+        # are legal one-beat bursts of any size; `width` only names the plane
+        # so the bind against the driven beat port is direct and adapter-free.
+        self.itf_bind('output', itf, signature=gvsoc.signature.IoV2Beat(self._width))

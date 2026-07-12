@@ -37,7 +37,7 @@ gvsoc/core/tests/utils/io_v2_clkbridge/rtl_calibration/.
 """
 
 from gvsoc.systree import Component, SlaveItf
-from gvsoc.signature import IoV2Any
+from gvsoc.signature import Signature
 
 
 class IoV2ClockBridge(Component):
@@ -50,8 +50,10 @@ class IoV2ClockBridge(Component):
     def __init__(self, parent: Component, name: str, *,
                  k_src_per_dir: int | None = None,
                  k_dst_per_dir: int | None = None,
-                 depth: int | None = None):
+                 depth: int | None = None,
+                 signature: Signature = None):
         super().__init__(parent, name)
+        self._port_signature = signature
         # Compile the bridge .cpp on demand alongside any target that uses
         # it (the framework dedupes by source-hash, so many bridges sharing
         # the same source produce a single .so). The cmake build does NOT
@@ -72,10 +74,23 @@ class IoV2ClockBridge(Component):
                           depth if depth is not None else self._DEFAULT_DEPTH)
 
     def i_INPUT(self) -> SlaveItf:
-        return SlaveItf(self, 'input', signature=IoV2Any())
+        return SlaveItf(self, 'input', signature=self._signature())
 
     def o_OUTPUT(self, slave: SlaveItf):
-        self.itf_bind('output', slave, signature=IoV2Any())
+        self.itf_bind('output', slave, signature=self._signature())
+
+    def _signature(self) -> Signature:
+        # The bridge relays the crossing's own protocol 1:1, so an explicit
+        # instantiation must commit each instance to the concrete protocol
+        # of that crossing (the auto-splice path never calls these helpers:
+        # it re-uses the spliced binding's original signatures).
+        if not isinstance(self._port_signature, Signature):
+            raise RuntimeError(
+                f'{self.get_path()}: an explicitly instantiated '
+                f'IoV2ClockBridge requires a concrete signature= '
+                f'(IoV2Sync / IoV2SingleReq / IoV2Beat / '
+                f'IoV2BigPacket(allow=True)) matching its crossing')
+        return self._port_signature
 
 
 class IoV2Cdc2PhaseBeh(IoV2ClockBridge):

@@ -35,4 +35,8 @@ class ReceiverV2(gvsoc.systree.Component):
         return gvsoc.systree.SlaveItf(self, 'control', signature='wire<TrafficReceiverConfig>')
 
     def i_INPUT(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, 'input', signature=gvsoc.signature.IoV2Any())
+        # Single-req contract, exactly what the C++ implements: async
+        # GRANTED/DENIED + one resp() on the master's own request object,
+        # never a beat stream. A beat master upstream gets the
+        # beat-to-single-req converter auto-inserted.
+        return gvsoc.systree.SlaveItf(self, 'input', signature=gvsoc.signature.IoV2SingleReq())

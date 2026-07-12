@@ -16,6 +16,7 @@ TargetParameter, which picks a build_case dict with:
 """
 
 import gvsoc.systree
+from gvsoc.signature import IoV2SingleReq
 import gvsoc.runner
 import vp.clock_domain
 from interco.remapper_v2 import Remapper, RemapperConfig
@@ -174,7 +175,12 @@ class Chip(gvsoc.systree.Component):
         clock = vp.clock_domain.Clock_domain(self, 'clock', frequency=100_000_000)
 
         # DUT
-        remapper = Remapper(self, 'remapper', config=spec['remapper_config'])
+        # Per-instance protocol commitment (no transparent signature anymore):
+        # single-req covers every form the stubs drive here (inline DONE,
+        # GRANTED + one resp, DENIED + retry), and the legacy 'io_v2' string
+        # stubs are exempt from the bridge pass, so the binds stay raw.
+        remapper = Remapper(self, 'remapper', config=spec['remapper_config'],
+                            signature=IoV2SingleReq())
         clock.o_CLOCK(remapper.i_CLOCK())
 
         # Upstream io_v2 master

@@ -21,7 +21,7 @@
  * no arg-stack. The control wire interface is identical to v1 and reuses the
  * v1 TrafficGenerator* types from generator.hpp (which does not include io.hpp).
  *
- * The output port is IoV2Any(beat_tolerant=True): it binds beat slaves RAW,
+ * The output port is IoV2Beat(width of the driven port): it binds beat slaves RAW,
  * so the generator is a beat-plane write master and follows the per-burst
  * write-acknowledgement contract (io_v2.hpp "Write acknowledgement" +
  * "Request allocation"):

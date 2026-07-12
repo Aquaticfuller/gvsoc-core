@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from config_tree import Config, cfg_field
 from gvsoc.systree import Component, SlaveItf
-from gvsoc.signature import IoV2Any
+from gvsoc.signature import IoV2SingleReq
 
 
 class LimiterConfig(Config):
@@ -60,7 +60,12 @@ class Limiter(Component):
     This is the io_v2 port of :class:`interco.limiter.Limiter`. The
     functional behaviour is identical; only the IO-side plumbing is new:
 
-    - input and output ports carry the ``io_v2`` signature
+    - input and output ports carry the ``IoV2SingleReq`` signature: the
+      limiter grants asynchronously and routes the single aggregated
+      response back by object identity, and its downstream sub-requests
+      are plain identity-routed accesses (not pooled write beats) — a
+      beat neighbour on either side gets the appropriate converter
+      auto-inserted by the signature system
     - status is ``IO_REQ_DONE`` / ``IO_REQ_GRANTED`` / ``IO_REQ_DENIED``
     - error reporting is via ``req->set_resp_status(IO_RESP_INVALID)`` +
       ``IO_REQ_DONE``
@@ -233,7 +238,7 @@ class Limiter(Component):
         emitting is answered with ``IO_REQ_DENIED`` until the limiter is
         ready again.
         """
-        return SlaveItf(self, 'input', signature=IoV2Any())
+        return SlaveItf(self, 'input', signature=IoV2SingleReq())
 
     def o_OUTPUT(self, itf: SlaveItf):
         """Binds the downstream master port.
@@ -241,4 +246,4 @@ class Limiter(Component):
         Each accepted CPU request is emitted as a stream of sub-requests
         (at most ``bandwidth`` bytes per cycle) through this port.
         """
-        self.itf_bind('output', itf, signature=IoV2Any())
+        self.itf_bind('output', itf, signature=IoV2SingleReq())

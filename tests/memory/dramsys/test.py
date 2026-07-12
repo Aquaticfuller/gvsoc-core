@@ -228,7 +228,8 @@ class Chip(gvsoc.systree.Component):
 
         clock = vp.clock_domain.Clock_domain(self, 'clock', frequency=1_000_000_000)
 
-        ddr = memory.dramsys.Dramsys(self, 'ddr', version=version)
+        ddr = memory.dramsys.Dramsys(self, 'ddr', version=version,
+            access_size=32 if version == 2 else 0)
         clock.o_CLOCK(ddr.i_CLOCK())
 
         if version == 1:

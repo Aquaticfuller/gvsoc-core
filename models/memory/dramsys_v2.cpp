@@ -211,6 +211,20 @@ ddr_v2::ddr_v2(vp::ComponentConf &config)
     dram_id = add_dram((char *)resources_path.c_str(), (char *)simulationJson_path.c_str(), &memspec);
     access_size_clog = log2(memspec.access_size);
     beat_width = memspec.access_size;
+
+    // The python wrapper declares the input port IoV2Beat(access-size); the
+    // real beat width only exists here, once the DRAMSys library has loaded
+    // the memspec. A mismatch means the target description lies about the
+    // protocol width every neighbour was bound against — fail loudly.
+    int64_t declared = get_js_config()->get("access-size")->get_int();
+    if (declared != (int64_t)memspec.access_size)
+    {
+        trace.fatal("Declared access-size %ld does not match the DRAMSys "
+            "memspec access_size %d (dram-type %s); fix access_size= in the "
+            "target description\n", (long)declared, memspec.access_size,
+            dram_type.c_str());
+    }
+
     beat_allocator = vp::IoReqAllocator::get(beat_width);
     dram_register_async_callback(dram_id, (CallbackInstance_t)this,
         (AsynCallbackResp_Meth *)&ddr_v2::rspCallback,

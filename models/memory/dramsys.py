@@ -21,7 +21,7 @@ import gvsoc.signature
 class Dramsys(st.Component):
 
     def __init__(self, parent, name, pim_support=False, version=1,
-                 dram_type='hbm2-example.json'):
+                 dram_type='hbm2-example.json', access_size: int = 0):
 
         super(Dramsys, self).__init__(parent, name)
 
@@ -39,21 +39,32 @@ class Dramsys(st.Component):
         else:
             self.set_component('memory.dramsys_v2')
 
+        # v2: the beat width of the input port. The true value comes from
+        # the DRAMSys memspec, which only the DRAMSys library can compute, so
+        # the target description must state it here and the C++ constructor
+        # fatals if it does not match the memspec (fail loudly, no silent
+        # width mismatch).
+        if version == 2 and access_size <= 0:
+            raise ValueError(
+                "Dramsys v2 requires access_size= (the memspec access size "
+                "in bytes) for its IoV2Beat input signature; the C++ model "
+                "validates it against the DRAMSys memspec at startup")
+        self.access_size = access_size
+
         self.add_properties({
             'require_systemc': True,
             'dram-type': dram_type,
             'pim-support': pim_support,
+            'access-size': access_size,
         })
 
     def i_INPUT(self) -> st.SlaveItf:
         if self.version == 1:
             return st.SlaveItf(self, 'input', signature='io')
-        # v2: beat-protocol slave, but its beat width is only known at
-        # runtime (= the DRAMSys memspec access_size), so it cannot declare
-        # IoV2Beat(width) statically. Declared IoV2Any so any v2 master binds
-        # directly; masters are expected to be beat-aware (beat-form writes
-        # are mandatory — a big-packet write wider than the beat is a fatal).
-        return st.SlaveItf(self, 'input', signature=gvsoc.signature.IoV2Any())
+        # v2: beat-protocol slave at the declared access_size (validated
+        # against the DRAMSys memspec by the C++ constructor).
+        return st.SlaveItf(self, 'input',
+                           signature=gvsoc.signature.IoV2Beat(self.access_size))
 
     # PIM ports are v1-only. The v2 wrapper does not implement them.
     def o_SENDMEMSPEC(self, itf: st.SlaveItf):

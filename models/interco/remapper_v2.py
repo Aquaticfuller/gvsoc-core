@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from config_tree import Config, cfg_field
 from gvsoc.systree import Component, SlaveItf
-from gvsoc.signature import IoV2Any
+from gvsoc.signature import Signature
 
 
 class RemapperConfig(Config):
@@ -215,7 +215,8 @@ class Remapper(Component):
 
         alias = Remapper(self, 'alias', config=RemapperConfig(
             base=0x00000000, size=0x10000,
-            target_base=0x20000000))
+            target_base=0x20000000),
+            signature=IoV2SingleReq())
         core.o_FETCH(alias.i_INPUT())
         alias.o_OUTPUT(flash.i_INPUT())
 
@@ -247,9 +248,22 @@ class Remapper(Component):
         ],
     }
 
-    def __init__(self, parent: Component, name: str, config: RemapperConfig):
+    def __init__(self, parent: Component, name: str, config: RemapperConfig,
+                 signature: Signature = None):
         super().__init__(parent, name, config=config)
         self.add_sources(['interco/remapper_v2.cpp'])
+        # The remapper relays any io_v2 response form 1:1, so it has no
+        # protocol of its own — each INSTANCE commits to the concrete
+        # protocol of the plane it sits on (IoV2Sync / IoV2SingleReq /
+        # IoV2Beat), declared on both ports. Mandatory: a transparent
+        # signature would hide the real endpoints' protocols from the
+        # auto-bridge pass (which compares hop by hop, not end to end).
+        if not isinstance(signature, Signature):
+            raise RuntimeError(
+                f'{self.get_path()}: Remapper requires an explicit concrete '
+                f'signature= (IoV2Sync / IoV2SingleReq / IoV2Beat) matching '
+                f'the plane it is inserted on')
+        self._signature = signature
 
     def i_INPUT(self) -> SlaveItf:
         """Returns the single input slave port.
@@ -259,7 +273,7 @@ class Remapper(Component):
         window) or leaves it alone (outside window) before forwarding
         to the output master port.
         """
-        return SlaveItf(self, 'input', signature=IoV2Any())
+        return SlaveItf(self, 'input', signature=self._signature)
 
     def o_OUTPUT(self, itf: SlaveItf):
         """Binds the downstream master port.
@@ -268,4 +282,4 @@ class Remapper(Component):
         (``target_base + (addr - base)``) or unchanged, depending on
         whether the original address was in the configured window.
         """
-        self.itf_bind('output', itf, signature=IoV2Any())
+        self.itf_bind('output', itf, signature=self._signature)
