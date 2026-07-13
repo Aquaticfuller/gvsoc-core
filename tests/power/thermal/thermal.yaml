@@ -1,0 +1,12 @@
+# Thermal sync points for the thermal testbench, loaded with
+# thermal.thermal_model.load_thermal_yaml. Each entry maps an area of
+# the thermal simulator to a component path of the platform.
+sync_points:
+  mem0:
+    path: mem0
+    rth: 100.0
+    tau: 2.0e-6
+  mem1:
+    path: mem1
+    rth: 100.0
+    tau: 2.0e-6

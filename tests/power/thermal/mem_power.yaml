@@ -1,0 +1,29 @@
+# Power model for the thermal testbench memories.
+#
+# The leakage is strongly temperature-dependent (0.001 W at 25C up to
+# 0.201 W at 125C, i.e. 0.002 W/K) so that a temperature change applied
+# by the thermal model visibly alters the reported power. The write_32
+# quantum is large (5000 pJ) so that write traffic visibly heats the
+# memory through the RC thermal model.
+background:
+  leakage:
+    type: linear
+    unit: W
+    values:
+      25.0:
+        1.2:
+          any: 0.001
+      125.0:
+        1.2:
+          any: 0.201
+write_32:
+  dynamic:
+    type: linear
+    unit: pJ
+    values:
+      25.0:
+        1.2:
+          any: 5000.0
+      125.0:
+        1.2:
+          any: 5000.0
