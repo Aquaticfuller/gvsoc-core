@@ -108,6 +108,12 @@ public:
     inline void sb_reg_invalid_set(int reg);
     inline void sb_reg_invalid_clear(int reg);
     inline void sb_reg_invalid_clear_mask(uint64_t mask);
+    // True when register `reg` has an in-flight producer (e.g. a deferred
+    // load) that has not yet written back. Lets a core with implicit
+    // register operands (Zdinx pair reads, whose odd sibling is not in the
+    // instruction's decoded scoreboard mask) re-check a register the generic
+    // scoreboard_insn_check would miss.
+    inline bool sb_reg_is_invalid(int reg) { return (this->sb_reg_invalid >> reg) & 1; }
     // Caller pushes an opaque per-register stall-reason tag at
     // invalidation time. The scoreboard stores the bytes verbatim and
     // hands them back via Events::event_scoreboard_stall when a
