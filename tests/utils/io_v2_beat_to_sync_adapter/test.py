@@ -50,11 +50,21 @@ def build_case(case_name: str) -> dict:
         }
 
     if case_name == 'lat_dur':
-        # latency=2 + duration=6 -> full_latency=8 over 4 beats: the spread puts
-        # the last beat at issue+8 while keeping beats >=1 cycle apart.
+        # latency=2 + duration=6/beat over 4 beats. Per-beat pacing: head beat
+        # at head=2, each following beat 6 cycles (its own duration) later ->
+        # last at head+18.
         return {
             'target': dict(latency=2, duration=6),
             'schedule': [dict(cycle=10, addr=BASE, size=32, name='r0')],
+        }
+
+    if case_name == 'spread':
+        # duration=2/beat over 8 beats: per-beat pacing spaces each beat 2
+        # cycles (its own duration), so one beat every 2 cycles; last at
+        # head+14 (not 1/cycle).
+        return {
+            'target': dict(latency=1, duration=2),
+            'schedule': [dict(cycle=10, addr=BASE, size=64, name='r0')],
         }
 
     if case_name == 'err':

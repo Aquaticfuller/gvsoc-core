@@ -15,11 +15,15 @@
  * That lets the adapter be trivial: each write beat is forwarded to the slave
  * inline (single-beat framing — the sync plane knows no bursts) and consumed
  * on the spot; a read burst — which carries no data under the beat protocol —
- * is served inline at submit time as beat-sized sub-reads, each into a
- * distinct allocator-backed beat whose co-allocated payload receives the
- * data. Either way every upstream response is fully determined at submit and
- * pushed onto one flat queue; an FSM streams the entries at one per cycle. No
- * async/deny bookkeeping, no latency-spread maths.
+ * is streamed one beat at a time, each beat read from the sync slave at its
+ * own delivery cycle (not pre-read at submit) so no queue of filled beats is
+ * ever held. An FSM drives the queue: the beats of a burst are paced by each
+ * beat's own bandwidth occupancy (get_duration(), floored at one cycle), so
+ * the transfer spreads naturally across the burst window; writes/atomics
+ * stream at one per cycle. The burst's head beat is the one exception — when
+ * the stream is idle it is issued at submit (the address phase) purely to
+ * sample the head latency, and its data rides along to be delivered after
+ * that latency. No async/deny bookkeeping.
  *
  * Wire-protocol invariants preserved (identical to the general adapter for the
  * sync case):
@@ -41,8 +45,11 @@
  *     exactly the cycle the last per-beat ack fired before the protocol
  *     change. Atomic opcodes (opcode != WRITE) carry response data and keep
  *     the classic round-trip of the master's own request.
- *   - The first entry is delayed by the slave's get_full_latency(); entries
- *     then stream at one per cycle.
+ *   - Read beats are paced by each beat's own bandwidth occupancy: the head
+ *     beat lands at the head latency (get_latency()), and every following beat
+ *     max(1, get_duration()) cycles after the previous one. A slave with no
+ *     duration (e.g. memory_v3) degrades to one beat per cycle. Each beat is
+ *     read at the cycle it is delivered (the head beat excepted).
  *
  * Multi-outstanding: a second burst received while one is still streaming is
  * forwarded inline and queued behind the active one.
@@ -86,10 +93,13 @@ private:
     static void            resp_retry_in_handler(vp::Block *__this, vp::IoRetryChannel channel);
     static void            fsm_handler(vp::Block *__this, vp::ClockEvent *event);
 
-    // One queued stream entry, fully determined at submit time.
-    //   READ_BEAT  — a distinct allocator-backed read beat whose payload was
-    //                filled inline at submit (the object already carries all
-    //                its fields; the ack fields below are unused).
+    // One queued stream entry.
+    //   READ_BEAT  — a read beat descriptor (addr/size/is_first/is_last/
+    //                burst_id/initiator). The beat is read from the sync slave
+    //                in emit_entry, at its delivery cycle; `beat` is normally
+    //                nullptr. The one exception is a burst's head beat issued
+    //                early at submit to sample the head latency: its already-
+    //                read object is stashed in `beat` and reused at emit.
     //   WRITE_TICK — silent virtual ack: consumes its 1-entry/cycle slot in
     //                the shared FIFO (preserving the pre-burst-ack pacing)
     //                and emits nothing.
@@ -109,6 +119,8 @@ private:
         int64_t burst_id;
         vp::IoRespStatus status;
         void *initiator;
+        bool is_first = false;   // READ_BEAT: upstream burst framing
+        bool is_last = false;
     };
 
     // One upstream write burst currently accepting beats (nullptr between
@@ -123,9 +135,17 @@ private:
         vp::IoRespStatus status = vp::IO_RESP_OK;   // OR-latched INVALID
     };
 
-    // Emit one entry. Returns false if the upstream master back-pressured the
-    // beat (held for re-send from resp_retry_in_handler).
+    // Emit one entry. Reads the beat from the sync slave (READ_BEAT, unless
+    // pre-issued as the head beat) and delivers it upstream. Sets
+    // stream_interval to the delay before the next entry. Returns false if the
+    // upstream master back-pressured the beat (held for re-send from
+    // resp_retry_in_handler).
     bool emit_entry(const StreamEntry &e);
+
+    // Enqueue the FSM for the next queued entry, stream_interval cycles from
+    // now (set by the entry just emitted: a read beat's own bandwidth
+    // occupancy, floored at one; everything else one per cycle).
+    void schedule_next();
 
     int beat_width;
     // Shared pool serving beat-sized requests with their payload co-allocated;
@@ -135,9 +155,12 @@ private:
     vp::IoMaster out;
     vp::ClockEvent fsm_event;
 
-    // Entries awaiting their FIFO slot, in submission/byte order, drained at
-    // one per cycle.
+    // Entries awaiting their FIFO slot, in submission/byte order.
     std::deque<StreamEntry> entries;
+
+    // Delay (cycles) before the FSM emits the next entry, set by the entry
+    // just emitted (a read beat's max(1, get_duration()); one otherwise).
+    int64_t stream_interval = 1;
 
     // The write burst currently accepting beats (nullptr between bursts:
     // after an is_last submission and before the next is_first). The sync

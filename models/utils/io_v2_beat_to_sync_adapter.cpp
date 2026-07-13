@@ -44,6 +44,10 @@ vp::IoReqStatus IoV2BeatToSyncAdapter::req_handler(vp::Block *__this, vp::IoReq 
     uint64_t total      = req->get_size();
     int64_t  burst_id   = req->burst_id;
     int64_t  latency    = 0;
+    // Only (re)start the FSM if it is idle. While it is already streaming the
+    // appended entries drain behind the active ones; a fresh enqueue could
+    // pull the next paced beat earlier than its slot.
+    bool     was_idle   = self->entries.empty() && !self->resp_held;
 
     if (req->get_is_write() && req->get_opcode() != vp::WRITE)
     {
@@ -156,51 +160,55 @@ vp::IoReqStatus IoV2BeatToSyncAdapter::req_handler(vp::Block *__this, vp::IoReq 
     }
     else
     {
-        // Read burst requests carry no data: serve each beat inline, at submit
-        // time, into a distinct allocator-backed object whose co-allocated
-        // payload receives the beat's data (the sync slave fills it directly).
-        // The whole burst is read in this cycle — exactly when the previous
-        // whole-burst forward read it — so data snapshot and timing are
-        // unchanged; the objects then just stream upstream one per cycle. The
-        // terminal master copies each payload out and frees the beat.
+        // Read burst requests carry no data: nothing is read now. Queue one
+        // lightweight descriptor per beat; each beat is read from the sync
+        // slave in emit_entry, at its own delivery cycle, and paced by its own
+        // bandwidth occupancy (get_duration()). No filled beats are held.
+        size_t first_idx = self->entries.size();
         uint64_t offset = 0;
         do
         {
             // A zero-size burst still gets a single zero-size completion beat.
             uint64_t beat = std::min<uint64_t>(total - offset,
                                                (uint64_t)self->beat_width);
-            vp::IoReq *b = self->beat_allocator->alloc();
-            b->prepare();
-            b->set_addr(burst_addr + offset);
-            b->set_size(beat);
-            b->set_is_write(false);
-            // Single-beat framing downstream (each sync call is an
-            // independent request); the upstream burst framing is applied
-            // after the call.
-            b->is_first = true;
-            b->is_last  = true;
-            b->burst_id = -1;
-
-            vp::IoReqStatus st = self->out.req(b);
-            self->traces.assert(st == vp::IO_REQ_DONE,
-                "sync slave must reply IO_REQ_DONE inline (got %d)", (int)st);
-            latency = std::max(latency, b->get_full_latency());
-
-            b->is_first = offset == 0;
-            b->is_last  = offset + beat >= total;
-            b->burst_id = burst_id;
-            b->initiator = req->initiator;
-
-            self->entries.push_back(StreamEntry{StreamEntry::READ_BEAT, b,
-                0, 0, -1, vp::IO_RESP_OK, nullptr});
+            self->entries.push_back(StreamEntry{StreamEntry::READ_BEAT,
+                nullptr, burst_addr + offset, beat, burst_id, vp::IO_RESP_OK,
+                req->initiator, offset == 0, offset + beat >= total});
             offset += beat;
         } while (offset < total);
+
+        // Head beat: only when the stream was idle do we pay a head latency.
+        // Issue it now (the address phase) purely to sample get_latency(); its
+        // data is stashed on the entry and delivered after that latency (the
+        // FSM start below). Following beats are read lazily at their slots.
+        if (was_idle)
+        {
+            StreamEntry &e0 = self->entries[first_idx];
+            vp::IoReq *b0 = self->beat_allocator->alloc();
+            b0->prepare();
+            b0->set_addr(e0.addr);
+            b0->set_size(e0.size);
+            b0->set_is_write(false);
+            b0->is_first = true;
+            b0->is_last  = true;
+            b0->burst_id = -1;
+
+            vp::IoReqStatus st = self->out.req(b0);
+            self->traces.assert(st == vp::IO_REQ_DONE,
+                "sync slave must reply IO_REQ_DONE inline (got %d)", (int)st);
+
+            e0.beat = b0;               // reused at emit, not re-issued
+            latency = b0->get_latency();
+        }
     }
 
-    // Start the FSM after the head latency. enqueue() keeps the earliest pending
-    // cycle, so while already streaming (enqueued at +1) this is a no-op and the
-    // queued beats just drain continuously behind the active ones.
-    self->fsm_event.enqueue(std::max((int64_t)1, latency));
+    // Start the FSM after the head latency (reads) / full latency (writes,
+    // atomics), but only if it was idle — otherwise the active stream drains
+    // the appended entries at their own pace (see was_idle / schedule_next).
+    if (was_idle)
+    {
+        self->fsm_event.enqueue(std::max((int64_t)1, latency));
+    }
 
     return vp::IO_REQ_GRANTED;
 }
@@ -230,11 +238,41 @@ bool IoV2BeatToSyncAdapter::emit_entry(const StreamEntry &e)
     if (e.kind == StreamEntry::WRITE_TICK)
     {
         this->trace.msg(vp::Trace::LEVEL_TRACE, "Consume write tick\n");
+        this->stream_interval = 1;
         return true;
     }
 
     vp::IoReq *r = e.beat;
-    if (e.kind == StreamEntry::WRITE_ACK)
+    if (e.kind == StreamEntry::READ_BEAT)
+    {
+        // Read the beat from the sync slave NOW (at its delivery cycle), unless
+        // it was pre-issued at submit as the burst's head beat. Downstream is
+        // single-beat framing; the upstream burst framing is stamped after.
+        if (r == nullptr)
+        {
+            r = this->beat_allocator->alloc();
+            r->prepare();
+            r->set_addr(e.addr);
+            r->set_size(e.size);
+            r->set_is_write(false);
+            r->is_first = true;
+            r->is_last  = true;
+            r->burst_id = -1;
+
+            vp::IoReqStatus st = this->out.req(r);
+            this->traces.assert(st == vp::IO_REQ_DONE,
+                "sync slave must reply IO_REQ_DONE inline (got %d)", (int)st);
+        }
+        r->is_first = e.is_first;
+        r->is_last  = e.is_last;
+        r->burst_id = e.burst_id;
+        r->initiator = e.initiator;
+        // Pace the next beat by this beat's own bandwidth occupancy (floored at
+        // one cycle so a no-duration slave streams one per cycle). Set before
+        // in.resp() so a back-pressure hold still resumes at the right pace.
+        this->stream_interval = std::max((int64_t)1, r->get_duration());
+    }
+    else if (e.kind == StreamEntry::WRITE_ACK)
     {
         // The single data-less burst ack, recycling the burst's consumed last
         // beat (see io_v2.hpp, "The write ack"). The initiator frees it.
@@ -247,12 +285,14 @@ bool IoV2BeatToSyncAdapter::emit_entry(const StreamEntry &e)
         r->is_last = true;
         r->set_resp_status(e.status);
         r->initiator = e.initiator;
+        this->stream_interval = 1;
     }
-    // READ_BEAT: distinct allocator-backed object, fully prepared at submit
-    // time (payload already holds the data). The terminal master copies it
-    // out and frees it — the master's burst request is never round-tripped as
-    // a read beat (initiator-owned convention). ATOMIC: the master's own
-    // request, emitted unmutated (classic round-trip).
+    else
+    {
+        // ATOMIC: the master's own request, emitted unmutated (classic
+        // round-trip; it already carries data and status).
+        this->stream_interval = 1;
+    }
 
     this->trace.msg(vp::Trace::LEVEL_TRACE,
         "Emit beat (req=%p, addr=0x%lx, size=%lu, first=%d, last=%d, write=%d)\n",
@@ -289,10 +329,19 @@ void IoV2BeatToSyncAdapter::resp_retry_in_handler(vp::Block *__this,
     self->resp_held = false;
     self->held_req = nullptr;
     self->held_owned = false;
-    if (!self->entries.empty())
+    self->schedule_next();
+}
+
+
+void IoV2BeatToSyncAdapter::schedule_next()
+{
+    if (this->entries.empty())
     {
-        self->fsm_event.enqueue(1);
+        return;
     }
+    // stream_interval was set by the entry just emitted (a read beat's own
+    // bandwidth occupancy, one otherwise).
+    this->fsm_event.enqueue(this->stream_interval);
 }
 
 
@@ -322,11 +371,7 @@ void IoV2BeatToSyncAdapter::fsm_handler(vp::Block *__this, vp::ClockEvent *)
         return;
     }
 
-    // More queued beats? Tick again next cycle.
-    if (!self->entries.empty())
-    {
-        self->fsm_event.enqueue(1);
-    }
+    self->schedule_next();
 }
 
 
@@ -383,6 +428,7 @@ void IoV2BeatToSyncAdapter::reset(bool active)
             }
         }
         this->entries.clear();
+        this->stream_interval = 1;
         // A burst still accepting beats: its already-received beats were
         // consumed (freed) inline, only the record remains.
         delete this->open_wr_burst;
