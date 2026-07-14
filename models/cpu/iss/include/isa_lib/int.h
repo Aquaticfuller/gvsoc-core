@@ -1974,7 +1974,7 @@ static inline int64_t lib_flexfloat_cvt_w_ff_round(Iss *s, unsigned long int a, 
     {
         result_int = -result_int;
     }
-    restoreFFRoundingMode(new_round);
+    restoreFFRoundingMode(old);
     return iss_get_signed_value(result_int, 32);
 }
 
