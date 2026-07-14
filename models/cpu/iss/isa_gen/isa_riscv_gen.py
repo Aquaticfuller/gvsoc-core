@@ -681,17 +681,17 @@ class Rv32a(IsaSubset):
 
     def __init__(self):
         super().__init__(name='rv32a', instrs=[
-            Instr('lr.w',       Format_LRES,  '00010 -- 00000 ----- 010 ----- 0101111'),
-            Instr('sc.w',       Format_AMO,   '00011 -- ----- ----- 010 ----- 0101111'),
-            Instr('amoswap.w',  Format_AMO,   '00001 -- ----- ----- 010 ----- 0101111'),
-            Instr('amoadd.w' ,  Format_AMO,   '00000 -- ----- ----- 010 ----- 0101111'),
-            Instr('amoxor.w' ,  Format_AMO,   '00100 -- ----- ----- 010 ----- 0101111'),
-            Instr('amoand.w' ,  Format_AMO,   '01100 -- ----- ----- 010 ----- 0101111'),
-            Instr('amoor.w'  ,  Format_AMO,   '01000 -- ----- ----- 010 ----- 0101111'),
-            Instr('amomin.w' ,  Format_AMO,   '10000 -- ----- ----- 010 ----- 0101111'),
-            Instr('amomax.w' ,  Format_AMO,   '10100 -- ----- ----- 010 ----- 0101111'),
-            Instr('amominu.w',  Format_AMO,   '11000 -- ----- ----- 010 ----- 0101111'),
-            Instr('amomaxu.w',  Format_AMO,   '11100 -- ----- ----- 010 ----- 0101111')
+            Instr('lr.w',       Format_LRES,  '00010 -- 00000 ----- 010 ----- 0101111', tags=["load"]),
+            Instr('sc.w',       Format_AMO,   '00011 -- ----- ----- 010 ----- 0101111', tags=["load"]),
+            Instr('amoswap.w',  Format_AMO,   '00001 -- ----- ----- 010 ----- 0101111', tags=["load"]),
+            Instr('amoadd.w' ,  Format_AMO,   '00000 -- ----- ----- 010 ----- 0101111', tags=["load"]),
+            Instr('amoxor.w' ,  Format_AMO,   '00100 -- ----- ----- 010 ----- 0101111', tags=["load"]),
+            Instr('amoand.w' ,  Format_AMO,   '01100 -- ----- ----- 010 ----- 0101111', tags=["load"]),
+            Instr('amoor.w'  ,  Format_AMO,   '01000 -- ----- ----- 010 ----- 0101111', tags=["load"]),
+            Instr('amomin.w' ,  Format_AMO,   '10000 -- ----- ----- 010 ----- 0101111', tags=["load"]),
+            Instr('amomax.w' ,  Format_AMO,   '10100 -- ----- ----- 010 ----- 0101111', tags=["load"]),
+            Instr('amominu.w',  Format_AMO,   '11000 -- ----- ----- 010 ----- 0101111', tags=["load"]),
+            Instr('amomaxu.w',  Format_AMO,   '11100 -- ----- ----- 010 ----- 0101111', tags=["load"])
         ], includes=[
             '<cpu/iss/include/isa/rv32a.hpp>',
         ])
