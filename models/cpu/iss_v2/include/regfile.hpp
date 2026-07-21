@@ -148,11 +148,7 @@ private:
 
 #ifdef CONFIG_GVSOC_ISS_REGFILE_SCOREBOARD
     uint64_t sb_reg_invalid;
-    // 64 entries (one per bit of sb_reg_invalid / sb_out_reg_mask) so
-    // ctzll-based indexing is always in range — sb_out_reg_mask gets
-    // sign-extended bits set in some decode paths (`1 << reg` with
-    // reg=31 widens to 0xFFFFFFFF80000000 when OR-assigned into a
-    // uint64_t), so the iteration can walk bit positions up to 63.
+    // 64 entries, one per integer or floating-point register scoreboard bit.
     uint8_t  sb_reason[64];
     // Bitmap of which sb_reason[bit] entries are currently non-zero —
     // mirrors sb_set_reason calls. The release path skips the per-bit
@@ -290,12 +286,12 @@ inline void Regfile::set_freg(int reg, uint64_t value)
 #ifdef CONFIG_GVSOC_ISS_REGFILE_SCOREBOARD
 inline void Regfile::sb_reg_invalid_set(int reg)
 {
-    this->sb_reg_invalid |= 1 << reg;
+    this->sb_reg_invalid |= uint64_t{1} << reg;
 }
 
 inline void Regfile::sb_reg_invalid_clear(int reg)
 {
-    this->sb_reg_invalid &= ~(1 << reg);
+    this->sb_reg_invalid &= ~(uint64_t{1} << reg);
 }
 
 inline void Regfile::sb_reg_invalid_clear_mask(uint64_t mask)

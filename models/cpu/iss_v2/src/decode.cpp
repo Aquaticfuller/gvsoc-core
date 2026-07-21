@@ -59,11 +59,11 @@ void Decode::insn_set_in_reg(iss_insn_t *insn, iss_decoder_arg_t *darg, int reg)
     insn->in_regs[darg->u.reg.id] = reg;
     if (darg->flags & ISS_DECODER_ARG_FLAG_VREG)
     {
-        insn->sb_in_vreg_mask |= 1 << reg;
+        insn->sb_in_vreg_mask |= uint32_t{1} << reg;
     }
     else
     {
-        insn->sb_reg_mask |= 1 << reg;
+        insn->sb_reg_mask |= uint64_t{1} << reg;
     }
 }
 
@@ -72,12 +72,12 @@ void Decode::insn_set_out_reg(iss_insn_t *insn, iss_decoder_arg_t *darg, int reg
     insn->out_regs[darg->u.reg.id] = reg;
     if (darg->flags & ISS_DECODER_ARG_FLAG_VREG)
     {
-        insn->sb_out_vreg_mask |= 1 << reg;
+        insn->sb_out_vreg_mask |= uint32_t{1} << reg;
     }
     else
     {
-        insn->sb_reg_mask |= 1 << reg;
-        insn->sb_out_reg_mask |= 1 << reg;
+        insn->sb_reg_mask |= uint64_t{1} << reg;
+        insn->sb_out_reg_mask |= uint64_t{1} << reg;
     }
 }
 
@@ -182,7 +182,7 @@ int Decode::decode_insn(iss_insn_t *insn, iss_reg_t pc, iss_opcode_t opcode, iss
             if (darg->u.indirect_imm.reg.flags & ISS_DECODER_ARG_FLAG_COMPRESSED)
                 arg->u.indirect_imm.reg_index += 8;
             insn->in_regs[darg->u.indirect_imm.reg.id] = arg->u.indirect_imm.reg_index;
-            insn->sb_reg_mask |= 1 << arg->u.indirect_imm.reg_index;
+            insn->sb_reg_mask |= uint64_t{1} << arg->u.indirect_imm.reg_index;
             if (darg->u.indirect_imm.reg.id >= insn->nb_in_reg)
                 insn->nb_in_reg = darg->u.indirect_imm.reg.id + 1;
             arg->u.indirect_imm.imm = this->decode_info(insn, opcode, &darg->u.indirect_imm.imm.info, darg->u.indirect_imm.imm.is_signed);
@@ -194,7 +194,7 @@ int Decode::decode_insn(iss_insn_t *insn, iss_reg_t pc, iss_opcode_t opcode, iss
             if (darg->u.indirect_reg.base_reg.flags & ISS_DECODER_ARG_FLAG_COMPRESSED)
                 arg->u.indirect_reg.base_reg_index += 8;
             insn->in_regs[darg->u.indirect_reg.base_reg.id] = arg->u.indirect_reg.base_reg_index;
-            insn->sb_reg_mask |= 1 << arg->u.indirect_reg.base_reg_index;
+            insn->sb_reg_mask |= uint64_t{1} << arg->u.indirect_reg.base_reg_index;
             if (darg->u.indirect_reg.base_reg.id >= insn->nb_in_reg)
                 insn->nb_in_reg = darg->u.indirect_reg.base_reg.id + 1;
 
@@ -202,7 +202,7 @@ int Decode::decode_insn(iss_insn_t *insn, iss_reg_t pc, iss_opcode_t opcode, iss
             if (darg->u.indirect_reg.offset_reg.flags & ISS_DECODER_ARG_FLAG_COMPRESSED)
                 arg->u.indirect_reg.offset_reg_index += 8;
             insn->in_regs[darg->u.indirect_reg.offset_reg.id] = arg->u.indirect_reg.offset_reg_index;
-            insn->sb_reg_mask |= 1 << arg->u.indirect_reg.offset_reg_index;
+            insn->sb_reg_mask |= uint64_t{1} << arg->u.indirect_reg.offset_reg_index;
             if (darg->u.indirect_reg.offset_reg.id >= insn->nb_in_reg)
                 insn->nb_in_reg = darg->u.indirect_reg.offset_reg.id + 1;
 
