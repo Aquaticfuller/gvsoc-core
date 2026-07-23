@@ -67,6 +67,10 @@ private:
     bool check = false;
     int width_bits = -1;
 
+    // Number of service slots occupied by a true read-modify-write atomic.
+    // LR and SC remain single-slot requests.
+    int atomic_rmw_cycles = 1;
+
     // Mask applied to incoming request addresses. -1 (all bits set) means no
     // truncation. Otherwise it's (truncate_size - 1), where truncate_size is the
     // user-provided window size to wrap addresses into.
@@ -172,6 +176,11 @@ log_is_write(*this, "req_is_write", 1, vp::SignalCommon::ResetKind::HighZ)
     // Fields not yet in MemoryConfig (still via JSON)
     this->check = get_js_config()->get_child_bool("check");
     this->width_bits = get_js_config()->get_child_int("width_bits");
+    this->atomic_rmw_cycles = get_js_config()->get_child_int("atomic_rmw_cycles");
+    if (this->atomic_rmw_cycles < 1)
+    {
+        this->atomic_rmw_cycles = 1;
+    }
     int align = get_js_config()->get_child_int("align");
 
     // Optional address truncation. 0 means inactive; any non-zero value (which
@@ -305,6 +314,19 @@ vp::IoReqStatus Memory::req(vp::Block *__this, vp::IoReq *req)
         {
     #define MAX(a, b) (((a) > (b)) ? (a) : (b))
             int duration = ((size - 1) >> _this->width_bits) + 1;
+
+            // Extend true RMW requests by the configured service occupancy so
+            // following requests observe the same resource usage. READ, WRITE,
+            // LR, and SC remain single-slot requests.
+            vp::IoReqOpcode opcode = req->get_opcode();
+            bool is_rmw_atomic = opcode != vp::IoReqOpcode::READ
+                && opcode != vp::IoReqOpcode::WRITE
+                && opcode != vp::IoReqOpcode::LR
+                && opcode != vp::IoReqOpcode::SC;
+            if (is_rmw_atomic)
+            {
+                duration *= _this->atomic_rmw_cycles;
+            }
             req->set_duration(duration);
             int64_t cycles = _this->clock.get_cycles();
             int64_t diff = _this->next_packet_start - cycles;

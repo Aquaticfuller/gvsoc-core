@@ -52,6 +52,10 @@ class Memory(gvsoc.systree.Component):
         should be set to True only if needed.
     latency: int
         Specify extra latency which will be added to any incoming request.
+    atomic_rmw_cycles: int
+        Number of memory service slots occupied by a read-modify-write atomic.
+        This is opt-in because some users put an external atomic adapter in
+        front of the memory.  A value of 1 preserves the historical behavior.
     truncate_size: int
         If non-zero, incoming request addresses are masked with (truncate_size - 1)
         before accessing the backing array. Lets the caller wrap or fold the incoming
@@ -61,8 +65,11 @@ class Memory(gvsoc.systree.Component):
     def __init__(self, parent: gvsoc.systree.Component, name: str, size: int=0, width_log2: int=-1,
             stim_file: str=None, power_trigger: bool=False,
             align: int=0, atomics: bool=False, latency=0, init=True,
-            truncate_size: int=0,
+            truncate_size: int=0, atomic_rmw_cycles: int=1,
             attributes: MemoryConfig | None=None, config: MemoryConfig | None=None):
+
+        if atomic_rmw_cycles < 1:
+            raise ValueError('atomic_rmw_cycles must be at least 1')
 
         if config is not None:
             attributes = config
@@ -90,6 +97,7 @@ class Memory(gvsoc.systree.Component):
             'align': align,
             'latency': latency if attributes is None else attributes.latency,
             'truncate_size': truncate_size,
+            'atomic_rmw_cycles': atomic_rmw_cycles,
         })
 
     def i_INPUT(self) -> gvsoc.systree.SlaveItf:
