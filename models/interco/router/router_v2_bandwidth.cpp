@@ -284,49 +284,50 @@ vp::IoReqStatus RouterBandwidth::forward_inline(InputPort *in, vp::IoReq *req,
     // IoReq::get_duration() / get_full_latency().
     int64_t head_latency = wait + this->cfg.latency + out->mapping_latency;
 
-    // Translate the address — the only mutation we do BEFORE the forward, so
-    // rollback on DENIED is one line.
+    // Translate the address — rollback on DENIED restores it below.
     uint64_t original_addr = req->get_addr();
     out->log_access(original_addr, size);
     req->set_addr(original_addr - out->remove_offset + out->add_offset);
 
+    // Install the InFlight BEFORE the (synchronous, possibly nested) forward:
+    // chained routers push onto the same req->initiator chain and responses are
+    // processed inner-first, so the inner InFlight must end up at the head.
+    // DONE / DENIED uninstall it again below, having no async response.
+    InFlight *ifl = this->alloc_inflight();
+    ifl->input = in;
+    ifl->saved_initiator = req->initiator;
+    req->initiator = ifl;
+
     vp::IoReqStatus st = out->itf.req(req);
 
-    if (st == vp::IO_REQ_DONE)
-    {
-        // Hot path: no InFlight, no initiator juggling, no watermark save/restore.
-        // Just annotate and advance.
-        req->inc_latency(head_latency);
-        req->set_duration(burst_duration);
-        in->next_available_cycle  = now + wait + burst_duration;
-        // Output is busy only for the bandwidth-consuming part of the
-        // transfer. router_latency + mapping_latency are pipeline delays —
-        // they delay *this* request's response (already in `logical_latency`
-        // on the annotation) but don't block the next request on the output.
-        // Without this, beat-streaming masters cascade: each beat pays
-        // router_latency again because the output watermark inflates.
-        out->next_available_cycle = now + wait + burst_duration;
-        return vp::IO_REQ_DONE;
-    }
     if (st == vp::IO_REQ_GRANTED)
     {
-        // Install InFlight AFTER the forward. Safe because resp_muxed can't fire
-        // until this function returns (same stack). Stashed in req->initiator
-        // (the v1 idiom) so a single load in resp_muxed retrieves it; the
-        // multi-beat / cascade safety comes from the re-install dance in
-        // resp_muxed, not from the stashing scheme itself.
-        InFlight *ifl = this->alloc_inflight();
-        ifl->input = in;
-        ifl->saved_initiator = req->initiator;
-        req->initiator = ifl;
+        // Async: resp_muxed pops it when the response arrives. A nested forward
+        // may have left req->initiator on a deeper InFlight — leave it there.
         req->inc_latency(head_latency);
         req->set_duration(burst_duration);
         in->next_available_cycle  = now + wait + burst_duration;
         out->next_available_cycle = now + wait + burst_duration;
         return vp::IO_REQ_GRANTED;
     }
+
+    // DONE / DENIED: no async response for our hop -> uninstall the InFlight we pushed.
+    req->initiator = ifl->saved_initiator;
+    this->free_inflight(ifl);
+
+    if (st == vp::IO_REQ_DONE)
+    {
+        // Output is busy only for the bandwidth-consuming part; router and
+        // mapping latency are pipeline delays that must not block the next
+        // request, else beat-streaming masters cascade.
+        req->inc_latency(head_latency);
+        req->set_duration(burst_duration);
+        in->next_available_cycle  = now + wait + burst_duration;
+        out->next_available_cycle = now + wait + burst_duration;
+        return vp::IO_REQ_DONE;
+    }
     // DENIED: restore the addr, mark the output stalled. No watermark advance
-    // (nothing actually went through), no InFlight to free, no latency to undo.
+    // (nothing actually went through), no latency to undo.
     req->set_addr(original_addr);
     out->stalled = true;
     return vp::IO_REQ_DENIED;
