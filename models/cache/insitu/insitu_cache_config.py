@@ -166,6 +166,13 @@ class InsituCacheControllerConfig(Config):
     structural_miss_penalty_cycles: int = cfg_field(default=-1, dump=True, desc=(
         "Sync-slave structural core miss-penalty override (-1 = use miss_penalty_cycles)."
     ))
+    structural_install_tail_cycles: int = cfg_field(default=0, dump=True, desc=(
+        "Sync-slave structural core: cycles the controller's refill pipeline stays busy AFTER the miss "
+        "response is emitted (the RTL install pipeline tail). Added to the refill-occupancy gate "
+        "(sync_refill_busy_until_) only — NOT to the reported per-access latency — so the isolated cold-"
+        "miss latency is unchanged but cold-miss throughput drops to the RTL rate (~1/(ML+17)). Set to 3 "
+        "to match the RTL (its install pipeline holds the controller ~3 cycles past the response)."
+    ))
     streaming_hit_latency_cycles: int = cfg_field(default=-1, dump=True, desc=(
         "Steady-state per-access read-hit latency once the hit pipeline is full. The RTL hit "
         "path has three decoupling registers (coalescer req-spill, resp-spill, "
@@ -501,6 +508,7 @@ def make_cachepool_512_config() -> InsituCacheTileConfig:
         # MemLatency+17 → ML + refill_bank_write(2) + 12 + ~3 serve/response overhead = ML+17.
         structural_hit_latency_cycles=10,
         structural_miss_penalty_cycles=12,
+        structural_install_tail_cycles=3,   # install-pipeline tail after the miss response (RTL occupancy)
         # Write path (calibrated vs RTL warm_write): write hit acks 2 cyc faster than a
         # read returns (8 vs 10 incl. interco), and writes serialize at ~½ read throughput.
         write_hit_latency_cycles=7,   # interco(1) + 7 = 8 (RTL warm write)

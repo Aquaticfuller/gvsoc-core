@@ -98,6 +98,23 @@ private:
     int32_t hit_latency_cycles_ = 0;
     int32_t write_commit_cycles_ = 0;
     int64_t write_commit_busy_until_ = 0;
+    // Refill occupancy (calibration step 2). The RTL controller keeps ONE outstanding line-refill and
+    // holds it until the miss is installed+served — the next refill-read only issues at the previous
+    // line's ready cycle, so cold-miss throughput is ~1/(ML + pipeline), not ~1/ML. The sync path resolves
+    // each miss inline, so without an explicit gate the +pipeline (bank_write + miss_penalty) overlaps the
+    // next refill's memory latency and throughput is over-predicted (~53/miss vs RTL 67/miss at ML=50).
+    //
+    // Mechanism: gate the refill ISSUE on sync_refill_busy_until_ (the previous line's ready cycle), and
+    // stamp the request with (issue + ML_nominal + bank_write + miss_penalty) - now. ML_nominal is the
+    // backing store's UNGATED refill latency (min full_latency seen; on the first refill of a run the
+    // store is ungated). We deliberately do NOT use the store's per-call gated full_latency for timing:
+    // the store serializes refills at its own ML (which would dominate and re-create the overlap), while
+    // the RTL's serialization is the CONTROLLER's occupancy, which is what sync_refill_busy_until_ models.
+    // The cachepool backing store (plain memory.cpp) does not serialize refills at all, so this gate is
+    // REQUIRED there for RTL-faithful miss throughput; on the calib TB it composes with the store's gate.
+    int64_t sync_refill_busy_until_ = 0;
+    int64_t ml_nominal_ = -1;
+    int32_t install_tail_cycles_ = 0;   // refill-pipeline tail after the response (occupancy, not latency)
 
     // --- state ---
     std::vector<WayMeta> meta_;            // [num_sets*num_ways]
@@ -183,6 +200,7 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
     if (shl >= 0) hit_latency_cycles_ = shl;
     int32_t smp = cfg->get_child_int("structural_miss_penalty_cycles");
     if (smp >= 0) miss_penalty_cycles_ = smp;
+    install_tail_cycles_ = cfg->get_child_int("structural_install_tail_cycles");
 
     geom_.init(cache_line_bytes_, num_ways_, num_sets_, cfg->get_child_bool("use_hash_way_select"), false);
     bank_.init(num_ways_, bank_factor);
@@ -336,6 +354,12 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     vline.status = after;
     vline.dirty = false;
 
+    // Refill occupancy gate (calibration step 2): issue this refill no earlier than the previous line's
+    // ready cycle (the previous miss's install+serve), so cold-miss throughput is ~1/(ML+pipeline) (RTL),
+    // not ~1/ML. The refill is still issued to the store now for its DATA; the request's TIMING is stamped
+    // from the controller-gated issue point using the store's nominal (ungated) latency.
+    const int64_t issue = (sync_refill_busy_until_ > now) ? sync_refill_busy_until_ : now;
+
     refill_req_.init();
     refill_req_.set_addr(addr_line(addr));
     refill_req_.set_size(cache_line_bytes_);
@@ -343,8 +367,10 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     refill_req_.set_data(refill_data_buf_.data());
     vp::IoReqStatus rst = refill_itf_.req(&refill_req_);
     if (rst == vp::IO_REQ_OK) {
-        const int64_t refill_lat = (int64_t)refill_req_.get_full_latency()
-                                   + refill_bank_write_cycles_ + miss_penalty_cycles_;
+        // The store's nominal (ungated) refill latency — the minimum seen (the store is ungated on the
+        // first refill of a run). We use this for timing instead of the per-call gated full_latency.
+        const int64_t full_lat = (int64_t)refill_req_.get_full_latency();
+        if (ml_nominal_ < 0 || full_lat < ml_nominal_) ml_nominal_ = full_lat;
         if (refill_req_.get_data() != nullptr)
             memcpy(&data_[((size_t)set * num_ways_ + vw) * cache_line_bytes_],
                    refill_req_.get_data(), cache_line_bytes_);
@@ -361,7 +387,14 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
             cnt_rd_miss_++;
         }
         cnt_refill_++;
-        req->inc_latency(refill_lat);
+        // Response cycle = (controller-gated issue) + (store nominal latency) + (install pipeline).
+        // The next refill-read waits for this line's ready cycle → serialized miss throughput.
+        const int64_t resp_cycle = issue + ml_nominal_ + refill_bank_write_cycles_ + miss_penalty_cycles_;
+        // The reported latency is (resp_cycle - now); the controller's refill pipeline stays busy an
+        // additional install_tail_cycles_ past the response (RTL install-pipeline tail), so the NEXT
+        // refill-read waits for that too → cold-miss throughput drops to the RTL ~1/(ML+17) rate.
+        sync_refill_busy_until_ = resp_cycle + install_tail_cycles_;
+        req->inc_latency(resp_cycle - now);
         return vp::IO_REQ_OK;
     }
     // The refill did not complete (rst != OK). The cluster L2 (wide_axi → SPM) answers synchronously, so

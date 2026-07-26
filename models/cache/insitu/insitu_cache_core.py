@@ -60,6 +60,7 @@ class InsituCacheCore(Component):
             # Structural sync-slave overrides (separate from the async controller's decomposition).
             'structural_hit_latency_cycles': config.structural_hit_latency_cycles,
             'structural_miss_penalty_cycles': config.structural_miss_penalty_cycles,
+            'structural_install_tail_cycles': config.structural_install_tail_cycles,
         })
 
     def i_INPUT(self, port: int = 0) -> SlaveItf:
