@@ -187,6 +187,11 @@ private:
     int pending_elem;
     int inst_elem_size;
     int width;
+    // Sync-OK-but-latent bursts held until their (issue + full-latency) timestamp, then committed
+    // (fsm_handler drains them through data_response). Makes vector traffic consume the calibrated
+    // cache latency instead of committing at issue. Mirrors the Ara variant's members.
+    std::queue<vp::IoReq *> delayed_bursts;
+    std::queue<int64_t> delayed_bursts_timestamps;
 };
 
 #else

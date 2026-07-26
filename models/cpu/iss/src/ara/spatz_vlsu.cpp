@@ -237,6 +237,19 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     AraVlsu *_this = (AraVlsu *)__this;
 
+    // Check if any synchronous delayed burst has reached its commit timestamp — drain ALL of them
+    // through the same completion path the async response uses (pop args, return the req to the port
+    // queue, decrement in-flight, commit the elements). Draining all eligible per firing (not one) is
+    // required: the VLSU issues up to nb_ports bursts/cycle, so a 1/cycle drain would cap commit
+    // throughput and artificially serialize memory-bound streams.
+    while (!_this->delayed_bursts.empty() &&
+           _this->delayed_bursts_timestamps.front() <= _this->ara.iss.top.clock.get_cycles())
+    {
+        data_response(_this, _this->delayed_bursts.front());
+        _this->delayed_bursts.pop();
+        _this->delayed_bursts_timestamps.pop();
+    }
+
     // In case nothing is on-going, disable the FSM
     if (_this->nb_pending_insn.get() == 0)
     {
@@ -337,14 +350,34 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
                 if (err == vp::IO_REQ_OK)
                 {
-                    // Sync: data is already valid, commit now. Pop our args (in reverse
-                    // push order) and return the request to the port queue.
-                    (void)req->arg_pop();  // size
-                    (void)req->arg_pop();  // vreg
-                    (void)req->arg_pop();  // port_id
-                    (void)req->arg_pop();  // slot
-                    _this->req_queues[i]->push_back(req);
-                    _this->ara.insn_commit(_this->pending_vreg, size);
+                    const int64_t latency = req->get_full_latency();
+                    { static int _dl = 0; if (_dl < 20 && latency > 0) { fprintf(stderr, "[VLSU-LAT] lat=%ld\n", (long)latency); _dl++; } }
+                    if (latency > 0)
+                    {
+                        // Sync completion carrying a real latency (the InSitu-cache path stamps
+                        // hit/miss latency on OK). Commit at (now + latency) instead of at issue:
+                        // hold the burst in delayed_bursts and commit it in fsm_handler when its
+                        // timestamp elapses — exactly like the async PENDING path but completing on a
+                        // timer. This makes vector traffic actually CONSUME the calibrated cache
+                        // latency (scoreboard/vreg writeback + ROB backpressure at the right time),
+                        // instead of every vector access being ~0-cycle. Args stay on the req for
+                        // data_response to pop at drain.
+                        slot.nb_pending_bursts++;
+                        _this->delayed_bursts.push(req);
+                        _this->delayed_bursts_timestamps.push(
+                            _this->ara.iss.top.clock.get_cycles() + latency);
+                    }
+                    else
+                    {
+                        // Sync: data is already valid, commit now. Pop our args (in reverse
+                        // push order) and return the request to the port queue.
+                        (void)req->arg_pop();  // size
+                        (void)req->arg_pop();  // vreg
+                        (void)req->arg_pop();  // port_id
+                        (void)req->arg_pop();  // slot
+                        _this->req_queues[i]->push_back(req);
+                        _this->ara.insn_commit(_this->pending_vreg, size);
+                    }
                 }
                 else if (err == vp::IO_REQ_PENDING)
                 {
