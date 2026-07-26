@@ -274,8 +274,13 @@ cache_line_t *Cache::refill(int line_index, unsigned int addr, unsigned int tag,
     vp::IoReqStatus err = this->refill_itf.req(refill_req);
     if (err != vp::IO_REQ_OK)
     {
-        if (err == vp::IO_REQ_PENDING)
+        if (err == vp::IO_REQ_PENDING || err == vp::IO_REQ_DENIED)
         {
+            // PENDING: the memory will respond later. DENIED (e.g. DRAMSys busy): the memory queues the
+            // request and retries it when it can accept, then responds — so park + serialize EXACTLY like
+            // PENDING. Without this, a DENIED refill was dropped here (no parked request, no pending_refill)
+            // while the memory still responded to it later, firing refill_response with an empty
+            // refill_pending_reqs (the segfault seen only with DRAMSys; plain memory never denies).
             req->save();
             this->refill_pending_reqs.push_front(req);
             this->refill_line = line;
