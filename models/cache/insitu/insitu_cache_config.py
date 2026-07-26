@@ -446,6 +446,13 @@ class InsituCacheTileConfig:
     # cross-tile hop is also 1. 0 = no xbar/hop latency (the pre-calibration default).
     xbar_latency_cycles: int = 1
     hop_latency_cycles: int = 1
+    # E1 MSB address rotation (tcdm_cache_interco.sv:387-404): rotate the N routing bits above
+    # dyn_offset (BankSel+TileID) to the address MSB before a request reaches its local bank, so
+    # those bits cannot alias into the bank's set index. OFF collapsed effective per-bank capacity
+    # by 2^N (16-core 4x4: 256 sets -> 16 sets = 64 KiB -> 4 KiB per bank). Requires dyn_offset ==
+    # log2(cache_line_bytes) (rotation must not move line-offset bits). The banks unrotate every
+    # L2-side egress (refill/evict/functional-WT) via route.hpp::unrotate_addr. False = pre-E1.
+    enable_rotation: bool = True
     controller: InsituCacheControllerConfig = field(
         default_factory=InsituCacheControllerConfig)
     coalescer: InsituCacheCoalescerConfig = field(

@@ -32,6 +32,7 @@
 
 #include "insitu_cache_decode.hpp"
 #include "insitu_cache_bank_array.hpp"
+#include "insitu_cache_route.hpp"
 
 using namespace insitu;
 
@@ -77,7 +78,7 @@ private:
     void functional_write_mem(vp::IoReq *user_req) {
         if (!functional_writethrough_ || !evict_itf_.is_bound() || user_req->get_data() == nullptr) return;
         funcwr_req_.init();
-        funcwr_req_.set_addr(user_req->get_addr());
+        funcwr_req_.set_addr(l2_addr(user_req->get_addr()));
         funcwr_req_.set_size(user_req->get_size());
         funcwr_req_.set_is_write(true);
         funcwr_req_.set_data(user_req->get_data());
@@ -85,11 +86,20 @@ private:
     }
 
     uint64_t addr_line(uint64_t a) const { return a & ~((uint64_t)cache_line_bytes_ - 1); }
+    // Inverse of the tile xbar's MSB rotation (route.hpp::rotate_addr — E1). The bank's tags/sets live
+    // in ROTATED address space, so every L2-side egress (refill, dirty writeback, functional WT, and
+    // the bypass fallback) must unrotate back to the global address before hitting the NoC.
+    // rotate_bits_=0 (rotation disabled / N=0 bank) → identity.
+    uint64_t l2_addr(uint64_t a) const {
+        return rotate_bits_ ? rotate_geom_.unrotate_addr(a, rotate_bits_) : a;
+    }
     WayMeta *set_ways(uint32_t set) { return &meta_[(size_t)set * num_ways_]; }
 
     // --- config / geometry ---
     uint32_t cache_line_bytes_, num_ways_, num_sets_;
     CacheGeom geom_;
+    insitu::RouteGeom rotate_geom_{};   // only dyn_offset/addr_width are used (l2_addr unrotation)
+    uint32_t rotate_bits_ = 0;
     bool functional_writethrough_;
     int32_t miss_penalty_cycles_, refill_bank_write_cycles_;
     uint32_t retr_fifo_depth_, miss_fifo_depth_, evic_fifo_depth_;
@@ -201,6 +211,14 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
     int32_t smp = cfg->get_child_int("structural_miss_penalty_cycles");
     if (smp >= 0) miss_penalty_cycles_ = smp;
     install_tail_cycles_ = cfg->get_child_int("structural_install_tail_cycles");
+
+    // E1 MSB-rotation inverse: the tile xbar rotates the N routing bits above dyn_offset to the MSB
+    // before a request reaches this bank (route.hpp::rotate_addr), so this bank's tags/sets live in
+    // ROTATED space. Every L2-side egress unrotates via l2_addr(). rotate_bits=0 → identity (the
+    // pre-E1 behaviour; also the single-bank / single-tile-N=0 case).
+    rotate_bits_               = cfg->get_child_int("rotate_bits");
+    rotate_geom_.dyn_offset    = cfg->get_child_int("rotate_dyn_offset");
+    rotate_geom_.addr_width    = cfg->get_child_int("rotate_addr_width");
 
     geom_.init(cache_line_bytes_, num_ways_, num_sets_, cfg->get_child_bool("use_hash_way_select"), false);
     bank_.init(num_ways_, bank_factor);
@@ -337,7 +355,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
                &data_[((size_t)set * num_ways_ + vw) * cache_line_bytes_], cache_line_bytes_);
         if (evict_itf_.is_bound()) {
             evict_req_.init();
-            evict_req_.set_addr(old_line);
+            evict_req_.set_addr(l2_addr(old_line));
             evict_req_.set_size(cache_line_bytes_);
             evict_req_.set_is_write(true);
             evict_req_.set_data(evict_data_buf_.data());
@@ -361,7 +379,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     const int64_t issue = (sync_refill_busy_until_ > now) ? sync_refill_busy_until_ : now;
 
     refill_req_.init();
-    refill_req_.set_addr(addr_line(addr));
+    refill_req_.set_addr(l2_addr(addr_line(addr)));
     refill_req_.set_size(cache_line_bytes_);
     refill_req_.set_is_write(false);
     refill_req_.set_data(refill_data_buf_.data());
@@ -408,7 +426,12 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     vline.tag = old_tag;
     vline.status = before;
     vline.dirty = old_dirty;
+    // The wire needs the global (unrotated) address; the req itself stays in rotated space for any
+    // later cache-side decode, so save/restore around the bypass call.
+    const uint64_t req_addr_save = req->get_addr();
+    req->set_addr(l2_addr(req_addr_save));
     vp::IoReqStatus fst = refill_itf_.req(req);          // bypass the cache: serve from backing memory
+    req->set_addr(req_addr_save);
     if (fst == vp::IO_REQ_OK) {
         req->inc_latency((int64_t)req->get_full_latency() + miss_penalty_cycles_);
         return vp::IO_REQ_OK;
@@ -601,9 +624,9 @@ void InsituCacheCore::drain_outputs()
     // so a new line-refill cannot start until the current one installs (serialized miss throughput).
     if (!refill_pending_ && !refill_spill_valid_ && refill_ready_cycle_ < 0 && !miss_fifo_.empty()) {
         uint64_t line = miss_fifo_.front(); miss_fifo_.pop_front();
-        pending_refill_addr_ = line;
+        pending_refill_addr_ = line;   // stays ROTATED — install_refill() re-decodes set/way from it
         refill_req_.init();
-        refill_req_.set_addr(line);
+        refill_req_.set_addr(l2_addr(line));
         refill_req_.set_size(cache_line_bytes_);
         refill_req_.set_is_write(false);
         refill_req_.set_data(refill_data_buf_.data());
@@ -624,7 +647,7 @@ void InsituCacheCore::drain_outputs()
     if (!evic_fifo_.empty()) {
         uint64_t line = evic_fifo_.front(); evic_fifo_.pop_front();
         evict_req_.init();
-        evict_req_.set_addr(line);
+        evict_req_.set_addr(l2_addr(line));
         evict_req_.set_size(cache_line_bytes_);
         evict_req_.set_is_write(true);
         evict_req_.set_data(evict_data_buf_.data());

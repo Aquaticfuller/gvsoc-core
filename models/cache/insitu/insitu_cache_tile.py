@@ -171,6 +171,25 @@ class InsituCacheTile(Component):
         n_remote = config.num_remote_port_core
         dyn_off  = config.interco.dynamic_offset
 
+        # E1 MSB rotation. Per-bank rotated-bit count N (route.hpp::bits_to_rotate): the xbar moves
+        # the N routing bits above dyn_offset to the MSB; each bank unrotates its L2-side egress by
+        # the same N. Rotation is only well-defined when dyn_offset == log2(line) (it must not move
+        # line-offset bits) — guard + fall back to off otherwise.
+        en_rot = bool(getattr(config, 'enable_rotation', True))
+        line_log2 = (config.controller.cache_line_bytes - 1).bit_length()
+        if en_rot and dyn_off != line_log2:
+            print(f'[insitu_cache_tile] WARNING: enable_rotation needs dyn_offset == log2(line) '
+                  f'({dyn_off} != {line_log2}) — disabling rotation')
+            en_rot = False
+        n_priv   = n_ctrl if config.num_tiles == 1 else 0   # xbar.py default (all-private / all-shared)
+        bank_bits = (n_ctrl - 1).bit_length()
+        tile_bits = (config.num_tiles - 1).bit_length()
+        def _rot_bits(bank_port):
+            if not en_rot: return 0
+            if n_priv == 0:          return bank_bits + tile_bits   # all-shared
+            if n_priv == n_ctrl:     return bank_bits               # all-private
+            return bank_bits if bank_port < n_priv else bank_bits + tile_bits
+
         # NrTCDMPortsPerCore per-port-class crossbars (one per lane j). Each: n_cores local lane-j ports
         # (+ remote-in) × n_ctrl local banks (+ remote-out), routed by address via insitu_cache_route.hpp.
         self._xbars = []
@@ -181,7 +200,7 @@ class InsituCacheTile(Component):
                 num_tiles=config.num_tiles, tile_id=config.tile_id,
                 dynamic_offset=dyn_off, addr_width=config.addr_width,
                 xbar_latency_cycles=getattr(config, 'xbar_latency_cycles', 0),
-                enable_rotation=False))   # A1: no MSB rotation (faithful rotation + refill un-rot = A2)
+                enable_rotation=en_rot))
 
         use_coal = getattr(config, 'cell_coalescer', False)
         n_vlsu = n_ppc - 1   # lanes 0..n_ppc-2 = Spatz VLSU; the last lane (n_ppc-1) = Snitch/FPU scalar
@@ -194,7 +213,9 @@ class InsituCacheTile(Component):
         for cb in range(n_ctrl):
             self._ctrls.append(InsituCacheCore(
                 self, f'ctrl_{cb}', config=config.controller,
-                num_input_ports=(2 if use_coal else n_ppc)))
+                num_input_ports=(2 if use_coal else n_ppc),
+                rotate_bits=_rot_bits(cb), rotate_dyn_offset=dyn_off,
+                rotate_addr_width=config.addr_width))
             if use_coal:
                 self._cellcoals.append(InsituCacheCellCoalescer(
                     self, f'coal_{cb}', num_inputs=n_vlsu,

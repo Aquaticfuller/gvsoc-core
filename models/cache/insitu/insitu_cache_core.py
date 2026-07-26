@@ -29,7 +29,8 @@ class InsituCacheCore(Component):
 
     def __init__(self, parent: Component, name: str,
                  config: InsituCacheControllerConfig | None = None,
-                 num_input_ports: int = 1):
+                 num_input_ports: int = 1,
+                 rotate_bits: int = 0, rotate_dyn_offset: int = 0, rotate_addr_width: int = 32):
         if config is None:
             config = InsituCacheControllerConfig()
 
@@ -61,6 +62,11 @@ class InsituCacheCore(Component):
             'structural_hit_latency_cycles': config.structural_hit_latency_cycles,
             'structural_miss_penalty_cycles': config.structural_miss_penalty_cycles,
             'structural_install_tail_cycles': config.structural_install_tail_cycles,
+            # E1 MSB-rotation inverse: how many routing bits the tile xbar rotated into the MSB for
+            # THIS bank (route.hpp::bits_to_rotate), + the rotation geometry. 0 → l2_addr() identity.
+            'rotate_bits': rotate_bits,
+            'rotate_dyn_offset': rotate_dyn_offset,
+            'rotate_addr_width': rotate_addr_width,
         })
 
     def i_INPUT(self, port: int = 0) -> SlaveItf:
