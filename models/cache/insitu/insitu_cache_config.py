@@ -152,6 +152,20 @@ class InsituCacheControllerConfig(Config):
         "Cycles from request acceptance at the controller to response emit on a read hit "
         "(the ISOLATED / pipeline-fill latency)"
     ))
+    # Structural-core (sync-slave) overrides. The structural InsituCacheCore reads hit_latency_cycles /
+    # miss_penalty_cycles by default, but its analytic sync-slave path has a DIFFERENT latency
+    # decomposition than the calibrated async controller (no interco(1)/drain stages), so it needs its
+    # own values. Calibrated 2026-07-25 on the insitu_cache_calib TB (structural tile + inline sync,
+    # STRUCT_BANKS=1) against the RTL standalone reference: isolated warm read-hit = 10 cyc →
+    # structural_hit_latency_cycles=10 (measured == knob); cold read-miss = MemLatency+17 →
+    # structural_miss_penalty_cycles=12 (ML + refill_bank_write(2) + 12 + ~3 serve/response = ML+17).
+    # -1 = fall back to hit_latency_cycles / miss_penalty_cycles (unchanged behaviour).
+    structural_hit_latency_cycles: int = cfg_field(default=-1, dump=True, desc=(
+        "Sync-slave structural core read-hit latency override (-1 = use hit_latency_cycles)."
+    ))
+    structural_miss_penalty_cycles: int = cfg_field(default=-1, dump=True, desc=(
+        "Sync-slave structural core miss-penalty override (-1 = use miss_penalty_cycles)."
+    ))
     streaming_hit_latency_cycles: int = cfg_field(default=-1, dump=True, desc=(
         "Steady-state per-access read-hit latency once the hit pipeline is full. The RTL hit "
         "path has three decoupling registers (coalescer req-spill, resp-spill, "
@@ -481,6 +495,12 @@ def make_cachepool_512_config() -> InsituCacheTileConfig:
         #   miss_penalty=8 — same total; see make_cachepool_512_conventional_config.)
         hit_latency_cycles=9,
         miss_penalty_cycles=7,
+        # Structural sync-slave core (used by the cachepool target): its analytic path has no
+        # interco(1)/drain, so it needs its own knobs. Calibrated 2026-07-25 on the calib TB vs the
+        # same RTL reference: isolated warm read-hit = 10 → 10 (measured == knob); cold read-miss =
+        # MemLatency+17 → ML + refill_bank_write(2) + 12 + ~3 serve/response overhead = ML+17.
+        structural_hit_latency_cycles=10,
+        structural_miss_penalty_cycles=12,
         # Write path (calibrated vs RTL warm_write): write hit acks 2 cyc faster than a
         # read returns (8 vs 10 incl. interco), and writes serialize at ~½ read throughput.
         write_hit_latency_cycles=7,   # interco(1) + 7 = 8 (RTL warm write)

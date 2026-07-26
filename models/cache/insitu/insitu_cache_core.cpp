@@ -177,6 +177,12 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
     inline_sync_       = cfg->get_child_bool("inline_sync_miss");
     hit_latency_cycles_= cfg->get_child_int("hit_latency_cycles");
     write_commit_cycles_= cfg->get_child_int("write_commit_cycles");
+    // Structural sync-slave overrides (the analytic path's decomposition differs from the async
+    // controller's — see insitu_cache_config.py). -1 = fall back to the shared knobs.
+    int32_t shl = cfg->get_child_int("structural_hit_latency_cycles");
+    if (shl >= 0) hit_latency_cycles_ = shl;
+    int32_t smp = cfg->get_child_int("structural_miss_penalty_cycles");
+    if (smp >= 0) miss_penalty_cycles_ = smp;
 
     geom_.init(cache_line_bytes_, num_ways_, num_sets_, cfg->get_child_bool("use_hash_way_select"), false);
     bank_.init(num_ways_, bank_factor);
