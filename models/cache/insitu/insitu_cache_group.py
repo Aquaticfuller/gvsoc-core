@@ -62,7 +62,8 @@ class InsituCacheGroup(Component):
             self._rxbars.append(InsituCacheRemoteXbar(
                 self, f'rxbar_{j}', num_tiles=n_tiles, num_cores=cores_per_tile,
                 num_cache=ctrl_per_tile, num_remote_port_core=n_remote,
-                dynamic_offset=config.interco.dynamic_offset, addr_width=config.addr_width))
+                dynamic_offset=config.interco.dynamic_offset, addr_width=config.addr_width,
+                hop_latency_cycles=getattr(config, 'hop_latency_cycles', 0)))
 
         # --- remote wiring (slot = tile*num_remote_port_core + r) ---
         # tile[t].remote_out[j][r] → rxbar[j].in[t*nr + r]; rxbar[j].out[T*nr + r] → tile[T].remote_in[j][r].

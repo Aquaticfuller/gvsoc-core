@@ -180,6 +180,7 @@ class InsituCacheTile(Component):
                 num_cores=n_cores, num_cache=n_ctrl, num_remote_port=n_remote,
                 num_tiles=config.num_tiles, tile_id=config.tile_id,
                 dynamic_offset=dyn_off, addr_width=config.addr_width,
+                xbar_latency_cycles=getattr(config, 'xbar_latency_cycles', 0),
                 enable_rotation=False))   # A1: no MSB rotation (faithful rotation + refill un-rot = A2)
 
         use_coal = getattr(config, 'cell_coalescer', False)

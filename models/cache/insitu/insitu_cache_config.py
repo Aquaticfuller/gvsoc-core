@@ -439,6 +439,13 @@ class InsituCacheTileConfig:
     num_tiles: int = 1              # NumTiles (for route.hpp partition-mode selection)
     tile_id: int = 0                # this tile's id (stamped for remote routing)
     addr_width: int = 32            # TCDM address width (route.hpp field positions)
+    # Crossbar / remote-xbar (cross-tile hop) request-path latency. The RTL `tcdm_cache_interco` has one
+    # request-side `spill_register` per port, and the group's AXI xbar uses `CUT_ALL_PORTS` (a pipeline cut
+    # on every port) — so each xbar hop costs ~1 cycle on the request path (the response path is a
+    # fall-through register = 0). Calibrated 2026-07-26 to 1. The remote xbar is the same module, so the
+    # cross-tile hop is also 1. 0 = no xbar/hop latency (the pre-calibration default).
+    xbar_latency_cycles: int = 1
+    hop_latency_cycles: int = 1
     controller: InsituCacheControllerConfig = field(
         default_factory=InsituCacheControllerConfig)
     coalescer: InsituCacheCoalescerConfig = field(
