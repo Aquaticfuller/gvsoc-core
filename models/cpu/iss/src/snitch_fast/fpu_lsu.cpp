@@ -232,7 +232,14 @@ void FpuLsu::lsu_stall_trampoline(Lsu *lsu, vp::IoReq *req)
 {
     FpuLsu *fpu_lsu = &lsu->iss.fpu_lsu;
     fpu_lsu->pending_latency = req->get_latency() + 1;
+#ifdef CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING
+    // stall_callback is an array in the multi-outstanding configuration (lsu.hpp:137); the outstanding
+    // request id travels in arg 0, as in load_float_resume below.
+    int req_id = *((int *)req->arg_get(0));
+    fpu_lsu->stall_callback[req_id](fpu_lsu, req);
+#else
     fpu_lsu->stall_callback(fpu_lsu, req);
+#endif
 }
 
 void FpuLsu::load_float_resume(FpuLsu *lsu, vp::IoReq *req)
@@ -277,7 +284,11 @@ int FpuLsu::data_req_aligned(iss_addr_t addr, uint8_t *data_ptr, uint8_t *memche
     }
     req->set_memcheck_data(memcheck_data);
 #endif
+#ifdef CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING
+    this->iss.lsu.stall_callback[req_id] = &FpuLsu::lsu_stall_trampoline;
+#else
     this->iss.lsu.stall_callback = &FpuLsu::lsu_stall_trampoline;
+#endif
     int err = this->iss.lsu.data.req(req);
 
     if (err == vp::IO_REQ_OK)

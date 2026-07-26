@@ -112,6 +112,10 @@ private:
     // returns IO_REQ_DENIED.
     std::deque<vp::IoReq*> in_q_;
     uint32_t in_q_cap_ = 32;   // ~NumSpatzOutstandingLoads
+    // Admission stall queue: requests that arrived while in_q_ was full. They are parked (PENDING, never
+    // dropped) and re-admitted as space frees — required for async-capable masters (the updated Spatz VLSU
+    // treats PENDING/DENIED as async and waits for a resp(); a DENIED + dropped request would hang it).
+    std::deque<vp::IoReq*> admission_stall_q_;
 
     // stage-0→stage-1 pipeline register
     struct PrereadTask { bool valid=false; bool is_refill=false; vp::IoReq *req=nullptr;
@@ -244,7 +248,14 @@ vp::IoReqStatus InsituCacheCore::req_handler(vp::Block *__this, vp::IoReq *req)
     // Synchronous-slave (closed-loop): resolve in-call, return IO_REQ_OK — never PENDING/DENIED, never
     // resp()/save() (the Spatz VLSU rejects async). The async path below is the open-loop calib path.
     if (_this->inline_sync_) return _this->run_request_sync(req);
-    if (_this->in_q_.size() >= _this->in_q_cap_) return vp::IO_REQ_DENIED;  // accept queue full → backpressure
+    if (_this->in_q_.size() >= _this->in_q_cap_) {
+        // Accept queue full: park the request (PENDING) and re-admit it as space frees (stage0_arbitrate).
+        // Never DENY + drop — an async-capable master would wait forever for a resp() that never comes.
+        req->save();
+        _this->admission_stall_q_.push_back(req);
+        _this->schedule_tick();
+        return vp::IO_REQ_PENDING;
+    }
     req->save();
     _this->in_q_.push_back(req);
     _this->schedule_tick();
@@ -311,6 +322,8 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
         cnt_evict_++;
     }
     CacheStatus before = vline.status;
+    const uint32_t old_tag = vline.tag;
+    const bool old_dirty = vline.dirty;
     vline.tag = geom_.tag_of(addr);
     CacheStatus after = is_write ? WRITE_PEND : READ_PEND;
     lru_update(geom_, ways, vw, before, after);         // allocate — BEFORE the status write
@@ -345,11 +358,29 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
         req->inc_latency(refill_lat);
         return vp::IO_REQ_OK;
     }
-    // The cluster L2 (wide_axi → SPM) answers synchronously, so this is not expected. Returning OK with
-    // the data already functionally served keeps the VLSU alive (a DENIED/PENDING would crash/hang it).
-    if (is_write) { exchange_line_data(req, set, vw, false); functional_write_mem(req); ways[vw].dirty = true; }
+    // The refill did not complete (rst != OK). The cluster L2 (wide_axi → SPM) answers synchronously, so
+    // this is not expected — but the previous fallback was a real bug: it served the requester from the
+    // NEVER-FILLED line (stale/zero bytes) and marked it VALID, so all later hits returned the same garbage
+    // silently. Instead: undo the allocation (the dirty victim, if any, was already written back above, so
+    // restoring its VALID state is safe — its data is in memory) and serve the requester directly from the
+    // backing store with the original address/size. The line stays unallocated; a later access will miss
+    // and retry the refill.
+    lru_update(geom_, ways, vw, after, before);          // revert the allocate
+    vline.tag = old_tag;
+    vline.status = before;
+    vline.dirty = old_dirty;
+    vp::IoReqStatus fst = refill_itf_.req(req);          // bypass the cache: serve from backing memory
+    if (fst == vp::IO_REQ_OK) {
+        req->inc_latency((int64_t)req->get_full_latency() + miss_penalty_cycles_);
+        return vp::IO_REQ_OK;
+    }
+    // Last resort (should be unreachable with a synchronous memory): keep the VLSU alive as before, but
+    // WITHOUT marking the line VALID, and say so loudly.
+    this->trace_.msg(vp::Trace::LEVEL_WARNING,
+        "refill AND direct backing-store access both failed (set=%u addr=0x%lx) — serving unbacked data\n",
+        set, (unsigned long)addr);
+    if (is_write) { exchange_line_data(req, set, vw, false); functional_write_mem(req); }
     else          { exchange_line_data(req, set, vw, true); }
-    ways[vw].status = VALID;
     req->inc_latency(refill_bank_write_cycles_ + miss_penalty_cycles_);
     return vp::IO_REQ_OK;
 }
@@ -371,6 +402,7 @@ void InsituCacheCore::tick(vp::Block *__this, vp::ClockEvent *event)
     // cycle — the refill latency EMERGES as the gap between issue and install.
     const int64_t now2 = _this->clock.get_cycles();
     const bool near_work = _this->preread_q_.valid || !_this->in_q_.empty() ||
+        !_this->admission_stall_q_.empty() ||
         _this->refill_spill_valid_ || !_this->resp_fifo_.empty() || !_this->evic_fifo_.empty() ||
         (!_this->miss_fifo_.empty() && !_this->refill_pending_ && _this->refill_ready_cycle_ < 0);
     if (near_work) {
@@ -565,6 +597,11 @@ void InsituCacheCore::stage0_arbitrate()
 {
     if (preread_q_.valid) return;   // stage-1 still holds a latched/stalled request
     // (refill install is handled separately in maybe_install_refill — it does not use preread_q_.)
+    // Re-admit parked requests as accept-queue space frees (they are already save()d).
+    while (!admission_stall_q_.empty() && in_q_.size() < in_q_cap_) {
+        in_q_.push_back(admission_stall_q_.front());
+        admission_stall_q_.pop_front();
+    }
     if (!in_q_.empty()) {
         vp::IoReq *r = in_q_.front(); in_q_.pop_front();
         preread_q_.valid = true; preread_q_.is_refill = false; preread_q_.req = r;

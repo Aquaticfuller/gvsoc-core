@@ -870,6 +870,19 @@ void InsituCacheController::refill_resp_handler(vp::Block *__this, vp::IoReq *re
     if (pending_way < 0) {
         _this->trace_.msg(vp::Trace::LEVEL_WARNING,
             "refill response with no matching pending line set=%u tag=0x%x\n", set, tag);
+        // An unmatched response must not latch the shared refill slot: refill_busy_ would stay set
+        // forever and every later miss would queue into refill_wait_queue_ with no refill ever issued
+        // again (hard deadlock). Release the slot and continue the queue exactly like the normal
+        // completion path below.
+        _this->refill_busy_ = false;
+        if (!_this->refill_wait_queue_.empty()) {
+            uint32_t next_line_addr = _this->refill_wait_queue_.front();
+            _this->refill_wait_queue_.pop_front();
+            const vp::IoReqStatus rst = _this->send_refill(next_line_addr);
+            if (rst == vp::IO_REQ_OK) {
+                InsituCacheController::refill_resp_handler(_this, &_this->refill_req_);
+            }
+        }
         return;
     }
 
