@@ -131,7 +131,8 @@ vp::IoReqStatus InsituCacheAmo::req_handler(vp::Block *__this, vp::IoReq *req)
     if (op == vp::SC) {
         const bool ok = _this->res_.on_sc(core, addr);
         if (!ok) {
-            if (req->get_data() != nullptr) { uint32_t one = 1; memcpy(req->get_data(), &one, _this->word_bytes_ <= 4 ? _this->word_bytes_ : 4); }
+            uint8_t *dst = req->get_second_data() != nullptr ? req->get_second_data() : req->get_data();
+            if (dst != nullptr) { uint32_t one = 1; memcpy(dst, &one, _this->word_bytes_ <= 4 ? _this->word_bytes_ : 4); }
             return vp::IO_REQ_OK;   // SC fail: no memory write, synchronous response (data=1)
         }
         // success: write the store to the core, then return 0 on the write-back response.
@@ -188,10 +189,16 @@ void InsituCacheAmo::resp_handler(vp::Block *__this, vp::IoReq *req)
     }
 
     // AMO_WRITE done → return the OLD value; SC_WRITE done → return 0 (success).
+    // CRITICAL: the ISS AMO convention (lsu.cpp:547-549, mirrored by memory.cpp's atomics) is operand =
+    // get_data(), RESULT = get_second_data() (which aliases the destination register). The old value MUST be
+    // written to get_second_data() — writing it to get_data() (the previous behaviour) left rd unchanged, so
+    // the core's beqz/bnez acquire check read stale register garbage and the spin lock never resolved.
     vp::IoReq *orig = _this->orig_;
-    if (orig != nullptr && orig->get_data() != nullptr) {
-        if (_this->phase_ == AMO_WRITE) memcpy(orig->get_data(), &_this->old_val_, 4);
-        else /* SC_WRITE */            { uint32_t zero = 0; memcpy(orig->get_data(), &zero, 4); }
+    uint8_t *result_dst = (orig != nullptr && orig->get_second_data() != nullptr)
+                          ? orig->get_second_data() : (orig != nullptr ? orig->get_data() : nullptr);
+    if (result_dst != nullptr) {
+        if (_this->phase_ == AMO_WRITE) memcpy(result_dst, &_this->old_val_, 4);
+        else /* SC_WRITE */            { uint32_t zero = 0; memcpy(result_dst, &zero, 4); }
     }
     _this->phase_ = IDLE;
     _this->orig_ = nullptr;
