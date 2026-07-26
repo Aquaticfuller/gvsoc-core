@@ -62,6 +62,7 @@ class InsituCacheCore(Component):
             'structural_hit_latency_cycles': config.structural_hit_latency_cycles,
             'structural_miss_penalty_cycles': config.structural_miss_penalty_cycles,
             'structural_install_tail_cycles': config.structural_install_tail_cycles,
+            'structural_write_hit_latency_cycles': getattr(config, 'structural_write_hit_latency_cycles', -1),
             # E1 MSB-rotation inverse: how many routing bits the tile xbar rotated into the MSB for
             # THIS bank (route.hpp::bits_to_rotate), + the rotation geometry. 0 → l2_addr() identity.
             'rotate_bits': rotate_bits,

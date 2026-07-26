@@ -33,6 +33,7 @@ struct WayMeta {
     bool        dirty  = false;
     uint64_t    tag    = 0;
     uint32_t    lru    = 0;   // LRU credit: 0 == victim (encoder.sv credit scheme)
+    int64_t     ready_cycle = 0;  // D1: cycle a PEND line's refill logically lands (sync-slave clamp)
     MissMeta    meta;
 };
 

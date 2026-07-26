@@ -106,8 +106,12 @@ private:
     // synchronous-slave (closed-loop) mode
     bool    inline_sync_ = false;
     int32_t hit_latency_cycles_ = 0;
+    int32_t write_hit_latency_cycles_ = -1;   // D2: store-ack latency (winfo FIFO); -1 → hit value
     int32_t write_commit_cycles_ = 0;
     int64_t write_commit_busy_until_ = 0;
+    // D2 winfo-FIFO acceptance window (insitu_cache_tcdm_wrapper.sv WRespFifoDepth=4): a store's ack
+    // drains ~2 cy after acceptance; a 5th store inside the window stalls until the oldest ack drains.
+    std::deque<int64_t> wresp_win_;           // ack-drain cycles of accepted-but-undrained stores
     // Refill occupancy (calibration step 2). The RTL controller keeps ONE outstanding line-refill and
     // holds it until the miss is installed+served — the next refill-read only issues at the previous
     // line's ready cycle, so cold-miss throughput is ~1/(ML + pipeline), not ~1/ML. The sync path resolves
@@ -211,6 +215,8 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
     int32_t smp = cfg->get_child_int("structural_miss_penalty_cycles");
     if (smp >= 0) miss_penalty_cycles_ = smp;
     install_tail_cycles_ = cfg->get_child_int("structural_install_tail_cycles");
+    // D2 store-ack latency (the winfo-FIFO ack; RTL ~8 cy regardless of hit/miss). -1 → hit value.
+    write_hit_latency_cycles_ = cfg->get_child_int("structural_write_hit_latency_cycles");
 
     // E1 MSB-rotation inverse: the tile xbar rotates the N routing bits above dyn_offset to the MSB
     // before a request reaches this bank (route.hpp::rotate_addr), so this bank's tags/sets live in
@@ -316,6 +322,18 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     const bool is_write = req->get_is_write();
     const uint32_t set = geom_.set_index(addr);
     WayMeta *ways = set_ways(set);
+
+    // D1 lazy install: a PEND line whose refill has logically landed (ready_cycle <= now) becomes
+    // VALID. Its data was memcpy'd into the line at miss-allocate time; a WRITE_PEND keeps its dirty
+    // flag. Runs before decode so the victim scan never sees an install-overdue line as free.
+    for (uint32_t w = 0; w < num_ways_; w++) {
+        if ((ways[w].status == READ_PEND || ways[w].status == WRITE_PEND) && ways[w].ready_cycle <= now) {
+            CacheStatus b = ways[w].status;
+            lru_update(geom_, ways, w, b, VALID);
+            ways[w].status = VALID;
+        }
+    }
+
     Decode d = decode_request(geom_, ways, addr, is_write);
 
     // Write-commit serialization → ADDED latency on an OK (never DENY; the LSU cannot retry).
@@ -325,7 +343,55 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
         write_commit_busy_until_ = accept + write_commit_cycles_;
     }
 
-    // --- HIT ---
+    // D1 PEND-line ready-cycle clamp (insitu_cache_core.sv: same-type followers merge as MSHR
+    // subarrays and WAIT; opposite-type stall in WR_CONFLICT_STALL; all-pend sets stall). The wait
+    // happens in-call; every line the clamp reaches installs, then the access re-decodes as a hit.
+    for (int guard = 0; guard <= (int)num_ways_; guard++) {
+        if (d.is_hit) break;
+        int64_t ready = -1;
+        if (d.is_hit_pend || d.is_hit_conflit) {
+            ready = ways[d.way].ready_cycle;
+        } else if (d.is_all_pend) {
+            for (uint32_t w = 0; w < num_ways_; w++)
+                if ((ways[w].status == READ_PEND || ways[w].status == WRITE_PEND) &&
+                    (ready < 0 || ways[w].ready_cycle < ready)) ready = ways[w].ready_cycle;
+        } else if (ways[d.way].status == READ_PEND || ways[d.way].status == WRITE_PEND) {
+            ready = ways[d.way].ready_cycle;   // victim scan picked a not-yet-ready PEND way — wait it out
+        } else {
+            break;   // genuine miss with a free/valid victim — proceed to allocate
+        }
+        if (ready < 0) break;                  // paranoia: no PEND line found — treat as miss
+        const int64_t virt0 = now + req->get_full_latency();
+        if (ready > virt0) req->inc_latency(ready - virt0);
+        const int64_t vnow = now + req->get_full_latency();
+        for (uint32_t w = 0; w < num_ways_; w++) {
+            if ((ways[w].status == READ_PEND || ways[w].status == WRITE_PEND) && ways[w].ready_cycle <= vnow) {
+                CacheStatus b = ways[w].status;
+                lru_update(geom_, ways, w, b, VALID);
+                ways[w].status = VALID;
+            }
+        }
+        d = decode_request(geom_, ways, addr, is_write);
+    }
+
+    // D2 winfo-FIFO acceptance window (insitu_cache_tcdm_wrapper.sv:731, WRespFifoDepth=4): a store's
+    // ack comes from the winfo FIFO ~2 cy after acceptance; a 5th store inside the window stalls
+    // until the oldest ack drains. Evaluated after any PEND clamp (a conflicted store is accepted late).
+    if (is_write) {
+        int64_t virt = now + req->get_full_latency();
+        while (!wresp_win_.empty() && wresp_win_.front() <= virt) wresp_win_.pop_front();
+        if (wresp_win_.size() >= 4) {
+            req->inc_latency(wresp_win_.front() - virt);
+            virt = now + req->get_full_latency();
+            wresp_win_.pop_front();
+        }
+        wresp_win_.push_back(virt + 2);
+    }
+    const int32_t wr_hit_lat = (write_hit_latency_cycles_ >= 0) ? write_hit_latency_cycles_
+                                                                : hit_latency_cycles_;
+
+    // --- HIT (also a D1-clamped follower: the clamp already waited out the refill; the +hit latency
+    // models the post-install drain through the shared response arbiter, 1/cycle) ---
     if (d.is_hit) {
         if (is_write) {
             exchange_line_data(req, set, d.way, /*line_to_req=*/false);
@@ -334,13 +400,14 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
             lru_update(geom_, ways, d.way, st, st);     // MRU bump
             ways[d.way].dirty = true;
             cnt_wr_hit_++;
+            req->inc_latency(wr_hit_lat);               // D2: store ack = winfo-FIFO latency
         } else {
             exchange_line_data(req, set, d.way, /*line_to_req=*/true);
             CacheStatus st = ways[d.way].status;
             lru_update(geom_, ways, d.way, st, st);
             cnt_rd_hit_++;
+            req->inc_latency(hit_latency_cycles_);
         }
-        req->inc_latency(hit_latency_cycles_);
         return vp::IO_REQ_OK;
     }
 
@@ -389,30 +456,38 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
         // first refill of a run). We use this for timing instead of the per-call gated full_latency.
         const int64_t full_lat = (int64_t)refill_req_.get_full_latency();
         if (ml_nominal_ < 0 || full_lat < ml_nominal_) ml_nominal_ = full_lat;
+        // Install the refill DATA now (so D1-clamped followers read correct bytes after their wait) but
+        // keep the line PEND with ready_cycle = the response cycle — the line is not VISIBLE as VALID
+        // until the refill pipeline has logically delivered it (D1). The VALID install + its LRU
+        // update happen lazily in the ready-cycle sweep.
         if (refill_req_.get_data() != nullptr)
             memcpy(&data_[((size_t)set * num_ways_ + vw) * cache_line_bytes_],
                    refill_req_.get_data(), cache_line_bytes_);
-        CacheStatus before2 = ways[vw].status;
-        lru_update(geom_, ways, vw, before2, VALID);    // complete — BEFORE the status write
-        ways[vw].status = VALID;
+        // Response cycle = (controller-gated issue) + (store nominal latency) + (install pipeline).
+        // The next refill-read waits for this line's ready cycle → serialized miss throughput.
+        const int64_t resp_cycle = issue + ml_nominal_ + refill_bank_write_cycles_ + miss_penalty_cycles_;
+        ways[vw].ready_cycle = resp_cycle;
+        // The controller's refill pipeline stays busy an additional install_tail_cycles_ past the
+        // response (RTL install-pipeline tail), so the NEXT refill-read waits for that too → cold-miss
+        // throughput drops to the RTL ~1/(ML+17) rate.
+        sync_refill_busy_until_ = resp_cycle + install_tail_cycles_;
         if (is_write) {
+            // D2: the store ack comes from the winfo FIFO ~acceptance-time — the WRITE_PEND merge
+            // with the refill happens inside the cache, invisible to the LSU. Apply the store data
+            // (+ functional WT) now; the line stays WRITE_PEND+dirty until the ready-cycle sweep, so
+            // a subsequent load correctly stalls for the rest of the refill.
             exchange_line_data(req, set, vw, /*line_to_req=*/false);
             functional_write_mem(req);
             ways[vw].dirty = true;
             cnt_wr_miss_++;
+            req->inc_latency(wr_hit_lat);
         } else {
             exchange_line_data(req, set, vw, /*line_to_req=*/true);
             cnt_rd_miss_++;
+            // The read misser waits for the refill: reported latency = resp_cycle - now.
+            req->inc_latency(resp_cycle - now);
         }
         cnt_refill_++;
-        // Response cycle = (controller-gated issue) + (store nominal latency) + (install pipeline).
-        // The next refill-read waits for this line's ready cycle → serialized miss throughput.
-        const int64_t resp_cycle = issue + ml_nominal_ + refill_bank_write_cycles_ + miss_penalty_cycles_;
-        // The reported latency is (resp_cycle - now); the controller's refill pipeline stays busy an
-        // additional install_tail_cycles_ past the response (RTL install-pipeline tail), so the NEXT
-        // refill-read waits for that too → cold-miss throughput drops to the RTL ~1/(ML+17) rate.
-        sync_refill_busy_until_ = resp_cycle + install_tail_cycles_;
-        req->inc_latency(resp_cycle - now);
         return vp::IO_REQ_OK;
     }
     // The refill did not complete (rst != OK). The cluster L2 (wide_axi → SPM) answers synchronously, so

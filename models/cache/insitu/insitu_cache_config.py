@@ -173,6 +173,10 @@ class InsituCacheControllerConfig(Config):
         "miss latency is unchanged but cold-miss throughput drops to the RTL rate (~1/(ML+17)). Set to 3 "
         "to match the RTL (its install pipeline holds the controller ~3 cycles past the response)."
     ))
+    structural_write_hit_latency_cycles: int = cfg_field(default=-1, dump=True, desc=(
+        "Sync-slave structural core store-ack latency (D2: the winfo-FIFO ack, paid by write hits AND "
+        "write misses — the WRITE_PEND merge is invisible to the LSU). -1 = use the read-hit value."
+    ))
     streaming_hit_latency_cycles: int = cfg_field(default=-1, dump=True, desc=(
         "Steady-state per-access read-hit latency once the hit pipeline is full. The RTL hit "
         "path has three decoupling registers (coalescer req-spill, resp-spill, "
@@ -523,6 +527,7 @@ def make_cachepool_512_config() -> InsituCacheTileConfig:
         structural_hit_latency_cycles=10,
         structural_miss_penalty_cycles=12,
         structural_install_tail_cycles=3,   # install-pipeline tail after the miss response (RTL occupancy)
+        structural_write_hit_latency_cycles=8,   # D2 store ack (RTL warm-write latency = 8, no interco)
         # Write path (calibrated vs RTL warm_write): write hit acks 2 cyc faster than a
         # read returns (8 vs 10 incl. interco), and writes serialize at ~½ read throughput.
         write_hit_latency_cycles=7,   # interco(1) + 7 = 8 (RTL warm write)
