@@ -190,6 +190,7 @@ void loader::event_handler(vp::Block *__this, vp::ClockEvent *event)
         }
         _this->current_section->size -= itersize;
 
+        auto *section = _this->current_section;   // saved for the DENIED rollback below
         if (_this->current_section->size == 0)
         {
             _this->current_section = NULL;
@@ -200,6 +201,21 @@ void loader::event_handler(vp::Block *__this, vp::ClockEvent *event)
         {
             latency += _this->req.get_full_latency();
             _this->event_enqueue(_this->event, latency);
+        }
+        else if (err == vp::IO_REQ_DENIED)
+        {
+            // The target is temporarily busy (e.g. a DRAMSys channel whose queue is full — it
+            // retries internally and would answer a LATER request, but it can't complete THIS one
+            // now). Roll back the section advance and retry next cycle instead of stalling the
+            // whole boot with the section half-written.
+            _this->current_section = section;
+            section->paddr -= itersize;
+            if (data)
+            {
+                section->data -= itersize;
+            }
+            section->size += itersize;
+            _this->event_enqueue(_this->event, 1);
         }
         else
         {

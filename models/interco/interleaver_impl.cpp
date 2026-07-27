@@ -163,8 +163,11 @@ vp::IoReqStatus interleaver::req(vp::Block *__this, vp::IoReq *req)
       {
         return vp::IO_REQ_PENDING;
       }
-      else if(err == vp::IO_REQ_DENIED && size == loop_size)
+      else if(err == vp::IO_REQ_DENIED)
       {
+        // Propagate DENIED (not INVALID) even mid-split: the caller retries the whole request;
+        // the chunks already forwarded are rewritten with identical data (writes are idempotent).
+        // Without this a busy DRAMSys channel turns a big loader write into a fatal INVALID.
         return vp::IO_REQ_DENIED;
       }
       else
