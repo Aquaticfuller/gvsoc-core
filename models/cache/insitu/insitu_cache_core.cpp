@@ -112,6 +112,10 @@ private:
     // D2 winfo-FIFO acceptance window (insitu_cache_tcdm_wrapper.sv WRespFifoDepth=4): a store's ack
     // drains ~2 cy after acceptance; a 5th store inside the window stalls until the oldest ack drains.
     std::deque<int64_t> wresp_win_;           // ack-drain cycles of accepted-but-undrained stores
+    // B1 per-cell request serialization (insitu_cache_core.sv: one 1-deep req_buf + the
+    // i_pre_reader_arbiter → ≤1 cache access/cycle/cell). Shared by all input ports (VLSU-aggregate
+    // and scalar-bypass alike — the RTL 2:1 bypass xbar serializes them into the one pipeline).
+    int64_t cell_busy_until_ = 0;
     // Refill occupancy (calibration step 2). The RTL controller keeps ONE outstanding line-refill and
     // holds it until the miss is installed+served — the next refill-read only issues at the previous
     // line's ready cycle, so cold-miss throughput is ~1/(ML + pipeline), not ~1/ML. The sync path resolves
@@ -323,6 +327,14 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     const uint32_t set = geom_.set_index(addr);
     WayMeta *ways = set_ways(set);
 
+    // B1 per-cell request serialization: every lookup — read or write, hit or miss — occupies the
+    // cell's single request pipeline for one cycle (the 1-deep req_buf + pre-reader arbiter).
+    // Contention folds into the response latency. D1 clamp waits below do NOT hold the cell (a
+    // PEND-stalled request re-arbitrates after the wait — RTL: it waits in the xbar input spill).
+    const int64_t accept = (cell_busy_until_ > now) ? cell_busy_until_ : now;
+    if (accept > now) req->inc_latency(accept - now);
+    cell_busy_until_ = accept + 1;
+
     // D1 lazy install: a PEND line whose refill has logically landed (ready_cycle <= now) becomes
     // VALID. Its data was memcpy'd into the line at miss-allocate time; a WRITE_PEND keeps its dirty
     // flag. Runs before decode so the victim scan never sees an install-overdue line as free.
@@ -345,7 +357,13 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
 
     // D1 PEND-line ready-cycle clamp (insitu_cache_core.sv: same-type followers merge as MSHR
     // subarrays and WAIT; opposite-type stall in WR_CONFLICT_STALL; all-pend sets stall). The wait
-    // happens in-call; every line the clamp reaches installs, then the access re-decodes as a hit.
+    // happens in-call. A clamped follower then serves from its PEND line WITHOUT installing it —
+    // installing at the clamp's virtual cycle would leak the future VALID state to requests still at
+    // an earlier real cycle (observed: follower #1's clamp installed the line at real t, so followers
+    // #2/#3 took 12-cycle early hits instead of clamping). The line installs only in real time (the
+    // sweep above) — or below when a genuine miss needs a way (the misser logically executes at the
+    // clamped cycle, so the install is on its own timeline).
+    int serve_pend_way = -1;
     for (int guard = 0; guard <= (int)num_ways_; guard++) {
         if (d.is_hit) break;
         int64_t ready = -1;
@@ -363,6 +381,11 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
         if (ready < 0) break;                  // paranoia: no PEND line found — treat as miss
         const int64_t virt0 = now + req->get_full_latency();
         if (ready > virt0) req->inc_latency(ready - virt0);
+        if (d.is_hit_pend || d.is_hit_conflit) {
+            serve_pend_way = (int)d.way;       // serve from the PEND line; NO install (see above)
+            break;
+        }
+        // all_pend / PEND-victim: the misser needs a way — install the lines its wait reached, re-decode.
         const int64_t vnow = now + req->get_full_latency();
         for (uint32_t w = 0; w < num_ways_; w++) {
             if ((ways[w].status == READ_PEND || ways[w].status == WRITE_PEND) && ways[w].ready_cycle <= vnow) {
@@ -390,21 +413,23 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     const int32_t wr_hit_lat = (write_hit_latency_cycles_ >= 0) ? write_hit_latency_cycles_
                                                                 : hit_latency_cycles_;
 
-    // --- HIT (also a D1-clamped follower: the clamp already waited out the refill; the +hit latency
-    // models the post-install drain through the shared response arbiter, 1/cycle) ---
-    if (d.is_hit) {
+    // --- HIT (also a D1-clamped follower served from its PEND line at serve_pend_way: the clamp
+    // already waited out the refill; the +hit latency models the post-install drain through the
+    // shared response arbiter, 1/cycle) ---
+    if (d.is_hit || serve_pend_way >= 0) {
+        const uint32_t hw = (serve_pend_way >= 0) ? (uint32_t)serve_pend_way : d.way;
         if (is_write) {
-            exchange_line_data(req, set, d.way, /*line_to_req=*/false);
+            exchange_line_data(req, set, hw, /*line_to_req=*/false);
             functional_write_mem(req);
-            CacheStatus st = ways[d.way].status;
-            lru_update(geom_, ways, d.way, st, st);     // MRU bump
-            ways[d.way].dirty = true;
+            CacheStatus st = ways[hw].status;
+            lru_update(geom_, ways, hw, st, st);        // MRU bump
+            ways[hw].dirty = true;
             cnt_wr_hit_++;
             req->inc_latency(wr_hit_lat);               // D2: store ack = winfo-FIFO latency
         } else {
-            exchange_line_data(req, set, d.way, /*line_to_req=*/true);
-            CacheStatus st = ways[d.way].status;
-            lru_update(geom_, ways, d.way, st, st);
+            exchange_line_data(req, set, hw, /*line_to_req=*/true);
+            CacheStatus st = ways[hw].status;
+            lru_update(geom_, ways, hw, st, st);
             cnt_rd_hit_++;
             req->inc_latency(hit_latency_cycles_);
         }

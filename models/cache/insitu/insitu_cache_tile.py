@@ -217,9 +217,12 @@ class InsituCacheTile(Component):
                 rotate_bits=_rot_bits(cb), rotate_dyn_offset=dyn_off,
                 rotate_addr_width=config.addr_width))
             if use_coal:
+                # C1: coalesce on the 16 B part (production folds PartSplit=4 → CoalescerDataWidth =
+                # CacheLineWidth/4 = 128b, cachepool_cache_ctrl.sv:80-81), not the 64 B line.
                 self._cellcoals.append(InsituCacheCellCoalescer(
                     self, f'coal_{cb}', num_inputs=n_vlsu,
-                    cache_line_bytes=config.controller.cache_line_bytes, word_bytes=4))
+                    cache_line_bytes=config.controller.cache_line_bytes, word_bytes=4,
+                    part_bytes=config.controller.cache_line_bytes // 4))
 
         # Wiring. tile i_INPUT(p) → xbar[p % n_ppc].in_(p // n_ppc)
         # (RTL cache_req[j][cb] = unmerge_req[cb*NrTCDMPortsPerCore + j], tile.sv:541-551).

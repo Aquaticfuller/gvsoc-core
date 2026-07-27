@@ -25,13 +25,16 @@ class InsituCacheCellCoalescer(Component):
     """N VLSU-lane inputs → 1 wide output to the cache core, with read coalescing + response split."""
 
     def __init__(self, parent: Component, name: str, *,
-                 num_inputs: int, cache_line_bytes: int = 64, word_bytes: int = 4):
+                 num_inputs: int, cache_line_bytes: int = 64, word_bytes: int = 4,
+                 part_bytes: int = 0):
         super().__init__(parent, name)
         self.add_sources(['cache/insitu/insitu_cache_cell_coalescer.cpp'])
         self.add_properties({
             'num_inputs': num_inputs,
             'cache_line_bytes': cache_line_bytes,
             'word_bytes': word_bytes,
+            # Coalescing granule (C1): the 16 B part (production PartSplit=4). 0 → legacy line-granule.
+            'part_bytes': part_bytes if part_bytes > 0 else cache_line_bytes,
         })
 
     def i_INPUT(self, port: int) -> SlaveItf:
