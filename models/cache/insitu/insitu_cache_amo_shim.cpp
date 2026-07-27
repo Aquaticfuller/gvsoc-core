@@ -59,6 +59,11 @@ class InsituCacheAmo : public vp::Component
 {
 public:
     explicit InsituCacheAmo(vp::ComponentConf &conf);
+    void stop() override {
+        fprintf(stderr, "[INSITU-AMO %s] rmw=%lu lat_sum=%lu\n", this->get_path().c_str(),
+                (unsigned long)n_rmw_, (unsigned long)lat_rmw_sum_);
+        vp::Component::stop();
+    }
 
 private:
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req);
@@ -87,6 +92,8 @@ private:
     vp::IoSlave  input_;
     vp::IoMaster output_;
     vp::Trace trace_;
+    // diagnostics: op count + total stamped latency (dumped at stop())
+    uint64_t n_rmw_ = 0, lat_rmw_sum_ = 0;
 };
 
 InsituCacheAmo::InsituCacheAmo(vp::ComponentConf &conf) : vp::Component(conf)
@@ -202,6 +209,7 @@ void InsituCacheAmo::resp_handler(vp::Block *__this, vp::IoReq *req)
     }
     _this->phase_ = IDLE;
     _this->orig_ = nullptr;
+    if (orig != nullptr) { _this->n_rmw_++; _this->lat_rmw_sum_ += (uint64_t)orig->get_full_latency(); }
     if (_this->in_sync_call_) {
         // resolved inside req_handler (sync cache): tell it to return IO_REQ_OK; do NOT resp() (the result
         // is already in orig's data buffer). resp()+PENDING would double-complete the upstream request.

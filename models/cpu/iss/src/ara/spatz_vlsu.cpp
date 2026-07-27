@@ -351,7 +351,6 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 if (err == vp::IO_REQ_OK)
                 {
                     const int64_t latency = req->get_full_latency();
-                    { static int _dl = 0; if (_dl < 20 && latency > 0) { fprintf(stderr, "[VLSU-LAT] lat=%ld\n", (long)latency); _dl++; } }
                     if (latency > 0)
                     {
                         // Sync completion carrying a real latency (the InSitu-cache path stamps

@@ -41,6 +41,16 @@ class InsituCacheCore : public vp::Component
 public:
     explicit InsituCacheCore(vp::ComponentConf &conf);
     void reset(bool active) override;
+    void stop() override {
+        // End-of-sim counter dump (diagnostics; one line per cell).
+        fprintf(stderr, "[INSITU-CORE %s] rd_hit=%lu rd_miss=%lu wr_hit=%lu wr_miss=%lu refill=%lu evict=%lu | lat_sum=%lu b1=%lu clamp=%lu/%lu winfo=%lu wcommit=%lu\n",
+                this->get_path().c_str(), (unsigned long)cnt_rd_hit_, (unsigned long)cnt_rd_miss_,
+                (unsigned long)cnt_wr_hit_, (unsigned long)cnt_wr_miss_,
+                (unsigned long)cnt_refill_, (unsigned long)cnt_evict_,
+                (unsigned long)lat_sum_, (unsigned long)lat_b1_, (unsigned long)lat_clamp_,
+                (unsigned long)n_clamp_, (unsigned long)lat_winfo_, (unsigned long)lat_wcommit_);
+        vp::Component::stop();
+    }
 
 private:
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req);
@@ -189,6 +199,8 @@ private:
     // telemetry
     uint64_t cnt_rd_hit_=0, cnt_wr_hit_=0, cnt_rd_miss_=0, cnt_wr_miss_=0, cnt_mshr_merge_=0,
              cnt_refill_=0, cnt_evict_=0, cnt_bank_conflict_=0;
+    // latency-budget diagnostics: requests, total stamped latency, and the per-mechanism waits
+    uint64_t lat_sum_=0, lat_b1_=0, lat_clamp_=0, lat_winfo_=0, lat_wcommit_=0, n_clamp_=0;
 };
 
 InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
@@ -332,7 +344,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     // Contention folds into the response latency. D1 clamp waits below do NOT hold the cell (a
     // PEND-stalled request re-arbitrates after the wait — RTL: it waits in the xbar input spill).
     const int64_t accept = (cell_busy_until_ > now) ? cell_busy_until_ : now;
-    if (accept > now) req->inc_latency(accept - now);
+    if (accept > now) { req->inc_latency(accept - now); lat_b1_ += (uint64_t)(accept - now); }
     cell_busy_until_ = accept + 1;
 
     // D1 lazy install: a PEND line whose refill has logically landed (ready_cycle <= now) becomes
@@ -352,6 +364,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     if (is_write && write_commit_cycles_ > 1) {
         const int64_t accept = (write_commit_busy_until_ > now) ? write_commit_busy_until_ : now;
         req->inc_latency(accept - now);
+        lat_wcommit_ += (uint64_t)(accept - now);
         write_commit_busy_until_ = accept + write_commit_cycles_;
     }
 
@@ -380,7 +393,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
         }
         if (ready < 0) break;                  // paranoia: no PEND line found — treat as miss
         const int64_t virt0 = now + req->get_full_latency();
-        if (ready > virt0) req->inc_latency(ready - virt0);
+        if (ready > virt0) { req->inc_latency(ready - virt0); lat_clamp_ += (uint64_t)(ready - virt0); n_clamp_++; }
         if (d.is_hit_pend || d.is_hit_conflit) {
             serve_pend_way = (int)d.way;       // serve from the PEND line; NO install (see above)
             break;
@@ -405,6 +418,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
         while (!wresp_win_.empty() && wresp_win_.front() <= virt) wresp_win_.pop_front();
         if (wresp_win_.size() >= 4) {
             req->inc_latency(wresp_win_.front() - virt);
+            lat_winfo_ += (uint64_t)(wresp_win_.front() - virt);
             virt = now + req->get_full_latency();
             wresp_win_.pop_front();
         }
@@ -433,6 +447,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
             cnt_rd_hit_++;
             req->inc_latency(hit_latency_cycles_);
         }
+        lat_sum_ += (uint64_t)req->get_full_latency();
         return vp::IO_REQ_OK;
     }
 
@@ -513,6 +528,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
             req->inc_latency(resp_cycle - now);
         }
         cnt_refill_++;
+        lat_sum_ += (uint64_t)req->get_full_latency();
         return vp::IO_REQ_OK;
     }
     // The refill did not complete (rst != OK). The cluster L2 (wide_axi → SPM) answers synchronously, so
@@ -534,6 +550,7 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     req->set_addr(req_addr_save);
     if (fst == vp::IO_REQ_OK) {
         req->inc_latency((int64_t)req->get_full_latency() + miss_penalty_cycles_);
+        lat_sum_ += (uint64_t)req->get_full_latency();
         return vp::IO_REQ_OK;
     }
     // Last resort (should be unreachable with a synchronous memory): keep the VLSU alive as before, but
