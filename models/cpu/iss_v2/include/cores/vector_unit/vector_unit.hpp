@@ -378,13 +378,15 @@ private:
     // Queue of pending instructions to be processed by this block
     // The block process them in-order
     std::vector<VuLsuPendingInsn> insns;
-    // Address of the next burst to be sent
+    // Base address of the current memory operation
     iss_addr_t pending_addr;
-    // Remaining size of the current load/store operation
+    // Total size of the current load/store operation, fixed during execution
     iss_addr_t pending_size;
+    // Remaining size of the current load/store operation
+    iss_addr_t remaining_size;
     // Write or read of the current load/store operation
     bool pending_is_write;
-    // Pointer to vector register file where next burst should read or written
+    // Base pointer in the vector register file for the current memory operation
     uint8_t *pending_velem;
     // Thsi indicates the vector register involved in the load/sotre operation.
     // Used for vector chaining to commit elements to correct register.
@@ -411,24 +413,24 @@ private:
     bool strided;
     int elem_size;
     int reg_indexed;
-    int pending_elem;
     int inst_elem_size;
     int64_t op_timestamp;
     bool prev_is_write;
     bool started;
     int vstart;
 
+    // Independent static issue: global burst k belongs to port k % nb_ports.
+    // Each port keeps only its accepted-burst count and DENIED state; burst
+    // count/size are derived from the immutable transfer size and access mode.
+    std::vector<int> port_burst;
+    std::vector<bool> port_stalled;
+
     // Instruction currently active in the VLSU. pending_insn->timestamp is reused across phases:
-    // 1. as an enqueue-cycle guard, 2. as the request issuing start time after instruction latency, 
-    // and 3. for memory-response/retirement timing. Keeping this index separate from insn_first_waiting 
-    // makes the phase explicit and prevents queued instructions from consuming their instruction latency 
+    // 1. as an enqueue-cycle guard, 2. as the request issuing start time after instruction latency,
+    // and 3. for memory-response/retirement timing. Keeping this index separate from insn_first_waiting
+    // makes the phase explicit and prevents queued instructions from consuming their instruction latency
     // before they become active.
     int insn_ongoing;
-    
-    // True if one burst was not granted. Once it is true, the block can not send any burst
-    // anymore until the last one is granted
-    bool stalled;
-
     // Bursts which have been handled synchronously with a delay. There are hold here until their
     // delay has elapsed
     struct DelayedBurst
@@ -475,7 +477,7 @@ private:
     };
 
     // Reorder buffer
-    std::vector<std::vector<VlsuRobEntry>> rob; 
+    std::vector<std::vector<VlsuRobEntry>> rob;
     // Next available entry in the ROB for each port
     std::vector<int> rob_next;
     // The first entry in the ROB which is waiting for response for each port

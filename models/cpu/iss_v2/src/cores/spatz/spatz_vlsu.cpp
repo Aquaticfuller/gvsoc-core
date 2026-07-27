@@ -72,6 +72,8 @@ event_label(*this, "label", 0, gv::Vcd_event_type_string)
     this->rob_next.resize(nb_ports);
     this->rob_first.resize(nb_ports);
     this->rob_count.resize(nb_ports);
+    this->port_burst.resize(nb_ports);
+    this->port_stalled.resize(nb_ports);
     for (int i=0; i<nb_ports; i++)
     {
         this->rob[i].resize(nb_outstanding_reqs);
@@ -99,7 +101,7 @@ void VuLsu::reset(bool active)
         this->insn_last = 0;
         this->nb_waiting_insn = 0;
         this->pending_size = 0;
-        this->stalled = false;
+        this->remaining_size = 0;
         this->insn_ongoing = 0;
 
         for (VuLsuPendingInsn &slot : this->insns)
@@ -125,6 +127,8 @@ void VuLsu::reset(bool active)
             this->rob_next[i] = 0;
             this->rob_first[i] = 0;
             this->rob_count[i] = 0;
+            this->port_burst[i] = 0;
+            this->port_stalled[i] = false;
 
             for (int j=0; j<nb_outstanding_reqs; j++)
             {
@@ -231,7 +235,11 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
     this->elem_size = elem_size;
     this->inst_elem_size = inst_elem_size;
     this->reg_indexed = reg_indexed;
-    this->pending_elem = 0;
+    this->remaining_size = this->pending_size;
+    for (int p = 0; p < this->nb_ports; p++)
+    {
+        this->port_burst[p] = 0;
+    }
 
     // ON RTL, it takes some time to switch from one instruction to another, and more if it is from
     // load to store, probably due to latency to write to regfile.
@@ -259,24 +267,27 @@ void VuLsu::data_grant(vp::Block *__this, vp::IoReq *req)
     VuLsu *_this = (VuLsu *)__this;
 
     uint64_t size = req->get_size();
-
-    // Prepare the next bursts and potentially switch to next instruction once all burst have been sent
-    if (_this->reg_indexed == -1)
+    int port;
+    VuLsuPendingInsn *slot;
+    if (req->get_is_write())
     {
-        _this->pending_addr += _this->strided ? _this->stride : size;
+        slot = (VuLsuPendingInsn *)req->get_args()[0];
+        port = (int)(intptr_t)req->get_args()[1];
     }
     else
     {
-        _this->pending_elem++;
+        VlsuRobEntry *entry = (VlsuRobEntry *)req->get_args()[0];
+        slot = entry->slot;
+        port = entry->port;
     }
-    _this->pending_size -= size;
-    _this->pending_velem += size;
 
-    if (_this->pending_size == 0)
+    _this->port_burst[port]++;
+    _this->remaining_size -= size;
+
+    if (_this->remaining_size == 0)
     {
-        VuLsuPendingInsn &slot = _this->insns[_this->insn_ongoing];
-        PendingInsn *pending_insn = slot.insn;
-        
+        PendingInsn *pending_insn = slot->insn;
+
         // Keep the last bus operation time to model the gap before the next one.
         _this->op_timestamp = _this->vu.iss.clock.get_cycles() + 1;
 
@@ -284,17 +295,42 @@ void VuLsu::data_grant(vp::Block *__this, vp::IoReq *req)
         pending_insn->timestamp = pending_insn->timestamp + 1;
 
         // Mark the instruction done once all bursts have been issued.
-        slot.done = true;
+        slot->done = true;
     }
 
-    // The last burst which stalled the block has just been granted. Resume the bursts.
-    _this->stalled = false;
+     // The last burst which stalled the port has just been granted. Release the port.
+    _this->port_stalled[port] = false;
 }
 
 
 void VuLsu::data_response(vp::Block *__this, vp::IoReq *req)
 {
     VuLsu *_this = (VuLsu *)__this;
+
+    if (req->get_is_write())
+    {
+        // Stores allocate no ROB entry: on RTL the store ROB entry is already
+        // freed once the request enters the memory-request spill register. The
+        // burst is committed and accounted here, at the write response, matching
+        // the RTL store_count which drains when the store response comes back.
+        VuLsuPendingInsn *slot = (VuLsuPendingInsn *)req->get_args()[0];
+        int port = (int)(intptr_t)req->get_args()[1];
+        int elem_idx = (int)(intptr_t)req->get_args()[2];
+        int nb_elem = (int)(intptr_t)req->get_args()[3];
+
+        iss_insn_t *insn = _this->vu.iss.exec.get_insn(slot->insn->entry);
+        _this->vu.insn_commit(slot->insn, (int)req->get_size());
+        _this->vu.exec_insn_chunk(insn, slot->insn, elem_idx, elem_idx + nb_elem, nb_elem);
+        slot->nb_pending_bursts--;
+
+        int req_nb_args = req->arg_current_index();
+        if (req_nb_args > 0)
+        {
+            req->arg_free(req_nb_args);
+        }
+        _this->req_queues[port]->push_back(req);
+        return;
+    }
 
     auto *rob_entry = (VlsuRobEntry *)req->get_args()[0];
 
@@ -325,7 +361,7 @@ void VuLsu::data_response(vp::Block *__this, vp::IoReq *req)
     if (_this->rob_first[port] == rob_id)
     {
         while (_this->rob[port][rob_id].valid == true && _this->rob[port][rob_id].allocated == true){
-            
+
             auto &entry = _this->rob[port][rob_id];
 
             // In case chaining is enabled, notify that some elements has been handled as it
@@ -387,10 +423,10 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     }
 
     // Check if the first waiting instruction can be started:
-    // - if the current on-going instruction finished issuing all requests i.e. _this->pending_size == 0;
+    // - if the current on-going instruction finished issuing all requests i.e. _this->remaining_size == 0;
     // - if the first waiting instruction past its enqueue cycle,
     // - and is ready dependency-wise.
-    if (_this->nb_waiting_insn > 0 && _this->pending_size == 0)
+    if (_this->nb_waiting_insn > 0 && _this->remaining_size == 0)
     {
         VuLsuPendingInsn &slot = _this->insns[_this->insn_first_waiting];
         PendingInsn *pending_insn = slot.insn;
@@ -422,13 +458,12 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         
     }
 
-    if (_this->pending_size && _this->op_timestamp <= _this->vu.iss.clock.get_cycles() && !_this->stalled)
+    if (_this->remaining_size && _this->op_timestamp <= _this->vu.iss.clock.get_cycles())
     {
         VuLsuPendingInsn &slot = _this->insns[_this->insn_ongoing];
         PendingInsn *pending_insn = slot.insn;
 
-        
-        // If the on-going instruction is ready and its instruction latency has elapsed, 
+        // If the on-going instruction is ready and its instruction latency has elapsed,
         // try to send requests to available ports
         if (pending_insn->timestamp <= _this->vu.iss.clock.get_cycles() && _this->vu.insn_ready(pending_insn))
         {
@@ -441,73 +476,93 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 _this->event_pc.event((uint8_t *)&insn->addr);
             }
 
-            for (int i=0; i<_this->ports.size(); i++)
+            for (int i = 0; i < _this->nb_ports; i++)
             {
-                if (_this->pending_size == 0 || _this->stalled) break;
+                if (_this->remaining_size == 0) break;
 
-                // Only use this port if it has requests available otherwise it means too many
-                // are pending
-                if (!_this->req_queues[i]->empty() && _this->rob_count[i] < _this->rob[i].size())
+                // Only use this port if it is not stalled and has requests available
+                if (!_this->port_stalled[i] && !_this->req_queues[i]->empty() && _this->rob_count[i] < _this->rob[i].size())
                 {
-                    uint64_t size;
-
+                    uint32_t req_size;
                     if (_this->strided ||  _this->reg_indexed != -1)
                     {
-                        size = _this->elem_size;
+                        req_size = _this->elem_size;
                     }
                     else
                     {
-                        size = std::min((iss_addr_t)_this->vu.lane_width, _this->pending_size);
+                        req_size = _this->vu.lane_width;
+                    }
+
+                    uint32_t req_idx = _this->port_burst[i] * _this->nb_ports + i;
+                    uint64_t req_offset = req_idx * req_size;
+                    if (req_offset >= _this->pending_size)
+                    {
+                        continue;
+                    }
+                    uint64_t size = std::min((uint64_t)req_size, _this->pending_size - req_offset);
+                    uint8_t *velem = _this->pending_velem + req_offset;
+                    int elem_idx = _this->vstart + req_offset / _this->elem_size;
+                    iss_reg_t addr;
+                    if (_this->strided)
+                    {
+                        uint64_t offset = req_idx * _this->stride;
+                        addr = _this->pending_addr + offset;
+                    }
+                    else if (_this->reg_indexed != -1)
+                    {
+                        uint64_t offset = velem_get_value(&_this->vu.iss, _this->reg_indexed, req_idx,
+                            _this->inst_elem_size, _this->vu.iss.vector.lmul);
+                        addr = _this->pending_addr + offset;
+                    }
+                    else
+                    {
+                        addr = _this->pending_addr + req_offset;
                     }
 
                     _this->trace.msg(vp::Trace::LEVEL_TRACE,
-                        "Sending request (id: %d, port: %d, addr: 0x%lx, size: 0x%lx, pending_size: 0x%lx, is_write: %d)\n",
-                        pending_insn->id, i, _this->pending_addr, size, _this->pending_size, _this->pending_is_write);
-
-                    _this->event_addr[i].event((uint8_t *)&_this->pending_addr);
+                        "Sending request (id: %d, port: %d, addr: 0x%lx, size: 0x%lx, remaining_size: 0x%lx, is_write: %d)\n",
+                        pending_insn->id, i, addr, size, _this->remaining_size,
+                        _this->pending_is_write);
+                    _this->event_addr[i].event((uint8_t *)&addr);
                     _this->event_size[i].event((uint8_t *)&size);
                     _this->event_is_write[i].event((uint8_t *)&_this->pending_is_write);
 
-                    // Pop a request from this port queue to limit number of outstanding requests
                     vp::IoReq *req = (vp::IoReq *)_this->req_queues[i]->pop();
-
                     req->init();
 
-                    iss_reg_t addr = _this->pending_addr;
-
-                    if (_this->reg_indexed != -1)
+                    if (_this->pending_is_write)
                     {
-                        uint64_t offset = velem_get_value(&_this->vu.iss, _this->reg_indexed, _this->pending_elem,
-                            _this->inst_elem_size, _this->vu.iss.vector.lmul);
-                        addr += offset;
+                        req->arg_push((void *)&slot);
+                        req->arg_push((void *)(intptr_t)i);
+                        req->arg_push((void *)(intptr_t)elem_idx);
+                        req->arg_push((void *)(intptr_t)(size / _this->elem_size));
                     }
-                    
-                    int rob_id = _this->rob_next[i];
-                    _this->rob_next[i] = (rob_id + 1) % _this->rob[i].size();
-                    _this->rob_count[i]++;
-                    
-                    VlsuRobEntry &rob_entry = _this->rob[i][rob_id];
-                    rob_entry.port = i;
-                    rob_entry.rob_id = rob_id;
-                    rob_entry.allocated = true;
-                    rob_entry.valid = false;
-                    rob_entry.req = req;
-                    rob_entry.slot = &slot;
-                    rob_entry.vreg = _this->pending_vreg;
-                    rob_entry.vstart = _this->vstart;
-                    rob_entry.elem_size = _this->elem_size;
-                    rob_entry.size = size;
+                    else
+                    {
+                        int rob_id = _this->rob_next[i];
+                        _this->rob_next[i] = (rob_id + 1) % _this->rob[i].size();
+                        _this->rob_count[i]++;
 
-                    req->arg_push((void *)&rob_entry);
+                        VlsuRobEntry &rob_entry = _this->rob[i][rob_id];
+                        rob_entry.port = i;
+                        rob_entry.rob_id = rob_id;
+                        rob_entry.allocated = true;
+                        rob_entry.valid = false;
+                        rob_entry.req = req;
+                        rob_entry.slot = &slot;
+                        rob_entry.vreg = _this->pending_vreg;
+                        rob_entry.vstart = elem_idx;
+                        rob_entry.elem_size = _this->elem_size;
+                        rob_entry.size = size;
+
+                        req->arg_push((void *)&rob_entry);
+                    }
 
                     req->set_addr(addr);
                     req->set_is_write(_this->pending_is_write);
                     req->set_size(size);
-
+                    req->set_data(velem);
                     slot.nb_pending_bursts++;
-                    _this->vstart += size / _this->elem_size;
-
-                    req->set_data(_this->pending_velem);
 
                     vp::IoReqStatus err = _this->ports[i].req(req);
 
@@ -533,33 +588,15 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                     }
                     else if (err == vp::IO_REQ_DENIED)
                     {
-                        // Any denied burst must prevent this block from sending any other burst.
-                        // It will resume only once the burst is granted
-                        _this->stalled = true;
-                        break;
+                        _this->port_stalled[i] = true;
                     }
-                    else
-                    {
-                        // Nothing to do for asynchronous requests (status PENDING), they are handled in the callback
-                    }
-
-
                     // Prepare the next burst if not DENIED
                     if (err != vp::IO_REQ_DENIED)
                     {
-                        if (_this->reg_indexed == -1)
-                        {
-                            _this->pending_addr += _this->strided ? _this->stride : size;
-                        }
-                        else
-                        {
-                            _this->pending_elem++;
-                        }
-                        _this->pending_size -= size;
-                        _this->pending_velem += size;
-
+                        _this->port_burst[i]++;
+                        _this->remaining_size -= size;
                         // Switch to next instruction once all burst have been sent
-                        if (_this->pending_size == 0)
+                        if (_this->remaining_size == 0)
                         {
                             // Keep the last bus operation time to model the gap before the next one.
                             _this->op_timestamp = _this->vu.iss.clock.get_cycles() + 1;
