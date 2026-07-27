@@ -89,6 +89,14 @@ private:
     uint8_t  scratch_buf_[8];     // value buffer for the scratch read/write
     vp::IoReq scratch_;
 
+    // B3 RMW lane occupancy (spatz_cache_amo.sv: core_ready=0 in DoAMO/WriteBackAMO/Wait — the
+    // bank-shared scalar lane is HELD from RMW accept until the write-back drains, ~15-20 cy on a
+    // hit, full refill time on a miss). rmw_busy_until_ = the cycle the window ends; any new request
+    // on the lane (any opcode) waits it out. rmw_write_rtt_cycles_ = the write-back RTT knob.
+    int64_t  rmw_busy_until_ = 0;
+    int64_t  rmw_read_lat_ = 0;   // the scratch read's latency (captured before scratch_ re-init)
+    int32_t  rmw_write_rtt_cycles_ = 8;
+
     vp::IoSlave  input_;
     vp::IoMaster output_;
     vp::Trace trace_;
@@ -101,6 +109,10 @@ InsituCacheAmo::InsituCacheAmo(vp::ComponentConf &conf) : vp::Component(conf)
     auto *cfg = this->get_js_config();
     word_bytes_ = cfg->get_child_int("word_bytes");
     if (word_bytes_ < 1) word_bytes_ = 4;
+    // B3: the write-back RTT of an RMW (the part after the scratch read). -1 → default 8
+    // (read-hit ~10 + 1 + 8 ≈ 19 cy end-to-end, matching the RTL's ~15-20 cy).
+    int32_t wrtt = cfg->get_child_int("amo_rmw_write_rtt_cycles");
+    if (wrtt >= 0) rmw_write_rtt_cycles_ = wrtt;
 
     input_.set_req_meth(&InsituCacheAmo::req_handler);
     this->new_slave_port("input", &input_);
@@ -117,6 +129,10 @@ vp::IoReqStatus InsituCacheAmo::req_handler(vp::Block *__this, vp::IoReq *req)
     const vp::IoReqOpcode op = req->get_opcode();
     const uint64_t addr = req->get_addr();
     const uint32_t core = (uint32_t)req->get_initiator();
+
+    // B3: a new request on this lane (any opcode) waits out the previous RMW's occupancy window.
+    const int64_t now = _this->clock.get_cycles();
+    if (now < _this->rmw_busy_until_) req->inc_latency(_this->rmw_busy_until_ - now);
 
     // --- plain accesses: pass through ---
     if (op == vp::READ) {
@@ -182,6 +198,7 @@ void InsituCacheAmo::resp_handler(vp::Block *__this, vp::IoReq *req)
 
     if (_this->phase_ == AMO_READ) {
         memcpy(&_this->old_val_, _this->scratch_buf_, 4);
+        _this->rmw_read_lat_ = _this->scratch_.get_full_latency();   // B3: before scratch_ re-init
         const uint32_t newv = amo_alu(_this->amo_op_, _this->old_val_, _this->b_val_);
         memcpy(_this->scratch_buf_, &newv, 4);
         _this->phase_ = AMO_WRITE;
@@ -209,7 +226,22 @@ void InsituCacheAmo::resp_handler(vp::Block *__this, vp::IoReq *req)
     }
     _this->phase_ = IDLE;
     _this->orig_ = nullptr;
-    if (orig != nullptr) { _this->n_rmw_++; _this->lat_rmw_sum_ += (uint64_t)orig->get_full_latency(); }
+    if (orig != nullptr) {
+        // B3: the requester sees the full RMW round trip (scratch read + 1 + write-back), and the
+        // lane stays busy for the same window (core_ready=0 until the write-back drains). A scratch
+        // read MISS already carries the refill latency, so a missing RMW costs ~refill+write ≈ the
+        // RTL's "full refill time on a miss". SC has no separate read: write + RTT. The window
+        // CHAINS: it starts after the previous RMW's window (the wait stamped at entry) — setting
+        // busy = now + total would let overlapping windows shrink the serialization.
+        const int64_t total = (_this->rmw_read_lat_ > 0)
+            ? (_this->rmw_read_lat_ + 1 + _this->scratch_.get_full_latency())
+            : (_this->scratch_.get_full_latency() + _this->rmw_write_rtt_cycles_);
+        orig->inc_latency(total);
+        const int64_t now = _this->clock.get_cycles();
+        _this->rmw_busy_until_ = (_this->rmw_busy_until_ > now ? _this->rmw_busy_until_ : now) + total;
+        _this->rmw_read_lat_ = 0;
+        _this->n_rmw_++; _this->lat_rmw_sum_ += (uint64_t)orig->get_full_latency();
+    }
     if (_this->in_sync_call_) {
         // resolved inside req_handler (sync cache): tell it to return IO_REQ_OK; do NOT resp() (the result
         // is already in orig's data buffer). resp()+PENDING would double-complete the upstream request.
