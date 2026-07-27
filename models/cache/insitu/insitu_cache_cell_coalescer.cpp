@@ -170,11 +170,16 @@ void InsituCacheCellCoalescer::tick(vp::Block *__this, vp::ClockEvent *event)
                 _this->schedule_tick();
                 break;
             }
-            // map the merged ports back to their parked Pend entries (same order as `acc`)
+            // map the merged ports back to their parked Pend entries (same order as `acc`).
+            // CRITICAL: match only !done entries — the coalescer input port is the PORT-CLASS, so
+            // different cores' lane-j accesses arrive with the SAME port index (and one core can
+            // also queue two same-cycle same-port bursts). Matching on port alone would put the
+            // SAME req in two groups → double resp() → arg_pop on empty in the VLSU (SIGSEGV,
+            // reproduced by M48 linked-list at 4-core).
             std::vector<Pend *> members;
             for (size_t k = 0; k < g.ports.size(); k++) {
                 for (auto &p : kv.second) {
-                    if (p.port == g.ports[k]) { members.push_back(&p); break; }
+                    if (!p.done && p.port == g.ports[k]) { members.push_back(&p); break; }
                 }
             }
             for (auto *mp : members) mp->done = true;
