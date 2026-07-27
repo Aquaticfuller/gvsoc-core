@@ -461,3 +461,18 @@ void Ara::isa_init()
         block->isa_init();
     }
 }
+
+void Ara::dump_stats()
+{
+#if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
+    AraVlsu *vlsu = static_cast<AraVlsu *>(this->blocks[Ara::vlsu_id]);
+    AraVcompute *vfpu = static_cast<AraVcompute *>(this->blocks[Ara::vfpu_id]);
+    AraVcompute *vslide = static_cast<AraVcompute *>(this->blocks[Ara::vslide_id]);
+    if (vlsu->dbg_bursts == 0 && vfpu->dbg_insns == 0 && vslide->dbg_insns == 0) return;
+    fprintf(stderr, "[ARA-STATS %s] vlsu: loads=%lu stores=%lu bursts=%lu | vfpu: insns=%lu busy=%lu | vslide: insns=%lu busy=%lu\n",
+            this->iss.top.get_path().c_str(),
+            (unsigned long)vlsu->dbg_loads, (unsigned long)vlsu->dbg_stores, (unsigned long)vlsu->dbg_bursts,
+            (unsigned long)vfpu->dbg_insns, (unsigned long)vfpu->dbg_busy,
+            (unsigned long)vslide->dbg_insns, (unsigned long)vslide->dbg_busy);
+#endif
+}

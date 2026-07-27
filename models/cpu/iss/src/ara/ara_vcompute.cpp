@@ -122,6 +122,8 @@ void AraVcompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             _this->ara.nb_lanes;
         int64_t end_cyclestamp = _this->ara.iss.top.clock.get_cycles() +
             nb_elems * _this->ara.iss.vector.sewb / _this->width + _this->pending_insn->insn->latency;
+        _this->dbg_insns++;
+        _this->dbg_busy += (uint64_t)(end_cyclestamp - _this->ara.iss.top.clock.get_cycles());
 
         // Only assign the end timestamp if the instruction is not chained
         if (!_this->pending_insn->chained)

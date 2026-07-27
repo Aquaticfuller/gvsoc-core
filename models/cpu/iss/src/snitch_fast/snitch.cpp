@@ -147,6 +147,9 @@ void IssWrapper::start()
 
 void IssWrapper::stop()
 {
+#if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
+    this->iss.vu.dump_stats();
+#endif
     this->iss.insn_cache.stop();
     this->iss.gdbserver.stop();
 }

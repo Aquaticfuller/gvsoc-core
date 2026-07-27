@@ -76,6 +76,10 @@ private:
     // can finished, based on operation duration.
     int64_t end_cyclestamp;
     int width;
+public:
+    // Issue-side diagnostics: instruction count + summed busy cycles, dumped at sim stop.
+    uint64_t dbg_insns = 0, dbg_busy = 0;
+private:
 };
 
 class AraVlsuPendingInsn
@@ -187,6 +191,10 @@ private:
     int pending_elem;
     int inst_elem_size;
     int width;
+public:
+    // Issue-side diagnostics (fft/etc): instruction and burst counts, dumped at sim stop.
+    uint64_t dbg_loads = 0, dbg_stores = 0, dbg_bursts = 0;
+private:
     // Sync-OK-but-latent bursts held until their (issue + full-latency) timestamp, then committed
     // (fsm_handler drains them through data_response). Makes vector traffic consume the calibrated
     // cache latency instead of committing at issue. Mirrors the Ara variant's members.
@@ -312,6 +320,8 @@ public:
     // of pending instruction, analyzed, and push to a processing block for executing once
     // dependencies are resolved. Can be called only when queue is not full.
     void insn_enqueue(PendingInsn *insn);
+    // Issue-side diagnostics dump (sim stop).
+    void dump_stats();
     // Called by a unit to notify that part of the vector result has been produced.
     // Used for vector chaining to start another operation before the result is fully produced.
     void insn_commit(int reg, int size);

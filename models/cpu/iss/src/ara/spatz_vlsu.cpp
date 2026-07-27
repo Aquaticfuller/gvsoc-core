@@ -206,6 +206,7 @@ void AraVlsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_st
 {
     // A load or store instruction is starting, just store information about the first burst and let
     // the FSM handle all the bursts.
+    if (is_write) this->dbg_stores++; else this->dbg_loads++;
     unsigned int sewb = this->ara.iss.vector.sewb;
     unsigned int lmul = this->ara.iss.vector.lmul;
     this->pending_vreg = reg;
@@ -347,6 +348,7 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 req->arg_push((void *)(uintptr_t)size);
 
                 vp::IoReqStatus err = _this->ports[i].req(req);
+                _this->dbg_bursts++;
 
                 if (err == vp::IO_REQ_OK)
                 {
