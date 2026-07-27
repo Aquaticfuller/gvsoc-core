@@ -63,6 +63,10 @@ class InsituCacheCore(Component):
             'structural_miss_penalty_cycles': config.structural_miss_penalty_cycles,
             'structural_install_tail_cycles': config.structural_install_tail_cycles,
             'structural_write_hit_latency_cycles': getattr(config, 'structural_write_hit_latency_cycles', -1),
+            # F1 flush walk (insitu_cache_tcdm_wrapper 7-state FSM): base = drain(21)+sets(256);
+            # per dirty line a serialized downstream eviction.
+            'flush_base_cycles': getattr(config, 'flush_base_cycles', 277),
+            'flush_evict_cycles': getattr(config, 'flush_evict_cycles', 20),
             # E1 MSB-rotation inverse: how many routing bits the tile xbar rotated into the MSB for
             # THIS bank (route.hpp::bits_to_rotate), + the rotation geometry. 0 → l2_addr() identity.
             'rotate_bits': rotate_bits,

@@ -43,10 +43,11 @@ public:
     void reset(bool active) override;
     void stop() override {
         // End-of-sim counter dump (diagnostics; one line per cell).
-        fprintf(stderr, "[INSITU-CORE %s] rd_hit=%lu rd_miss=%lu wr_hit=%lu wr_miss=%lu refill=%lu evict=%lu | lat_sum=%lu b1=%lu clamp=%lu/%lu winfo=%lu wcommit=%lu\n",
+        fprintf(stderr, "[INSITU-CORE %s] rd_hit=%lu rd_miss=%lu wr_hit=%lu wr_miss=%lu refill=%lu evict=%lu flush=%lu/%lu | lat_sum=%lu b1=%lu clamp=%lu/%lu winfo=%lu wcommit=%lu\n",
                 this->get_path().c_str(), (unsigned long)cnt_rd_hit_, (unsigned long)cnt_rd_miss_,
                 (unsigned long)cnt_wr_hit_, (unsigned long)cnt_wr_miss_,
                 (unsigned long)cnt_refill_, (unsigned long)cnt_evict_,
+                (unsigned long)cnt_flush_, (unsigned long)cnt_flush_dirty_,
                 (unsigned long)lat_sum_, (unsigned long)lat_b1_, (unsigned long)lat_clamp_,
                 (unsigned long)n_clamp_, (unsigned long)lat_winfo_, (unsigned long)lat_wcommit_);
         vp::Component::stop();
@@ -54,10 +55,12 @@ public:
 
 private:
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req);
+    static vp::IoReqStatus flush_req_handler(vp::Block *__this, vp::IoReq *req);
     static void refill_resp_handler(vp::Block *__this, vp::IoReq *req);
     static void tick(vp::Block *__this, vp::ClockEvent *event);
 
     void schedule_tick(int64_t cycles = 1);
+    vp::IoReqStatus run_flush(vp::IoReq *req);         // F1: flush-all (write back dirty, invalidate, gate)
     void stage1_process();                 // decode + FSM + bank write
     vp::IoReqStatus run_request_sync(vp::IoReq *req);  // synchronous-slave: resolve in-call, inc_latency, OK
     bool process_request(vp::IoReq *req);  // REQ_PROC body; returns true=done, false=stalled (retry)
@@ -126,6 +129,10 @@ private:
     // i_pre_reader_arbiter → ≤1 cache access/cycle/cell). Shared by all input ports (VLSU-aggregate
     // and scalar-bypass alike — the RTL 2:1 bypass xbar serializes them into the one pipeline).
     int64_t cell_busy_until_ = 0;
+    // F1 flush: while set, ALL upstream traffic to this cell is gated (the RTL l1d_busy_i).
+    int64_t flush_busy_until_ = 0;
+    int32_t flush_base_cycles_ = 277;   // the RTL walk (CHECK_PEND drain 21 + 256 sets)
+    int32_t flush_evict_cycles_ = 20;   // per dirty line: the serialized downstream eviction
     // Refill occupancy (calibration step 2). The RTL controller keeps ONE outstanding line-refill and
     // holds it until the miss is installed+served — the next refill-read only issues at the previous
     // line's ready cycle, so cold-miss throughput is ~1/(ML + pipeline), not ~1/ML. The sync path resolves
@@ -201,6 +208,7 @@ private:
              cnt_refill_=0, cnt_evict_=0, cnt_bank_conflict_=0;
     // latency-budget diagnostics: requests, total stamped latency, and the per-mechanism waits
     uint64_t lat_sum_=0, lat_b1_=0, lat_clamp_=0, lat_winfo_=0, lat_wcommit_=0, n_clamp_=0;
+    uint64_t cnt_flush_=0, cnt_flush_dirty_=0;
 };
 
 InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
@@ -231,6 +239,12 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
     int32_t smp = cfg->get_child_int("structural_miss_penalty_cycles");
     if (smp >= 0) miss_penalty_cycles_ = smp;
     install_tail_cycles_ = cfg->get_child_int("structural_install_tail_cycles");
+    // F1 flush knobs (insitu_cache_tcdm_wrapper.sv 7-state FSM): the base walk = CHECK_PEND drain
+    // (21) + the 256-set sweep; each dirty line adds a serialized downstream eviction.
+    int32_t fbc = cfg->get_child_int("flush_base_cycles");
+    if (fbc > 0) flush_base_cycles_ = fbc;
+    int32_t fec = cfg->get_child_int("flush_evict_cycles");
+    if (fec > 0) flush_evict_cycles_ = fec;
     // D2 store-ack latency (the winfo-FIFO ack; RTL ~8 cy regardless of hit/miss). -1 → hit value.
     write_hit_latency_cycles_ = cfg->get_child_int("structural_write_hit_latency_cycles");
 
@@ -269,7 +283,7 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
             extra_inputs_.push_back(p);
         }
     }
-    flush_itf_.set_req_meth(&InsituCacheCore::req_handler);   // flush TODO (Step 6); accept-as-OK stub
+    flush_itf_.set_req_meth(&InsituCacheCore::flush_req_handler);   // F1: real flush (was accept-OK stub)
     new_slave_port("flush", &flush_itf_);
     refill_itf_.set_resp_meth(&InsituCacheCore::refill_resp_handler);
     new_master_port("refill", &refill_itf_);
@@ -327,6 +341,53 @@ vp::IoReqStatus InsituCacheCore::req_handler(vp::Block *__this, vp::IoReq *req)
 }
 
 // ---------- synchronous-slave (closed-loop) ----------
+// F1 flush-all (the RTL 7-state FSM, analytic form): write back every dirty line (fire-and-forget
+// like the eviction path — REQUIRED for data persistence across the flush), invalidate everything
+// (PEND lines too — their ready_cycle is cleared so the lazy sweep can't resurrect them), then gate
+// all upstream traffic for the walk's duration (l1d_busy_i). The response carries the duration so
+// the peripheral's FLUSH_STATUS spins for the right length.
+vp::IoReqStatus InsituCacheCore::flush_req_handler(vp::Block *__this, vp::IoReq *req)
+{
+    InsituCacheCore *_this = static_cast<InsituCacheCore *>(__this);
+    return _this->run_flush(req);
+}
+
+vp::IoReqStatus InsituCacheCore::run_flush(vp::IoReq *req)
+{
+    const int64_t now = clock.get_cycles();
+    uint64_t n_dirty = 0;
+    for (uint32_t s = 0; s < num_sets_; s++) {
+        WayMeta *ways = set_ways(s);
+        for (uint32_t w = 0; w < num_ways_; w++) {
+            if (ways[w].status == INVALID) continue;
+            if (ways[w].dirty) {
+                n_dirty++;
+                if (evict_itf_.is_bound()) {
+                    const uint64_t old_line = ((uint64_t)ways[w].tag << (geom_.off_bits + geom_.depth_bits)) |
+                                              ((uint64_t)s << geom_.off_bits);
+                    memcpy(evict_data_buf_.data(),
+                           &data_[((size_t)s * num_ways_ + w) * cache_line_bytes_], cache_line_bytes_);
+                    evict_req_.init();
+                    evict_req_.set_addr(l2_addr(old_line));
+                    evict_req_.set_size(cache_line_bytes_);
+                    evict_req_.set_is_write(true);
+                    evict_req_.set_data(evict_data_buf_.data());
+                    (void)evict_itf_.req(&evict_req_);      // writeback (sync store, buffer reused safely)
+                }
+            }
+            ways[w].status = INVALID;
+            ways[w].dirty = false;
+            ways[w].ready_cycle = 0;
+        }
+    }
+    const int64_t dur = (int64_t)flush_base_cycles_ + (int64_t)n_dirty * flush_evict_cycles_;
+    flush_busy_until_ = now + dur;
+    cnt_flush_++;
+    cnt_flush_dirty_ += n_dirty;
+    req->inc_latency(dur);
+    return vp::IO_REQ_OK;
+}
+
 // Analytic one-shot, mirroring InsituCacheController::inline_sync_miss (controller.cpp:438-598): decode,
 // serve/install, fold the latency into req->inc_latency(), and return IO_REQ_OK in the same call — NO
 // save(), NO resp(), NO tick/event, NO in_q_/preread_q_/mshr_/FIFOs/refill_*_ async state. At most one
@@ -338,6 +399,9 @@ vp::IoReqStatus InsituCacheCore::run_request_sync(vp::IoReq *req)
     const bool is_write = req->get_is_write();
     const uint32_t set = geom_.set_index(addr);
     WayMeta *ways = set_ways(set);
+
+    // F1: all upstream traffic is gated while a flush walk is in progress (l1d_busy_i).
+    if (now < flush_busy_until_) req->inc_latency(flush_busy_until_ - now);
 
     // B1 per-cell request serialization: every lookup — read or write, hit or miss — occupies the
     // cell's single request pipeline for one cycle (the 1-deep req_buf + pre-reader arbiter).
