@@ -48,9 +48,12 @@
  *
  * Throughput: 1 forward beat per cycle per (output, channel) on the forward
  * side; 1 response beat per cycle per output on the response side (paced by
- * the adapter). Burst atomicity: an output channel locked to an input on
- * is_first forward stays locked until the burst ack (write) / is_last
- * response (read).
+ * the adapter). Burst atomicity: an output channel is locked to an input from
+ * is_first through the accepted is_last forward beat. The
+ * lock_{read,write}_output options can extend that lock through the burst ack
+ * (write) / is_last response (read). The configured latency is the total
+ * pipelined forward delay; values 0 and 1 both preserve the default one-cycle
+ * stage, while larger values delay every beat without reducing throughput.
  */
 
 #include <climits>
@@ -82,6 +85,7 @@ struct BurstEntry
     InputPort *input = nullptr;
     int output_id = -1;                // -1 until fsm has decoded the first beat's mapping
     int channel = 0;                   // resolved direction-channel for this burst
+    bool is_write = false;             // request direction, also valid with a shared channel
     int64_t original_burst_id = -1;    // master's burst_id, restored on response
     // Snapshot of req->is_last as the master submitted each forward beat into
     // this slot — reads and atomics only (pure write beats produce no
@@ -531,6 +535,7 @@ void RouterBeat::free_burst_slot(int slot_idx)
     slot.in_use = false;
     slot.input = nullptr;
     slot.output_id = -1;
+    slot.is_write = false;
     slot.original_burst_id = -1;
     slot.pending_master_is_last.clear();
     slot.base_addr = 0;
@@ -653,6 +658,12 @@ vp::IoReqStatus RouterBeat::forward_beat(InputPort *in, OutputPort *out,
             // beat — release it.
             beat->free();
         }
+
+        if (log_last && !this->cfg.lock_write_output)
+        {
+            out->elected_input[slot.channel] = nullptr;
+        }
+
         // The FIFO advanced either way — report GRANTED to the arbitration
         // caller (DONE never leaks upstream of the router).
         return vp::IO_REQ_GRANTED;
@@ -672,6 +683,14 @@ vp::IoReqStatus RouterBeat::forward_beat(InputPort *in, OutputPort *out,
         {
             slot.total_bytes += log_size;
         }
+
+        bool lock_output = log_is_write ?
+            this->cfg.lock_write_output : this->cfg.lock_read_output;
+        if (log_last && !lock_output)
+        {
+            out->elected_input[slot.channel] = nullptr;
+        }
+
         // Slot stays alive until the burst ack (write) / is_last response
         // (read) fires in the resp handler.
     }
@@ -772,6 +791,7 @@ vp::IoReqStatus RouterBeat::req_muxed(vp::Block *__this, vp::IoReq *req, int por
         slot.input = in;
         slot.output_id = -1;                          // decoded later by fsm
         slot.channel = _this->channel_of(is_write);
+        slot.is_write = is_write;
         slot.original_burst_id = req->burst_id;
         slot.base_addr = req->get_addr();
         slot.total_bytes = 0;
@@ -920,8 +940,9 @@ void RouterBeat::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         if (out->elected_input[ch] != nullptr && out->elected_input[ch] != in) continue;
         if (output_used[slot.output_id][ch]) continue;
 
-        // Lock output-channel to this input on is_first (writes) or on the
-        // single read forward (reads).
+        // Lock the output channel through the accepted final forward beat;
+        // forward_beat then releases it or holds it through the response,
+        // per the direction's configuration.
         if (beat->is_first)
         {
             out->elected_input[ch] = in;
@@ -1055,7 +1076,12 @@ vp::IoRespAck RouterBeat::resp_muxed(vp::Block *__this, vp::IoReq *req, int port
 
     if (burst_done)
     {
-        self->elected_input[slot.channel] = nullptr;
+        bool lock_output = slot.is_write ?
+            _this->cfg.lock_write_output : _this->cfg.lock_read_output;
+        if (lock_output)
+        {
+            self->elected_input[slot.channel] = nullptr;
+        }
         // The input's in-progress tracker (active_multi_beat_slot) was
         // already cleared by req_muxed at queue-time on the master's is_last
         // beat — the input could start a new multi-beat burst before this
@@ -1171,7 +1197,7 @@ void RouterBeat::deliver_synth_acks()
         int slot_idx = it->slot_idx;
         it = this->synth_acks.erase(it);
 
-        if (slot.output_id >= 0)
+        if (slot.output_id >= 0 && this->cfg.lock_write_output)
         {
             this->entries[slot.output_id]->elected_input[ch] = nullptr;
         }

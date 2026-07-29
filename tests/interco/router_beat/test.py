@@ -232,6 +232,144 @@ def build_case(case: str):
             nb_masters=2,
         )
 
+    if case == 'read_output_lock_enabled' or case == 'read_output_lock_disabled':
+        # Two reads contend for one output. A has a long response delay, while
+        # B responds quickly. With the compatibility lock enabled, B cannot
+        # reach the target until A responds. With it disabled, B's AR-like
+        # descriptor follows A one cycle later and completes first.
+        lock = case == 'read_output_lock_enabled'
+        rules_t0 = [
+            rule(addr_min=0x000, addr_max=0x03f, behavior='granted',
+                 resp_delay=12),
+            rule(addr_min=0x080, addr_max=0x0bf, behavior='granted',
+                 resp_delay=1),
+        ]
+        return dict(
+            config=beat_cfg(
+                max_input_pending_size=16,
+                max_pending_bursts=4,
+                lock_read_output=lock,
+            ),
+            schedule_a=[burst(cycle=10, addr=t0_base, size=4, burst_id=1,
+                              name='A')],
+            schedule_b=[burst(cycle=10, addr=t0_base + 0x80, size=4, burst_id=2,
+                              name='B')],
+            targets=[('t0', t0_base, window, rules_t0)],
+            nb_masters=2,
+        )
+
+    if case == 'read_output_unlock_after_retry':
+        # Releasing on the final forward must happen only after acceptance.
+        # A is denied once, so B must remain blocked through the retry window;
+        # once A's retry is accepted, B may forward before A responds.
+        rules_t0 = [
+            rule(addr_min=0x000, addr_max=0x03f,
+                 behavior='deny_then_granted', deny_count=1,
+                 retry_delay=5, resp_delay=10),
+            rule(addr_min=0x080, addr_max=0x0bf, behavior='granted',
+                 resp_delay=1),
+        ]
+        return dict(
+            config=beat_cfg(
+                max_input_pending_size=16,
+                max_pending_bursts=4,
+                lock_read_output=False,
+            ),
+            schedule_a=[burst(cycle=10, addr=t0_base, size=4, burst_id=1,
+                              name='A')],
+            schedule_b=[burst(cycle=10, addr=t0_base + 0x80, size=4, burst_id=2,
+                              name='B')],
+            targets=[('t0', t0_base, window, rules_t0)],
+            nb_masters=2,
+        )
+
+    if case == 'write_output_lock_enabled' or case == 'write_output_lock_disabled':
+        # Two native Beat writes contend for one output. W beats must remain
+        # contiguous in both modes. The compatibility lock additionally holds
+        # the output through B; AXI-style mode releases immediately after the
+        # accepted last W beat.
+        lock = case == 'write_output_lock_enabled'
+        rules_t0 = [rule(behavior='granted', resp_delay=8)]
+        return dict(
+            config=beat_cfg(
+                max_input_pending_size=64,
+                max_pending_bursts=4,
+                lock_write_output=lock,
+            ),
+            schedule_a=[burst(cycle=10, addr=t0_base, size=4, nb_beats=4,
+                              burst_id=1, name='A', is_write=True)],
+            schedule_b=[burst(cycle=10, addr=t0_base + 0x80, size=4, nb_beats=4,
+                              burst_id=2, name='B', is_write=True)],
+            targets=[('t0', t0_base, window, rules_t0)],
+            nb_masters=2,
+            native_beat_width=4,
+        )
+
+    if case == 'shared_output_stale_read_response':
+        # Mixed policies on one physical channel. R releases after its forward,
+        # then B's long write owns the shared channel through its ack. R's late
+        # response must not clear B's newer lock and let probe P interleave.
+        rules_t0 = [
+            rule(addr_min=0x000, addr_max=0x03f, behavior='granted',
+                 resp_delay=3),
+            rule(addr_min=0x080, addr_max=0x0bf, behavior='granted',
+                 resp_delay=8),
+            rule(addr_min=0x200, addr_max=0x23f, behavior='granted',
+                 resp_delay=1),
+        ]
+        return dict(
+            config=beat_cfg(
+                max_input_pending_size=64,
+                max_pending_bursts=4,
+                shared_rw_channel=True,
+                lock_read_output=False,
+                lock_write_output=True,
+            ),
+            schedule_a=[
+                burst(cycle=10, addr=t0_base, size=4, burst_id=1, name='R'),
+                burst(cycle=14, addr=t0_base + 0x200, size=4, burst_id=3,
+                      name='P'),
+            ],
+            schedule_b=[burst(cycle=10, addr=t0_base + 0x80, size=4, nb_beats=6,
+                              burst_id=2, name='B', is_write=True)],
+            targets=[('t0', t0_base, window, rules_t0)],
+            nb_masters=2,
+            native_beat_width=4,
+        )
+
+    if case == 'shared_output_stale_write_response':
+        # Symmetric mixed-policy case. A releases after its last W beat, then
+        # B's delayed read owns the shared channel through R. A's old B response
+        # must not clear B's newer lock and admit write probe P early.
+        rules_t0 = [
+            rule(addr_min=0x000, addr_max=0x03f, behavior='granted',
+                 resp_delay=3),
+            rule(addr_min=0x080, addr_max=0x0bf, behavior='granted',
+                 resp_delay=6),
+            rule(addr_min=0x200, addr_max=0x23f, behavior='granted',
+                 resp_delay=1),
+        ]
+        return dict(
+            config=beat_cfg(
+                max_input_pending_size=64,
+                max_pending_bursts=4,
+                shared_rw_channel=True,
+                lock_read_output=True,
+                lock_write_output=False,
+            ),
+            schedule_a=[
+                burst(cycle=10, addr=t0_base, size=4, nb_beats=2,
+                      burst_id=1, name='A', is_write=True),
+                burst(cycle=14, addr=t0_base + 0x200, size=4, nb_beats=2,
+                      burst_id=3, name='P', is_write=True),
+            ],
+            schedule_b=[burst(cycle=10, addr=t0_base + 0x80, size=4,
+                              burst_id=2, name='R')],
+            targets=[('t0', t0_base, window, rules_t0)],
+            nb_masters=2,
+            native_beat_width=4,
+        )
+
     if case == 'resp_arbitration':
         # One master issues two multi-beat reads to two different outputs. Both
         # output adapters stream their response beats back at 1 beat/cycle, so

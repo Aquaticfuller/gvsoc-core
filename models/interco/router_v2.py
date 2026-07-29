@@ -135,6 +135,13 @@ class RouterConfig(Config, HasSize):
         ``False`` (default) → two independent channels, doubling effective
         throughput when traffic is balanced. Read by the bandwidth,
         backpressure and beat variants.
+    lock_read_output : bool
+        Beat variant. Keep an output's read channel locked to the initiating
+        input until the final response beat, rather than releasing it once the
+        final request beat is accepted (which matches AXI AR arbitration).
+    lock_write_output : bool
+        Beat variant. Same for the write channel, holding it until the write
+        acknowledgement. A burst stays non-interleaved either way.
     max_input_pending_size : int
         Per-input FIFO depth in bytes. Used by the beat variant.
     bandwidth : int
@@ -171,6 +178,16 @@ class RouterConfig(Config, HasSize):
         "(reads and writes compete for the same per-cycle slot). False (default) gives two "
         "independent channels, effectively doubling the router throughput when read and write "
         "traffic is balanced."
+    ))
+    lock_read_output: bool = cfg_field(default=True, dump=True, desc=(
+        "Keep an output's read channel locked to the initiating input until the final response "
+        "beat. When false, release it once the final request beat is accepted, matching AXI AR "
+        "arbitration."
+    ))
+    lock_write_output: bool = cfg_field(default=True, dump=True, desc=(
+        "Keep an output's write channel locked to the initiating input until the write "
+        "acknowledgement. When false, release it once the final request beat is accepted. A "
+        "burst stays non-interleaved either way."
     ))
     max_input_pending_size: int = cfg_field(default=0, dump=True, desc=(
         "Size of the FIFO for each input. Only valid for asynchronous mode and only when input "
@@ -260,6 +277,7 @@ class Router(gvsoc.systree.Component):
        ``latency``,                –, yes, yes, –
        ``bandwidth``,              –, yes, yes, –
        ``shared_rw_channel``,      –, yes, yes, yes
+       ``lock_*_output``,          –, –,   –,   yes
        ``width``,                  –, –,   –,   yes
        ``max_input_pending_size``, –, –,   –,   yes
        ``max_pending_bursts``,     –, –,   –,   yes
