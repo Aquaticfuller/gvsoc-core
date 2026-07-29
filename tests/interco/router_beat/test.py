@@ -210,6 +210,17 @@ def build_case(case: str):
             nb_masters=1,
         )
 
+    if case == 'forward_latency_default' or case == 'forward_latency_two':
+        latency = 0 if case == 'forward_latency_default' else 2
+        return dict(
+            config=beat_cfg(latency=latency, max_input_pending_size=64),
+            schedule=[burst(cycle=10, addr=t0_base, size=4, nb_beats=4,
+                            burst_id=1, name='W', is_write=True)],
+            targets=[('t0', t0_base, window, ok)],
+            nb_masters=1,
+            native_beat_width=4,
+        )
+
     if case == 'burst4':
         return dict(
             config=beat_cfg(max_input_pending_size=64),

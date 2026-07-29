@@ -149,7 +149,8 @@ class RouterConfig(Config, HasSize):
         backpressure variants.
     latency : int
         Per-router latency in cycles, applied on every request on top of any
-        per-mapping latency. Used by the bandwidth and backpressure variants.
+        per-mapping latency. The beat variant interprets this as its total
+        pipelined forward delay, with a minimum of one cycle.
     width : int
         Beat width in bytes. Required by the beat variant (beats with
         ``size > width`` are rejected as ``IO_RESP_INVALID``).
@@ -198,7 +199,8 @@ class RouterConfig(Config, HasSize):
         "end time of the burst."
     ))
     latency: int = cfg_field(default=0, dump=True, desc=(
-        "Per-router latency in cycles applied to every request, on top of any per-mapping latency."
+        "Per-router latency in cycles applied to every request. The beat variant uses this as "
+        "its total pipelined forward delay, with values 0 and 1 both selecting one cycle."
     ))
     width: int = cfg_field(default=0, dump=True, desc=(
         "Beat width in bytes (only used by the beat-streaming variant)."
@@ -274,7 +276,7 @@ class Router(gvsoc.systree.Component):
        :header: Field, untimed, bandwidth, backpressure, beat
        :widths: auto
 
-       ``latency``,                –, yes, yes, –
+       ``latency``,                –, yes, yes, yes
        ``bandwidth``,              –, yes, yes, –
        ``shared_rw_channel``,      –, yes, yes, yes
        ``lock_*_output``,          –, –,   –,   yes

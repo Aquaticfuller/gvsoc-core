@@ -181,12 +181,10 @@ public:
     {
         vp::IoReq *req;
         int        slot_idx;
+        int64_t    ready_cycle;
     };
     std::deque<PendingBeat> pending;
     uint64_t pending_bytes = 0;
-    // Cycle-latched "head arrival" gate — beats pushed in cycle T are only
-    // visible to an fsm running at cycle T+1.
-    vp::ClockedSignal<int64_t> head_cycle;
     // Tracks the in-progress multi-beat burst on this input (between its
     // is_first and is_last beats). -1 when no such burst is open. Used only by
     // continuation beats (is_first=false) to look up their slot; single-beat
@@ -425,8 +423,7 @@ void OutputPort::log_resp(uint64_t addr, uint64_t size,
 
 InputPort::InputPort(RouterBeat *top, int id, std::string name)
     : top(top), id(id),
-      itf(id, &RouterBeat::req_muxed, &RouterBeat::resp_retry_in_muxed),
-      head_cycle(*top, name + "/head_cycle", 64, true, /*reset=*/INT64_MAX)
+      itf(id, &RouterBeat::req_muxed, &RouterBeat::resp_retry_in_muxed)
 {
 }
 
@@ -623,7 +620,6 @@ vp::IoReqStatus RouterBeat::forward_beat(InputPort *in, OutputPort *out,
         out->log_access(original_addr, log_size, log_is_write, log_first, log_last);
         in->pending.pop_front();
         in->pending_bytes -= log_size;
-        if (in->pending.empty()) in->head_cycle.set(INT64_MAX);
 
         if (beat->get_resp_status() == vp::IO_RESP_INVALID)
         {
@@ -678,7 +674,6 @@ vp::IoReqStatus RouterBeat::forward_beat(InputPort *in, OutputPort *out,
         in->pending.pop_front();
         // Mirror the directional accounting from req_muxed.
         in->pending_bytes -= log_is_write ? log_size : 0;
-        if (in->pending.empty()) in->head_cycle.set(INT64_MAX);
         if (is_pure_write)
         {
             slot.total_bytes += log_size;
@@ -824,13 +819,9 @@ vp::IoReqStatus RouterBeat::req_muxed(vp::Block *__this, vp::IoReq *req, int por
     if (is_write) { _this->stat_writes++; _this->stat_bytes_written += size; }
     else          { _this->stat_reads++;  _this->stat_bytes_read    += size; }
 
-    bool was_empty = in->pending.empty();
-    in->pending.push_back(InputPort::PendingBeat{req, slot_idx});
+    int64_t forward_latency = std::max((int64_t)1, (int64_t)_this->cfg.latency);
+    in->pending.push_back(InputPort::PendingBeat{ req, slot_idx, now + forward_latency});
     in->pending_bytes += fifo_cost;
-    if (was_empty)
-    {
-        in->head_cycle.set(now);
-    }
 
     _this->schedule_fsm();
     return vp::IO_REQ_GRANTED;
@@ -855,10 +846,9 @@ void RouterBeat::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         InputPort *in = _this->inputs[i];
         if (in->pending.empty()) continue;
 
-        // ClockedSignal gate: head must have been committed to a prior cycle.
-        if (in->head_cycle.get() >= now) continue;
-
         InputPort::PendingBeat head = in->pending.front();
+        if (head.ready_cycle > now) continue;
+
         vp::IoReq *beat = head.req;
         int slot_idx = head.slot_idx;
         BurstEntry &slot = _this->burst_table[slot_idx];
@@ -881,7 +871,6 @@ void RouterBeat::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 in->pending.pop_front();
                 // Mirror the directional accounting from req_muxed.
                 in->pending_bytes -= beat->get_is_write() ? err_size : 0;
-                if (in->pending.empty()) in->head_cycle.set(INT64_MAX);
 
                 if (!err_is_pure_write)
                 {
