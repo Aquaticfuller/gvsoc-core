@@ -24,7 +24,7 @@ class Xf16(IsaSubset):
         super().__init__(name='f16', instrs=[
 
             Insn('------- ----- ----- 001 ----- 0000111', 'flh',       FL('h'),            tags=["load", 'fp_op']),
-            Insn('------- ----- ----- 001 ----- 0100111', 'fsh',       FS('h'),            tags=['fp_op']),
+            Insn('------- ----- ----- 001 ----- 0100111', 'fsh',       FS('h'),            tags=['store', 'fp_op']),
             Insn('-----10 ----- ----- --- ----- 1000011', 'fmadd.h',   F_FFF('h', ui12_3), tags=['sfmadd', 'fp_op']),
             Insn('-----10 ----- ----- --- ----- 1000111', 'fmsub.h',   F_FFF('h', ui12_3), tags=['sfmadd', 'fp_op']),
             Insn('-----10 ----- ----- --- ----- 1001011', 'fnmsub.h',  F_FFF('h', ui12_3), tags=['sfmadd', 'fp_op']),
@@ -149,7 +149,7 @@ class Xf8(IsaSubset):
     def __init__(self):
         super().__init__(name='f8', instrs=[
             Insn('------- ----- ----- 000 ----- 0000111', 'flb',       FL('b'),            tags=["load", 'fp_op']),
-            Insn('------- ----- ----- 000 ----- 0100111', 'fsb',       FS('b'),            tags=['fp_op']),
+            Insn('------- ----- ----- 000 ----- 0100111', 'fsb',       FS('b'),            tags=['store', 'fp_op']),
             Insn('-----11 ----- ----- --- ----- 1000011', 'fmadd.b',   F_FFF('b', ui12_3), tags=['sfmadd', 'fp_op']),
             Insn('-----11 ----- ----- --- ----- 1000111', 'fmsub.b',   F_FFF('b', ui12_3), tags=['sfmadd', 'fp_op']),
             Insn('-----11 ----- ----- --- ----- 1001011', 'fnmsub.b',  F_FFF('b', ui12_3), tags=['sfmadd', 'fp_op']),
