@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <deque>
 #include <queue>
 #include <cpu/iss_v2/include/types.hpp>
 #include <cpu/iss_v2/include/stats/insn_duration.hpp>
@@ -403,10 +404,6 @@ private:
     int nb_waiting_insn;
     // Ports to the TCDM, used by VLSU for vector load and store operations
     std::vector<vp::IoMaster> ports;
-    // Queues of requests. Each port has its own queue to model limited oustanding requests
-    std::vector<vp::Queue *> req_queues;
-    // Whole list of requests for all ports
-    std::vector<vp::IoReq> requests;
     // Number of TCDM ports
     int nb_ports;
     iss_reg_t stride;
@@ -449,7 +446,29 @@ private:
 
     std::priority_queue<DelayedBurst, std::vector<DelayedBurst>, DelayedBurstCompare> delayed_bursts;
 
-    // Reorder Buffer for mempool configuration
+    // A burst in flight. Both loads and stores take their request from the same pool,
+    // and the request describes the elements it covers, so that it can be committed
+    // when it completes: through its ROB entry for a load, directly for a store.
+    struct VlsuReq
+    {
+        vp::IoReq req;
+        // Copy of the vector elements to be stored. The register file is read when the
+        // request is sent, but the request is only applied when it reaches the target,
+        // when a younger instruction may already have overwritten the register. Unused
+        // by loads, which write the register file from the response data.
+        std::vector<uint8_t> data;
+        // Instruction slot which issued the request
+        VuLsuPendingInsn *slot = nullptr;
+        // Port on which the request was sent
+        int port = 0;
+        // Vector register and range of elements covered by the request
+        int vreg = 0;
+        int vstart = 0;
+        int nb_elem = 0;
+    };
+
+    // Reorder Buffer for mempool configuration. It only tracks the completion order of
+    // the loads, the requests themselves being described by VlsuReq.
     struct VlsuRobEntry
     {
         // Port and id
@@ -463,17 +482,7 @@ private:
         bool valid = false;
 
         // Request itself
-        vp::IoReq *req = nullptr;
-
-        // Instruction slot issued the request
-        VuLsuPendingInsn *slot = nullptr;
-
-        // Vector register
-        int vreg = 0;
-
-        int elem_size = 0;
-        int vstart = 0;
-        int size = 0;
+        VlsuReq *req = nullptr;
     };
 
     // Reorder buffer
@@ -484,6 +493,14 @@ private:
     std::vector<int> rob_first;
     // Number of allocated entries in the ROB for each port
     std::vector<int> rob_count;
+
+    // Requests, allocated on demand and recycled once their response is received. The
+    // pool puts no limit on the number of outstanding bursts, like RTL where the number
+    // of loads is limited by the ROB and the number of stores by nothing. A deque keeps
+    // the requests already in flight at a stable address while the pool grows.
+    std::deque<VlsuReq> reqs;
+    // Requests which are not in flight
+    std::vector<VlsuReq *> reqs_free;
 };
 
 #endif // CONFIG_GVSOC_ISS_VLSU_V2
