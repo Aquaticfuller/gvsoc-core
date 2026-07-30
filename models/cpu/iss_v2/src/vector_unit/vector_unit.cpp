@@ -464,6 +464,13 @@ void Vu::isa_init()
 
 bool Vu::insn_ready(PendingInsn *insn)
 {
+    // By default an instruction reads one chunk past what it already processed
+    int chunk_size = this->nb_lanes * this->lane_width;
+    return this->insn_ready(insn, insn->nb_bytes_done + chunk_size);
+}
+
+bool Vu::insn_ready(PendingInsn *insn, int next_read)
+{
     // WAW and WAR deps cannot be chained and are blocking
     if (this->insns_out_deps[insn->id] != 0)
     {
@@ -498,13 +505,11 @@ bool Vu::insn_ready(PendingInsn *insn)
             if (!dep_insn->out_can_be_chained)
                 return false;
 
-            // A chained consumer trails the producer by one chunk plus the
-            // producer's FPU pipeline depth: the producer's result word is
-            // only written pipeline_latency cycles after its operands
-            // entered the unit (one chunk is processed per cycle, so the
-            // extra trailing distance is expressed in chunks).
+            // The producer must have committed the elements read here, plus the ones
+            // still in its FPU pipeline: a result word lands pipeline_latency cycles
+            // after its operands entered, one chunk per cycle.
             if (dep_insn->nb_bytes_done * dep_insn->out_chaining_factor <
-                    (insn->nb_bytes_done + chunk_size * (1 + dep_insn->pipeline_latency)) * insn->chaining_factor)
+                    (next_read + chunk_size * dep_insn->pipeline_latency) * insn->chaining_factor)
             {
                 // The producer cannot progress any further once fully
                 // committed; its remaining results become available as it
@@ -519,8 +524,7 @@ bool Vu::insn_ready(PendingInsn *insn)
 
                 float out_factor = dep_insn->out_chaining_factor != 0.0f ?
                     dep_insn->out_chaining_factor : 1.0f;
-                float base_needed = (insn->nb_bytes_done + chunk_size) *
-                    insn->chaining_factor / out_factor;
+                float base_needed = next_read * insn->chaining_factor / out_factor;
                 float avail = dep_insn->nb_bytes_done;
                 if (base_needed > avail)
                     base_needed = avail;

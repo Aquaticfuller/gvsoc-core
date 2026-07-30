@@ -701,6 +701,9 @@ public:
     void insn_end(PendingInsn *insn);
     void insn_commit(PendingInsn *pending_insn, int nb_elems);
     bool insn_ready(PendingInsn *insn);
+    // Same, for an instruction about to read the elements up to next_read rather than
+    // the chunk after the ones it already processed.
+    bool insn_ready(PendingInsn *insn, int next_read);
     // Called by the ISS to offload an instruction to vu. The instruction is pushed to the queue
     // of pending instruction, analyzed, and push to a processing block for executing once
     // dependencies are resolved. Can be called only when queue is not full.

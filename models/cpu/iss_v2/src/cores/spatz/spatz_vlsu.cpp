@@ -485,8 +485,10 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         PendingInsn *pending_insn = slot.insn;
 
         // If the on-going instruction is ready and its instruction latency has elapsed,
-        // try to send requests to available ports
-        if (pending_insn->timestamp <= _this->vu.iss.clock.get_cycles() && _this->vu.insn_ready(pending_insn))
+        // try to send requests to available ports. A store reads the register file once
+        // per burst, so it is checked burst by burst, at the elements that burst reads.
+        if (pending_insn->timestamp <= _this->vu.iss.clock.get_cycles() &&
+            (_this->pending_is_write || _this->vu.insn_ready(pending_insn)))
         {
             iss_insn_t *insn = _this->vu.iss.exec.get_insn(pending_insn->entry);
 
@@ -523,6 +525,14 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                     }
                     uint64_t size = std::min((uint64_t)_this->burst_size,
                         _this->pending_size - req_offset);
+
+                    // The producer must have committed the elements this burst reads
+                    if (_this->pending_is_write &&
+                        !_this->vu.insn_ready(pending_insn, req_offset + size))
+                    {
+                        continue;
+                    }
+
                     uint8_t *velem = _this->pending_velem + req_offset;
                     int elem_idx = _this->vstart + req_offset / _this->elem_size;
                     iss_reg_t addr;
