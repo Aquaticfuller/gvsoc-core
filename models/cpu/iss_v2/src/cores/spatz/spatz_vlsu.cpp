@@ -100,6 +100,7 @@ void VuLsu::reset(bool active)
         for (VuLsuPendingInsn &slot : this->insns)
         {
             slot.done = false;
+            slot.nb_remaining_bursts = 0;
         }
 
         int nb_ports = this->vu.iss.get_js_config()->get_child_int("vu/nb_ports");
@@ -151,6 +152,7 @@ void VuLsu::enqueue_insn(PendingInsn *pending_insn)
     slot.insn = pending_insn;
     slot.nb_pending_bursts = 0;
     slot.done = false;
+    slot.nb_remaining_bursts = 0;
     this->nb_pending_insn.inc(1);
     this->nb_waiting_insn++;
 
@@ -225,11 +227,18 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
     this->elem_size = elem_size;
     this->inst_elem_size = inst_elem_size;
     this->reg_indexed = reg_indexed;
+    this->burst_size = do_stride || reg_indexed != -1 ? elem_size : this->vu.lane_width;
     this->remaining_size = this->pending_size;
     for (int p = 0; p < this->nb_ports; p++)
     {
         this->port_burst[p] = 0;
     }
+
+    VuLsuPendingInsn &slot = this->insns[this->insn_first_waiting];
+    // Store bursts commit one by one on their response: they are not tracked in the
+    // ROB and so not committed by group.
+    slot.nb_remaining_bursts = is_write ?
+        0 : (this->pending_size + this->burst_size - 1) / this->burst_size;
 
     // ON RTL, it takes some time to switch from one instruction to another, and more if it is from
     // load to store, probably due to latency to write to regfile.
@@ -335,40 +344,70 @@ void VuLsu::data_response(vp::Block *__this, vp::IoReq *req)
         req->arg_free(req_nb_args);
     }
 
-    int port = rob_entry->port;
-    int rob_id = rob_entry->rob_id;
-
-    // Check if this response is for the oldest request, and potentially end other requests which are waiting for this one
-    if (_this->rob_first[port] == rob_id)
+    // This response may have completed a group the register file is waiting for, on
+    // this instruction or on a younger one. An instruction reaches the ROB heads only
+    // once the older ones committed everything, so walk from the oldest.
+    for (int i = 0; i < _this->nb_pending_insn.get(); i++)
     {
-        while (_this->rob[port][rob_id].valid == true && _this->rob[port][rob_id].allocated == true){
+        VuLsuPendingInsn &slot = _this->insns[(_this->insn_first + i) % VuLsu::queue_size];
 
-            auto &entry = _this->rob[port][rob_id];
-            VlsuReq *load_req = entry.req;
+        while (slot.nb_remaining_bursts > 0)
+        {
+            // Burst k goes on port k % nb_ports and each port retires in order, so the
+            // next group sits at the head of the first ports. Like RTL, it is committed
+            // only once every burst it contains has its response.
+            int group_size = std::min(slot.nb_remaining_bursts, _this->nb_ports);
+            int nb_ready = 0;
+            while (nb_ready < group_size)
+            {
+                VlsuRobEntry &entry = _this->rob[nb_ready][_this->rob_first[nb_ready]];
+                if (!entry.allocated || !entry.valid || entry.req->slot != &slot)
+                {
+                    break;
+                }
+                nb_ready++;
+            }
 
-            // In case chaining is enabled, notify that some elements has been handled as it
-            // might start an instruction
-            VuLsuPendingInsn &slot = *load_req->slot;
+            if (nb_ready != group_size)
+            {
+                break;
+            }
+
             PendingInsn *pending_insn = slot.insn;
             iss_insn_t *insn = _this->vu.iss.exec.get_insn(pending_insn->entry);
+            int committed_size = 0;
 
-            int size = load_req->req.get_size();
+            for (int j = 0; j < group_size; j++)
+            {
+                VlsuRobEntry &entry = _this->rob[j][_this->rob_first[j]];
+                VlsuReq *load_req = entry.req;
 
-            _this->vu.insn_commit(pending_insn, size);
-            _this->vu.exec_insn_chunk(insn, pending_insn, load_req->vstart,
-                load_req->vstart + load_req->nb_elem, load_req->nb_elem);
+                _this->vu.exec_insn_chunk(insn, pending_insn, load_req->vstart,
+                    load_req->vstart + load_req->nb_elem, load_req->nb_elem);
+                committed_size += load_req->req.get_size();
 
-            slot.nb_pending_bursts--;
-            _this->reqs_free.push_back(load_req);
-            _this->rob_count[port]--;
-            entry.allocated = false;
-            _this->rob_first[port] = (_this->rob_first[port] + 1) % _this->rob[port].size();
+                entry.allocated = false;
+                slot.nb_pending_bursts--;
+                _this->reqs_free.push_back(load_req);
+                _this->rob_count[j]--;
+                _this->rob_first[j] = (_this->rob_first[j] + 1) % _this->rob[j].size();
+            }
 
-            _this->trace.msg("Retiring request (req: %p, pending insn bursts: %d)\n",
-                &load_req->req, slot.nb_pending_bursts);
+            slot.nb_remaining_bursts -= group_size;
 
-            // Move to the next oldest request in the ROB
-            rob_id = _this->rob_first[port];
+            // Notify the committed elements, which may start a chained instruction.
+            // Only the group's own elements are reported, so a consumer never reads
+            // elements still in flight on another port.
+            _this->vu.insn_commit(pending_insn, committed_size);
+
+            _this->trace.msg("Committing load bursts (id: %d, nb_bursts: %d, pending insn bursts: %d)\n",
+                pending_insn->id, group_size, slot.nb_pending_bursts);
+        }
+
+        // A younger instruction owns the ROB heads only once this one is fully done.
+        if (slot.nb_remaining_bursts != 0)
+        {
+            break;
         }
     }
 }
@@ -476,23 +515,14 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                         continue;
                     }
 
-                    uint32_t req_size;
-                    if (_this->strided ||  _this->reg_indexed != -1)
-                    {
-                        req_size = _this->elem_size;
-                    }
-                    else
-                    {
-                        req_size = _this->vu.lane_width;
-                    }
-
                     uint32_t req_idx = _this->port_burst[i] * _this->nb_ports + i;
-                    uint64_t req_offset = req_idx * req_size;
+                    uint64_t req_offset = req_idx * _this->burst_size;
                     if (req_offset >= _this->pending_size)
                     {
                         continue;
                     }
-                    uint64_t size = std::min((uint64_t)req_size, _this->pending_size - req_offset);
+                    uint64_t size = std::min((uint64_t)_this->burst_size,
+                        _this->pending_size - req_offset);
                     uint8_t *velem = _this->pending_velem + req_offset;
                     int elem_idx = _this->vstart + req_offset / _this->elem_size;
                     iss_reg_t addr;

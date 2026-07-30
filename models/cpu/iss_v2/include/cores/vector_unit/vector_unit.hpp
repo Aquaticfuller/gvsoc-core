@@ -145,6 +145,9 @@ public:
     int nb_pending_bursts;
     // Used by some blocks to flag the termination
     bool done;
+    // Bursts of the operation not yet committed to the vector register file. Loads
+    // only: store bursts commit one by one on their response.
+    int nb_remaining_bursts;
 };
 
 #if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
@@ -246,6 +249,9 @@ private:
     iss_addr_t pending_addr;
     // Total size of the current load/store operation, fixed during execution
     iss_addr_t pending_size;
+    // Size of one burst of the current load/store operation. One element for a strided
+    // or indexed operation, one lane otherwise.
+    iss_addr_t burst_size;
     // Remaining size of the current load/store operation
     iss_addr_t remaining_size;
     // Write or read of the current load/store operation
@@ -441,6 +447,9 @@ private:
     iss_addr_t pending_addr;
     // Total size of the current load/store operation, fixed during execution
     iss_addr_t pending_size;
+    // Burst size of the current operation: one element for a strided or indexed
+    // access, one lane otherwise.
+    iss_addr_t burst_size;
     // Remaining size of the current load/store operation
     iss_addr_t remaining_size;
     // Write or read of the current load/store operation
