@@ -78,6 +78,7 @@ private:
     static void retry_handler(vp::Block *__this, vp::IoRetryChannel);
     static void issue_handler(vp::Block *__this, vp::ClockEvent *event);
     static void quit_handler(vp::Block *__this, vp::ClockEvent *event);
+    static void resp_retry_handler(vp::Block *__this, vp::ClockEvent *event);
 
     void emit_next_beat(BurstEntry *burst);
     void try_send(Beat *beat);
@@ -90,6 +91,12 @@ private:
     WrBurst *open_wb = nullptr;
     vp::ClockEvent issue_event;
     vp::ClockEvent quit_event;
+    // Response-channel back-pressure, to exercise the router's upstream-denied
+    // path: deny the first `resp_deny_count` responses and reopen the channel
+    // `resp_retry_delay` cycles later with out.resp_retry().
+    vp::ClockEvent resp_retry_event;
+    int resp_deny_count = 0;
+    int resp_retry_delay = 1;
     vp::Trace trace;
     std::vector<BurstEntry *> schedule;
     size_t next_to_schedule = 0;
@@ -103,7 +110,8 @@ StubMaster::StubMaster(vp::ComponentConf &config)
     : vp::Component(config),
       out(&StubMaster::retry_handler, &StubMaster::resp_handler),
       issue_event(this, &StubMaster::issue_handler),
-      quit_event(this, &StubMaster::quit_handler)
+      quit_event(this, &StubMaster::quit_handler),
+      resp_retry_event(this, &StubMaster::resp_retry_handler)
 {
     this->traces.new_trace("trace", &this->trace, vp::DEBUG);
     this->new_master_port("output", &this->out);
@@ -114,6 +122,10 @@ StubMaster::StubMaster(vp::ComponentConf &config)
 
     int qac = this->get_js_config()->get_child_int("quit_after_cycles");
     if (qac > 0) this->quit_after_cycles = qac;
+
+    this->resp_deny_count = this->get_js_config()->get_child_int("resp_deny_count");
+    int rrd = this->get_js_config()->get_child_int("resp_retry_delay");
+    if (rrd > 0) this->resp_retry_delay = rrd;
 
     js::Config *sched = this->get_js_config()->get("schedule");
     if (sched != NULL)
@@ -294,6 +306,13 @@ void StubMaster::issue_handler(vp::Block *__this, vp::ClockEvent *event)
     }
 }
 
+void StubMaster::resp_retry_handler(vp::Block *__this, vp::ClockEvent *)
+{
+    StubMaster *_this = (StubMaster *)__this;
+    printf("[%ld] %s RESP_RETRY\n", _this->clock.get_cycles(), _this->logname.c_str());
+    _this->out.resp_retry();
+}
+
 void StubMaster::quit_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     StubMaster *_this = (StubMaster *)__this;
@@ -307,6 +326,19 @@ vp::IoRespAck StubMaster::resp_handler(vp::Block *__this, vp::IoReq *req)
     StubMaster *_this = (StubMaster *)__this;
     int64_t now = _this->clock.get_cycles();
     bool is_last = req->is_last;
+
+    // Response-channel back-pressure. Nothing is consumed or freed: the
+    // producer keeps the beat and must wait for our resp_retry() before
+    // offering it again.
+    if (_this->resp_deny_count > 0)
+    {
+        _this->resp_deny_count--;
+        printf("[%ld] %s RESP_DENIED opcode=%d size=%lu last=%d\n",
+            now, _this->logname.c_str(), (int)req->get_opcode(),
+            (unsigned long)req->get_size(), is_last ? 1 : 0);
+        _this->resp_retry_event.enqueue(_this->resp_retry_delay);
+        return vp::IO_RESP_DENIED;
+    }
 
     // Write burst ack: a distinct data-less object carrying the WrBurst
     // record in its initiator. Exactly one per burst; police the shape.

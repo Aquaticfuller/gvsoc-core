@@ -653,6 +653,36 @@ def build_case(case: str):
             nb_masters=1,
         )
 
+    if case == 'resp_denied_by_master':
+        # The master back-pressures its response channel: it denies the first
+        # read response beat and reopens the channel 5 cycles later. The router
+        # has already consumed that beat's burst bookkeeping, so it must hold
+        # the beat and wait for resp_retry() -- not re-offer it every cycle.
+        # The gap between RESP_DENIED and the accepted RESP is the assertion:
+        # 5 cycles if the router waits, 1 if it polls.
+        return dict(
+            config=beat_cfg(),
+            schedule=[burst(cycle=10, addr=t0_base, size=4, nb_beats=2,
+                            burst_id=1, name='r0')],
+            targets=[('t0', t0_base, window, [rule(behavior='done')])],
+            nb_masters=1,
+            resp_deny_count=1,
+            resp_retry_delay=5,
+        )
+
+    if case == 'write_ack_denied_by_master':
+        # Same, for a synthesized write-burst ack -- the path where the router
+        # itself owns the response object rather than the downstream.
+        return dict(
+            config=beat_cfg(),
+            schedule=[burst(cycle=10, addr=t0_base, size=4, nb_beats=2,
+                            burst_id=1, name='w0', is_write=True)],
+            targets=[('t0', t0_base, window, [rule(behavior='done')])],
+            nb_masters=1,
+            resp_deny_count=1,
+            resp_retry_delay=5,
+        )
+
     raise ValueError(f'Unknown case: {case}')
 
 
@@ -762,7 +792,9 @@ class Chip(gvsoc.systree.Component):
 
         nb_masters = spec['nb_masters']
         if nb_masters == 1:
-            master = StubMaster(self, 'master', schedule=spec['schedule'], logname='master')
+            master = StubMaster(self, 'master', schedule=spec['schedule'], logname='master',
+                                resp_deny_count=spec.get('resp_deny_count', 0),
+                                resp_retry_delay=spec.get('resp_retry_delay', 1))
             clock.o_CLOCK(master.i_CLOCK())
             master.o_OUTPUT(router.i_INPUT(0))
         else:

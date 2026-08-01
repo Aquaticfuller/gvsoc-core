@@ -136,14 +136,49 @@ public:
     // in-order FIFO front is a single beat (one direction), so this never
     // aliases.
     InputPort *stalled_input[NB_CHANNELS] = {nullptr, nullptr};
-    // Set when this output's most recent response beat was back-pressured: the
-    // target input had already forwarded its one beat for the cycle, so the
-    // downstream (the auto-inserted beat adapter or a native beat slave) was
-    // told to hold the beat (resp_muxed returned IO_RESP_DENIED). The response FSM
-    // releases it on a later cycle by calling bus.resp_retry(), which makes the
-    // downstream re-send synchronously. At most one beat is ever held per output
-    // because the downstream stops streaming the instant it is denied.
-    bool resp_stalled = false;
+    // The one response this output can be holding. Two orthogonal tags:
+    //   reason            who may release it — the response FSM for a CHANNEL
+    //                     stall, only the owed master's retry for an UPSTREAM
+    //                     one, which owes us a resp_retry() per io_v2.
+    //   bookkeeping_taken whether resp_muxed already took the burst accounting.
+    //                     Once it has, req->burst_id is back to the master's own
+    //                     value and no longer a slot index, so the re-send must
+    //                     use in/ch/burst_done from here.
+    // (untaken, UPSTREAM) cannot occur: the accounting is taken before resp().
+    struct HeldResp
+    {
+        vp::IoReq *req = nullptr;          // null => nothing held
+        InputPort *in = nullptr;
+        int ch = 0;
+        bool burst_done = false;
+        bool bookkeeping_taken = false;
+        enum Reason { CHANNEL, UPSTREAM } reason = CHANNEL;
+
+        // The third state, (taken, CHANNEL), is reached by mutation in
+        // forward_held_resp().
+        static HeldResp channel_stall(vp::IoReq *req, InputPort *in, int ch)
+        {
+            HeldResp h;
+            h.req = req;
+            h.in = in;
+            h.ch = ch;
+            h.bookkeeping_taken = false;  // refused before any was taken
+            h.reason = CHANNEL;
+            return h;
+        }
+        static HeldResp upstream_stall(vp::IoReq *req, InputPort *in, int ch, bool burst_done)
+        {
+            HeldResp h;
+            h.req = req;
+            h.in = in;
+            h.ch = ch;
+            h.burst_done = burst_done;
+            h.bookkeeping_taken = true;   // resp_muxed already took it
+            h.reason = UPSTREAM;
+            return h;
+        }
+    };
+    HeldResp held_resp;
     // Per-mapping VCD traces split into request and response sub-trees.
     // req/* logs every outgoing forward — read setup reqs and per-beat writes.
     // resp/* logs every read beat returned upstream (writes get no per-resp
@@ -266,7 +301,15 @@ private:
     // by calling bus.resp_retry() (the downstream re-issues synchronously). An
     // output whose target input is still busy this cycle re-stalls and is
     // retried again on the next response-FSM tick.
-    void drive_stalled_resps();
+    // Re-drive held responses. On a response-FSM tick (retrying_in == nullptr)
+    // only RESP_STALL_CHANNEL outputs are released — a RESP_STALL_UPSTREAM one
+    // is waiting on its master. When a master signals resp_retry, its own input
+    // is passed so the outputs held for it are released too.
+    void drive_stalled_resps(InputPort *retrying_in = nullptr, int retrying_ch = -1);
+    // Re-forward the beat an output is holding whose burst accounting was
+    // already taken. Returns the ack to give the downstream, which keeps
+    // holding the beat while this stays DENIED.
+    vp::IoRespAck forward_held_resp(OutputPort *out);
     // Deliver due synthesized write-burst acks (produced when a native beat
     // slave answered the burst's last beat with an inline DONE, or on a
     // decode error), honouring the per-(input, channel) one-beat-per-cycle
@@ -302,10 +345,18 @@ private:
     struct SynthAck
     {
         vp::IoReq *ack;
+        // Burst slot still to be released, or -1 once it has been: an ack the
+        // upstream master refused is re-queued with its bookkeeping done.
         int slot_idx;
         int64_t ready;
+        InputPort *in;
+        int ch;
     };
     std::deque<SynthAck> synth_acks;
+    // Acks refused by their master, waiting for its response channel to
+    // reopen. Merged back into synth_acks at the head of the next delivery
+    // pass rather than in place, so the pass's iteration stays valid.
+    std::deque<SynthAck> denied_synth_acks;
     vp::ClockEvent fsm_event;
     vp::ClockEvent resp_fsm_event;
     int round_robin_next = 0;
@@ -644,7 +695,8 @@ vp::IoReqStatus RouterBeat::forward_beat(InputPort *in, OutputPort *out,
             beat->burst_id = slot.original_burst_id;
             beat->set_resp_status(slot.status);
             this->synth_acks.push_back(SynthAck{beat, slot_idx,
-                this->clock.get_cycles() + std::max((int64_t)1, lat)});
+                this->clock.get_cycles() + std::max((int64_t)1, lat),
+                slot.input, slot.channel});
             this->schedule_resp_fsm();
         }
         else
@@ -819,7 +871,8 @@ vp::IoReqStatus RouterBeat::req_muxed(vp::Block *__this, vp::IoReq *req, int por
     if (is_write) { _this->stat_writes++; _this->stat_bytes_written += size; }
     else          { _this->stat_reads++;  _this->stat_bytes_read    += size; }
 
-    int64_t forward_latency = std::max((int64_t)1, (int64_t)_this->cfg.latency);
+    int64_t forward_latency = std::max(
+        (int64_t)1, (int64_t)_this->cfg.latency);
     in->pending.push_back(InputPort::PendingBeat{ req, slot_idx, now + forward_latency});
     in->pending_bytes += fifo_cost;
 
@@ -908,7 +961,7 @@ void RouterBeat::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                         beat->burst_id = slot.original_burst_id;
                         beat->set_resp_status(vp::IO_RESP_INVALID);
                         _this->synth_acks.push_back(SynthAck{beat, slot_idx,
-                            now + 1});
+                            now + 1, slot.input, slot.channel});
                         _this->schedule_resp_fsm();
                     }
                     else
@@ -983,6 +1036,24 @@ vp::IoRespAck RouterBeat::resp_muxed(vp::Block *__this, vp::IoReq *req, int port
     RouterBeat *_this = (RouterBeat *)__this;
     OutputPort *self = _this->entries[port];
 
+    // A denied downstream owes us the same beat back before any other, so a
+    // different one means it broke the back-pressure contract, and dropping the
+    // held record would silently lose that beat. vp_assert_always: vp_assert
+    // compiles out exactly where the loss would be silent.
+    vp_assert_always(self->held_resp.req == nullptr || self->held_resp.req == req, &_this->trace,
+        "downstream sent a new response beat while this output still holds " "a denied one\n");
+
+    // Re-send of the beat this output is holding. If its accounting was
+    // already taken, the slot lookup below must not run again — take the
+    // recorded input/channel instead.
+    if (self->held_resp.req == req && self->held_resp.bookkeeping_taken)
+    {
+        return _this->forward_held_resp(self);
+    }
+    // A beat refused before its bookkeeping was touched simply replays the
+    // normal path; drop the record so the state below is rebuilt from scratch.
+    self->held_resp = OutputPort::HeldResp();
+
     // The forward path stashed slot_idx in req->burst_id. The downstream
     // adapter (when present) snapshots burst_id at schedule time and restores
     // it per beat, so this is robust across cascaded beat-aware routers.
@@ -1008,16 +1079,16 @@ vp::IoRespAck RouterBeat::resp_muxed(vp::Block *__this, vp::IoReq *req, int port
     // against it.
     if (in->resp_used_cycle[ch] == now && self->bus.is_resp_retry_bound())
     {
-        self->resp_stalled = true;
+        self->held_resp = OutputPort::HeldResp::channel_stall(req, in, ch);
         _this->schedule_resp_fsm();
         return vp::IO_RESP_DENIED;
     }
 
-    // Past the gate we are committed to delivering this beat (no upstream master
-    // currently denies, see the assert below), so consume the burst bookkeeping
-    // now — before the forward — exactly as the pre-arbitration code did. In
-    // particular the slot is freed before resp() so a master that reentrantly
-    // issues a new request from its resp callback can reuse it.
+    // Take the burst accounting now, before the forward: the slot must be free
+    // by the time resp() runs so a master that reentrantly issues from its resp
+    // callback can reuse it. If the master then refuses, we hold the beat rather
+    // than rebuild what we just tore down.
+    int64_t resp_used_before = in->resp_used_cycle[ch];
     in->resp_used_cycle[ch] = now;
 
     // A pure write response is the burst's single data-less ack (AXI B
@@ -1091,13 +1162,25 @@ vp::IoRespAck RouterBeat::resp_muxed(vp::Block *__this, vp::IoReq *req, int port
 
     vp::IoRespAck st = in->itf.resp(req);
 
-    // No upstream master in the current codebase back-pressures its response
-    // channel, so a DENIED here is not expected. If one is introduced, it must
-    // be handled symmetrically to the gate case above (hold + re-drive on the
-    // input's resp_retry); assert for now rather than silently dropping a beat.
-    vp_assert(st != vp::IO_RESP_DENIED, &_this->trace,
-        "upstream master denied a response beat (not yet supported)\n");
-    (void)st;
+    // The master back-pressures its response channel. The accounting is already
+    // gone, so hold the beat: the downstream keeps it and re-sends on the
+    // bus.resp_retry() that drive_stalled_resps() issues. Undo the channel
+    // occupancy — no beat crossed this cycle. A downstream without the
+    // back-pressure handshake would neither hold the beat nor answer the
+    // retry, so it can only be asserted against.
+    vp_assert(st != vp::IO_RESP_DENIED || self->bus.is_resp_retry_bound(), &_this->trace,
+        "upstream master denied a response beat on an output whose downstream "
+        "does not support response back-pressure\n");
+    if (st == vp::IO_RESP_DENIED && self->bus.is_resp_retry_bound())
+    {
+        in->resp_used_cycle[ch] = resp_used_before;
+        self->held_resp =
+            OutputPort::HeldResp::upstream_stall(req, in, ch, burst_done);
+        // Deliberately no schedule_resp_fsm(): the master owes us a
+        // resp_retry(), and re-offering before it arrives would be an
+        // unsolicited resp() as well as a per-cycle busy-poll.
+        return vp::IO_RESP_DENIED;
+    }
 
     // No need to restore req->burst_id between beats: the downstream adapter
     // (or beat-aware slave) resets it from its per-beat snapshot before the
@@ -1113,42 +1196,100 @@ vp::IoRespAck RouterBeat::resp_muxed(vp::Block *__this, vp::IoReq *req, int port
 }
 
 void RouterBeat::resp_retry_in_muxed(vp::Block *__this, int port,
-                                     vp::IoRetryChannel /*channel*/)
+    vp::IoRetryChannel channel)
 {
     RouterBeat *_this = (RouterBeat *)__this;
-    // An upstream master signalled its response channel is ready again. The
-    // beats we hold live in the downstream producers, so re-drive every stalled
-    // output now (synchronously, as the retry contract requires): the one
-    // targeting this input will forward, the rest re-stall harmlessly.
-    _this->drive_stalled_resps();
+    // This master's response channel is ready again. Release the outputs held
+    // for it, plus any channel-stalled output (those were never offered to a
+    // master, so re-offering them is always safe). Synchronously, as the retry
+    // contract requires.
+    InputPort *in = _this->inputs[port];
+    // channels_for() yields one index for READ/WRITE (or when the channels are
+    // shared) and both for ANY; -1 then means "any channel of this input".
+    int chans[NB_CHANNELS];
+    int ch = _this->channels_for(channel, chans) == 1 ? chans[0] : -1;
+    _this->drive_stalled_resps(in, ch);
 }
 
-void RouterBeat::drive_stalled_resps()
+vp::IoRespAck RouterBeat::forward_held_resp(OutputPort *out)
 {
-    // Snapshot which outputs are stalled, clear them, then ask each to re-send.
+    OutputPort::HeldResp &held = out->held_resp;
+    InputPort *in = held.in;
+    int ch = held.ch;
+    int64_t now = this->clock.get_cycles();
+
+    // Same per-(input, channel) pacing as the first attempt: another output may
+    // have won this master's response channel while the beat was held.
+    if (in->resp_used_cycle[ch] == now && out->bus.is_resp_retry_bound())
+    {
+        held.reason = OutputPort::HeldResp::CHANNEL;
+        this->schedule_resp_fsm();
+        return vp::IO_RESP_DENIED;
+    }
+
+    vp::IoRespAck st = in->itf.resp(held.req);
+    if (st == vp::IO_RESP_DENIED)
+    {
+        held.reason = OutputPort::HeldResp::UPSTREAM;
+        return vp::IO_RESP_DENIED;
+    }
+
+    in->resp_used_cycle[ch] = now;
+    bool burst_done = held.burst_done;
+    held = OutputPort::HeldResp();
+    if (burst_done)
+    {
+        this->wake_denied_masters();
+        this->schedule_fsm();
+    }
+    return vp::IO_RESP_ACCEPTED;
+}
+
+void RouterBeat::drive_stalled_resps(InputPort *retrying_in, int retrying_ch)
+{
+    // Snapshot which outputs are eligible, clear them, then ask each to re-send.
     // bus.resp_retry() makes the downstream re-issue resp() synchronously, which
-    // re-enters resp_muxed: it either forwards (input's channel now free) or
-    // re-stalls (still busy this cycle), setting resp_stalled again for the next
-    // tick. Snapshotting first keeps a re-stall from being revisited this pass.
+    // re-enters resp_muxed: it either forwards (input's channel now free, or the
+    // master reopened) or re-stalls, re-establishing held_resp. Snapshotting
+    // first keeps a re-stall from being revisited this pass.
     int n = (int)this->entries.size();
     if (n == 0) return;
-    bool any_retry = false;
+    bool any_channel_retry = false;
     int start = this->resp_round_robin_next;
     for (int k = 0; k < n; k++)
     {
         OutputPort *out = this->entries[(start + k) % n];
-        if (!out->resp_stalled) continue;
-        out->resp_stalled = false;
-        any_retry = true;
+        OutputPort::HeldResp &held = out->held_resp;
+        if (held.req == nullptr) continue;
+        if (held.reason == OutputPort::HeldResp::UPSTREAM)
+        {
+            // Only the master that reopened its channel may pull this one.
+            if (held.in != retrying_in) continue;
+            if (retrying_ch >= 0 && held.ch != retrying_ch) continue;
+        }
+        else
+        {
+            any_channel_retry = true;
+        }
+        // Only an untaken record may be dropped — its re-send replays the
+        // normal path and rebuilds everything. A taken one must survive
+        // whatever its reason: (taken, CHANNEL) still has no valid burst_id,
+        // so forward_held_resp() has to keep handling it.
+        if (!held.bookkeeping_taken)
+        {
+            held = OutputPort::HeldResp();
+        }
         out->bus.resp_retry();
     }
     this->resp_round_robin_next = (this->resp_round_robin_next + 1) % n;
-    // If anything re-stalled, drain it on the next cycle (one beat/cycle/input).
-    if (any_retry)
+    // If a channel-stalled output re-stalled, drain it on the next cycle (one
+    // beat/cycle/input). Upstream stalls are not rescheduled — they wait.
+    if (any_channel_retry)
     {
         for (int i = 0; i < n; i++)
         {
-            if (this->entries[i]->resp_stalled)
+            OutputPort::HeldResp &h = this->entries[i]->held_resp;
+            if (h.req != nullptr && h.reason == OutputPort::HeldResp::CHANNEL)
             {
                 this->schedule_resp_fsm();
                 break;
@@ -1162,6 +1303,13 @@ void RouterBeat::deliver_synth_acks()
     int64_t now = this->clock.get_cycles();
     bool pending_left = false;
 
+    if (!this->denied_synth_acks.empty())
+    {
+        this->synth_acks.insert(this->synth_acks.begin(),
+            this->denied_synth_acks.begin(), this->denied_synth_acks.end());
+        this->denied_synth_acks.clear();
+    }
+
     for (auto it = this->synth_acks.begin(); it != this->synth_acks.end(); )
     {
         if (it->ready > now)
@@ -1170,9 +1318,8 @@ void RouterBeat::deliver_synth_acks()
             ++it;
             continue;
         }
-        BurstEntry &slot = this->burst_table[it->slot_idx];
-        InputPort *in = slot.input;
-        int ch = slot.channel;
+        InputPort *in = it->in;
+        int ch = it->ch;
         // Same per-(input, channel) one-beat-per-cycle pacing as resp_muxed.
         if (in->resp_used_cycle[ch] == now)
         {
@@ -1180,22 +1327,36 @@ void RouterBeat::deliver_synth_acks()
             ++it;
             continue;
         }
+        int64_t resp_used_before = in->resp_used_cycle[ch];
         in->resp_used_cycle[ch] = now;
 
         vp::IoReq *ack = it->ack;
         int slot_idx = it->slot_idx;
         it = this->synth_acks.erase(it);
 
-        if (slot.output_id >= 0 && this->cfg.lock_write_output)
+        // slot_idx < 0 marks an ack whose slot was already released on an
+        // earlier attempt that the master refused.
+        if (slot_idx >= 0)
         {
-            this->entries[slot.output_id]->elected_input[ch] = nullptr;
+            BurstEntry &slot = this->burst_table[slot_idx];
+            if (slot.output_id >= 0 && this->cfg.lock_write_output)
+            {
+                this->entries[slot.output_id]->elected_input[ch] = nullptr;
+            }
+            this->free_burst_slot(slot_idx);
         }
-        this->free_burst_slot(slot_idx);
 
         vp::IoRespAck st = in->itf.resp(ack);
-        vp_assert(st != vp::IO_RESP_DENIED, &this->trace,
-            "upstream master denied a response beat (not yet supported)\n");
-        (void)st;
+        if (st == vp::IO_RESP_DENIED)
+        {
+            // The router owns this ack, so simply hold it until the master
+            // reopens its response channel. Its slot is already released.
+            in->resp_used_cycle[ch] = resp_used_before;
+            this->denied_synth_acks.push_back(
+                SynthAck{ack, -1, now + 1, in, ch});
+            pending_left = true;
+            continue;
+        }
 
         this->wake_denied_masters();
         this->schedule_fsm();
