@@ -107,6 +107,34 @@ def build_case(case_name: str) -> dict:
             'targets': [('t0', t0_base, window, ok)],
         }
 
+    if case_name == 'rw_channels_split':
+        # A read then a write to the same output, bandwidth=4 size=16 ->
+        # burst_duration=4. With shared_rw_channel=False each direction owns its
+        # watermark, so both report latency=4 instead of stacking.
+        return {
+            'config': RouterConfig(kind='bandwidth', latency=0, bandwidth=4,
+                                   shared_rw_channel=False),
+            'schedule': [
+                dict(cycle=10, addr=t0_base, size=16, is_write=False, name='rd'),
+                dict(cycle=10, addr=t0_base + 0x10, size=16, is_write=True, name='wr'),
+            ],
+            'targets': [('t0', t0_base, window, ok)],
+        }
+
+    if case_name == 'rw_channels_shared':
+        # Same workload with shared_rw_channel=True: both compete for one
+        # watermark, so the write stacks behind the read (4 then 7 — the write
+        # is sent one cycle later, leaving 3 cycles of the read's burst).
+        return {
+            'config': RouterConfig(kind='bandwidth', latency=0, bandwidth=4,
+                                   shared_rw_channel=True),
+            'schedule': [
+                dict(cycle=10, addr=t0_base, size=16, is_write=False, name='rd'),
+                dict(cycle=10, addr=t0_base + 0x10, size=16, is_write=True, name='wr'),
+            ],
+            'targets': [('t0', t0_base, window, ok)],
+        }
+
     if case_name == 'out_of_mapping':
         return {
             'config': RouterConfig(kind='bandwidth', latency=0, bandwidth=0),

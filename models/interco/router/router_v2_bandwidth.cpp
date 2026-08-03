@@ -18,6 +18,8 @@
  *     req->set_duration(burst_dur)      // MAX-combined across series hops
  *     next_available := now + wait + burst_dur            // throughput watermark
  *
+ * Watermarks are per channel: R and W contend only when `shared_rw_channel` is set.
+ *
  * Splitting head latency (additive) from bandwidth occupancy (max-combined) is what
  * lets two bandwidth routers in series report the bottleneck transfer time instead of
  * summing it: the same request object carries `duration`, and each hop's set_duration()
@@ -64,8 +66,9 @@ public:
     uint64_t add_offset = 0;
     int64_t mapping_latency = 0;
     // Bandwidth watermark: earliest (logical) cycle at which this output can accept
-    // the next request. Advanced on every accepted forward.
-    int64_t next_available_cycle = 0;
+    // the next request. Advanced on every accepted forward. Indexed per channel by
+    // RouterBandwidth::channel().
+    int64_t next_available_cycle[2] = {0, 0};
     // True when the downstream returned DENIED for the most recent forward; cleared
     // by retry_muxed.
     bool stalled = false;
@@ -89,9 +92,9 @@ public:
     RouterBandwidth *top;
     int id;
     vp::IoSlave itf;
-    // Bandwidth watermark for this input. Tracks pure throughput on the input side;
-    // does not include router or mapping latency.
-    int64_t next_available_cycle = 0;
+    // Bandwidth watermark for this input, per channel. Pure throughput: no router
+    // or mapping latency.
+    int64_t next_available_cycle[2] = {0, 0};
     // Requests that were accepted by the router (GRANTED to master) but couldn't be
     // forwarded because some output was stalled. Drained when the output retries.
     std::deque<QueuedReq> queue;
@@ -136,6 +139,13 @@ private:
     // is marked stalled and the latency annotation is rolled back.
     vp::IoReqStatus forward_inline(InputPort *in, vp::IoReq *req, OutputPort *out,
                                     int64_t now);
+
+    // Watermark slot a request competes for, as in router_v2_beat: one shared slot,
+    // or one per direction so balanced traffic gets 2x throughput.
+    inline int channel(bool is_write) const
+    {
+        return this->cfg.shared_rw_channel ? 0 : (is_write ? 1 : 0);
+    }
 
     // Try to drain an input's queue after its blocking output has been retried.
     void drain_queue(InputPort *in);
@@ -264,9 +274,10 @@ vp::IoReqStatus RouterBandwidth::forward_inline(InputPort *in, vp::IoReq *req,
     // `bandwidth` by spreading traffic across multiple outputs — the per-input
     // watermark prevents that. A single output could be oversubscribed by multiple
     // initiators — the per-output watermark prevents that. The request must wait for
-    // whichever is later.
-    int64_t wait_in  = in->next_available_cycle  - now;  if (wait_in  < 0) wait_in  = 0;
-    int64_t wait_out = out->next_available_cycle - now;  if (wait_out < 0) wait_out = 0;
+    // whichever is later, on the channel this request belongs to.
+    int chan = this->channel(req->get_is_write());
+    int64_t wait_in  = in->next_available_cycle[chan]  - now;  if (wait_in  < 0) wait_in  = 0;
+    int64_t wait_out = out->next_available_cycle[chan] - now;  if (wait_out < 0) wait_out = 0;
     int64_t wait = std::max(wait_in, wait_out);
 
     int64_t burst_duration = 0;
@@ -306,8 +317,8 @@ vp::IoReqStatus RouterBandwidth::forward_inline(InputPort *in, vp::IoReq *req,
         // may have left req->initiator on a deeper InFlight — leave it there.
         req->inc_latency(head_latency);
         req->set_duration(burst_duration);
-        in->next_available_cycle  = now + wait + burst_duration;
-        out->next_available_cycle = now + wait + burst_duration;
+        in->next_available_cycle[chan]  = now + wait + burst_duration;
+        out->next_available_cycle[chan] = now + wait + burst_duration;
         return vp::IO_REQ_GRANTED;
     }
 
@@ -322,8 +333,8 @@ vp::IoReqStatus RouterBandwidth::forward_inline(InputPort *in, vp::IoReq *req,
         // request, else beat-streaming masters cascade.
         req->inc_latency(head_latency);
         req->set_duration(burst_duration);
-        in->next_available_cycle  = now + wait + burst_duration;
-        out->next_available_cycle = now + wait + burst_duration;
+        in->next_available_cycle[chan]  = now + wait + burst_duration;
+        out->next_available_cycle[chan] = now + wait + burst_duration;
         return vp::IO_REQ_DONE;
     }
     // DENIED: restore the addr, mark the output stalled. No watermark advance
