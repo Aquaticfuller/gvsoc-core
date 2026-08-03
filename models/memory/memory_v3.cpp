@@ -282,6 +282,14 @@ vp::IoReqStatus Memory::req(vp::Block *__this, vp::IoReq *req)
     uint8_t *data = req->get_data();
     uint64_t size = req->get_size();
 
+    // A sync / single-req slave keeps the classic per-req round-trip, so every
+    // request arriving here is a complete transaction. A stale is_last off a
+    // recycled IoReq would leak an InFlight per access in a bandwidth router
+    // upstream. Check rather than overwrite: is_last belongs to the caller.
+    vp_assert_always(req->is_last, &_this->trace,
+        "memory_v3 got a request with is_last unset -- it is a single-req "
+        "slave and cannot serve a non-final beat\n");
+
     _this->trace.msg("Memory access (addr: 0x%llx, offset: 0x%llx, size: 0x%llx, is_write: %d, op: %d)\n",
         (unsigned long long)req->get_addr(), (unsigned long long)offset,
         (unsigned long long)size, req->get_is_write(), req->get_opcode());
