@@ -31,12 +31,15 @@ public:
 
 private:
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req, int input_id);
+    // E3: dyn_offset only (csr-id 2).
+    static vp::IoReqStatus config_handler(vp::Block *__this, vp::IoReq *req);
 
     RouteGeom geom_;
     uint32_t  num_tiles_, nrpc_, n_slots_;
     int32_t   hop_latency_cycles_;
     std::vector<vp::IoSlave *>  inputs_;
     std::vector<vp::IoMaster *> outputs_;
+    vp::IoSlave config_;    // E3: dyn_offset only (csr-id 2)
     vp::Trace trace_;
 };
 
@@ -68,6 +71,21 @@ InsituCacheRemoteXbar::InsituCacheRemoteXbar(vp::ComponentConf &conf) : vp::Comp
 
     this->traces.new_trace("trace", &this->trace_, vp::DEBUG);
     this->trace_.msg(vp::Trace::LEVEL_INFO, "InsituCacheRemoteXbar tiles=%u nrpc=%u\n", num_tiles_, nrpc_);
+
+    // E3: dyn_offset only (the remote router never re-partitions banks, it re-extracts addr_tile).
+    config_.set_req_meth(&InsituCacheRemoteXbar::config_handler);
+    this->new_slave_port("config", &config_);
+}
+
+vp::IoReqStatus InsituCacheRemoteXbar::config_handler(vp::Block *__this, vp::IoReq *req)
+{
+    InsituCacheRemoteXbar *_this = static_cast<InsituCacheRemoteXbar *>(__this);
+    if ((uint32_t)req->get_addr() == 2) {   // XBAR_OFFSET only
+        uint32_t value = 0;
+        if (req->get_data() != nullptr) memcpy(&value, req->get_data(), req->get_size() < 4 ? req->get_size() : 4);
+        _this->geom_.dyn_offset = value;
+    }
+    return vp::IO_REQ_OK;
 }
 
 vp::IoReqStatus InsituCacheRemoteXbar::req_handler(vp::Block *__this, vp::IoReq *req, int input_id)

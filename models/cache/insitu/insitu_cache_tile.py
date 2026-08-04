@@ -215,7 +215,10 @@ class InsituCacheTile(Component):
                 self, f'ctrl_{cb}', config=config.controller,
                 num_input_ports=(2 if use_coal else n_ppc),
                 rotate_bits=_rot_bits(cb), rotate_dyn_offset=dyn_off,
-                rotate_addr_width=config.addr_width))
+                rotate_addr_width=config.addr_width,
+                # E3: this bank's identity for runtime repartition (default matches the xbar).
+                bank_index=cb, num_cache=n_ctrl, num_tiles=config.num_tiles,
+                num_private_cache=n_priv))
             if use_coal:
                 # C1: coalesce on the 16 B part (production folds PartSplit=4 → CoalescerDataWidth =
                 # CacheLineWidth/4 = 128b, cachepool_cache_ctrl.sv:80-81), not the 64 B line.

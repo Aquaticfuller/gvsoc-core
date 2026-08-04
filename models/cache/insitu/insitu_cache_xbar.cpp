@@ -39,6 +39,8 @@ public:
 
 private:
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req, int input_id);
+    // E3 runtime partition config (csr-id in addr: 0=num_private, 1=private_start, 2=dyn_offset).
+    static vp::IoReqStatus config_handler(vp::Block *__this, vp::IoReq *req);
 
     RouteGeom geom_;
     uint32_t  num_inputs_, num_outputs_, num_cache_, num_remote_port_;
@@ -49,6 +51,7 @@ private:
 
     std::vector<vp::IoSlave *>  inputs_;
     std::vector<vp::IoMaster *> outputs_;
+    vp::IoSlave config_;
     vp::IoReq split_subreq_;
     vp::Trace trace_;
 };
@@ -88,6 +91,34 @@ InsituCacheXbar::InsituCacheXbar(vp::ComponentConf &conf) : vp::Component(conf)
         "InsituCacheXbar in=%u out=%u cache=%u remote=%u tile=%u priv=%u rot=%d\n",
         num_inputs_, num_outputs_, num_cache_, num_remote_port_, tile_id_,
         num_private_cache_, (int)enable_rotation_);
+
+    // E3: runtime partition config (the peripheral broadcasts on the partition-commit writes).
+    config_.set_req_meth(&InsituCacheXbar::config_handler);
+    this->new_slave_port("config", &config_);
+}
+
+vp::IoReqStatus InsituCacheXbar::config_handler(vp::Block *__this, vp::IoReq *req)
+{
+    InsituCacheXbar *_this = static_cast<InsituCacheXbar *>(__this);
+    uint32_t value = 0;
+    if (req->get_data() != nullptr) memcpy(&value, req->get_data(), req->get_size() < 4 ? req->get_size() : 4);
+    const uint32_t csr = (uint32_t)req->get_addr();
+    switch (csr) {
+        case 0:  // L1D_PRIVATE: num_private_cache (per-call into route_request/bits_to_rotate).
+            _this->num_private_cache_ = value;
+            break;
+        case 1:  // L1D_ADDR: the private_start boundary.
+            _this->geom_.private_start = (uint64_t)value;
+            break;
+        case 2:  // XBAR_OFFSET: the BankSel field LSB (routing granularity).
+            _this->geom_.dyn_offset = value;
+            break;
+        default:
+            _this->trace_.msg(vp::Trace::LEVEL_WARNING, "xbar config: unknown csr-id %u\n", csr);
+            break;
+    }
+    _this->trace_.msg(vp::Trace::LEVEL_INFO, "xbar config csr=%u value=0x%x\n", csr, value);
+    return vp::IO_REQ_OK;
 }
 
 vp::IoReqStatus InsituCacheXbar::req_handler(vp::Block *__this, vp::IoReq *req, int input_id)

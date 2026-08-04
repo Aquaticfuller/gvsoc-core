@@ -44,6 +44,18 @@ struct ReqRoute {
     uint32_t remote_tile = 0;      // target tile id when !local
 };
 
+// tcdm_cache_interco.sv:363-385 — how many routing bits a given LOCAL bank port rotates.
+// FREE function: the single source of truth shared by the xbar (rotate on request), the cache
+// core (unrotate on L2 egress), and the peripheral-side setters (E3 runtime repartition) — so
+// they can never drift apart.
+inline uint32_t bits_to_rotate(uint32_t bank_port, uint32_t num_private_cache, uint32_t num_cache,
+                               uint32_t cache_bank_bits, uint32_t tile_bits) {
+    if (num_private_cache == 0)          return cache_bank_bits + tile_bits;   // all-shared
+    if (num_private_cache == num_cache)  return cache_bank_bits;               // all-private
+    return (bank_port < num_private_cache) ? cache_bank_bits                   // mixed: private
+                                           : (cache_bank_bits + tile_bits);    // mixed: shared
+}
+
 // Geometry + runtime CSRs of one tile's tcdm_cache_interco. All widths in bits; addresses byte-addressed.
 struct RouteGeom {
     uint32_t num_cache       = 4;    // NumCache — local cache banks per tile
@@ -111,10 +123,7 @@ struct RouteGeom {
 
     // tcdm_cache_interco.sv:363-385 — how many routing bits a given LOCAL bank port rotates.
     uint32_t bits_to_rotate(uint32_t bank_port, uint32_t num_private_cache) const {
-        if (num_private_cache == 0)          return cache_bank_bits + tile_bits;   // all-shared
-        if (num_private_cache == num_cache)  return cache_bank_bits;               // all-private
-        return (bank_port < num_private_cache) ? cache_bank_bits                   // mixed: private
-                                               : (cache_bank_bits + tile_bits);    // mixed: shared
+        return insitu::bits_to_rotate(bank_port, num_private_cache, num_cache, cache_bank_bits, tile_bits);
     }
 
     // tcdm_cache_interco.sv:387-404 — rotate the N routing bits (just above dyn_offset) to the MSB.

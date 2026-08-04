@@ -56,6 +56,7 @@ public:
 private:
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req);
     static vp::IoReqStatus flush_req_handler(vp::Block *__this, vp::IoReq *req);
+    static vp::IoReqStatus config_handler(vp::Block *__this, vp::IoReq *req);   // E3
     static void refill_resp_handler(vp::Block *__this, vp::IoReq *req);
     static void tick(vp::Block *__this, vp::ClockEvent *event);
 
@@ -113,6 +114,9 @@ private:
     CacheGeom geom_;
     insitu::RouteGeom rotate_geom_{};   // only dyn_offset/addr_width are used (l2_addr unrotation)
     uint32_t rotate_bits_ = 0;
+    // E3 runtime partition (set via the config slave port): the identity of THIS bank, needed to
+    // recompute rotate_bits_ from the shared bits_to_rotate table and to make flush class-selective.
+    int32_t  bank_index_ = 0, num_cache_ = 1, num_tiles_ = 1, num_private_cache_ = 0;
     bool functional_writethrough_;
     int32_t miss_penalty_cycles_, refill_bank_write_cycles_;
     uint32_t retr_fifo_depth_, miss_fifo_depth_, evic_fifo_depth_;
@@ -198,6 +202,7 @@ private:
     vp::IoMaster refill_itf_;
     vp::IoMaster evict_itf_;
     vp::IoSlave  flush_itf_;
+    vp::IoSlave  config_itf_;                   // E3: runtime partition config (csr-id in addr)
     vp::IoReq    refill_req_, evict_req_, funcwr_req_;
     std::vector<uint8_t> refill_data_buf_, evict_data_buf_;
 
@@ -255,6 +260,12 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
     rotate_bits_               = cfg->get_child_int("rotate_bits");
     rotate_geom_.dyn_offset    = cfg->get_child_int("rotate_dyn_offset");
     rotate_geom_.addr_width    = cfg->get_child_int("rotate_addr_width");
+    // E3: this bank's identity (default partition from elaboration; the config slave can repartition
+    // at runtime). num_private_cache default matches the xbar's (all-private single-tile, all-shared group).
+    bank_index_       = cfg->get_child_int("bank_index");
+    num_cache_        = cfg->get_child_int("num_cache");
+    num_tiles_        = cfg->get_child_int("num_tiles");
+    num_private_cache_= cfg->get_child_int("num_private_cache");
 
     geom_.init(cache_line_bytes_, num_ways_, num_sets_, cfg->get_child_bool("use_hash_way_select"), false);
     bank_.init(num_ways_, bank_factor);
@@ -285,6 +296,9 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
     }
     flush_itf_.set_req_meth(&InsituCacheCore::flush_req_handler);   // F1: real flush (was accept-OK stub)
     new_slave_port("flush", &flush_itf_);
+    // E3: runtime partition config (the peripheral broadcasts on the partition-commit writes).
+    config_itf_.set_req_meth(&InsituCacheCore::config_handler);
+    new_slave_port("config", &config_itf_);
     refill_itf_.set_resp_meth(&InsituCacheCore::refill_resp_handler);
     new_master_port("refill", &refill_itf_);
     new_master_port("evict", &evict_itf_);
@@ -346,6 +360,29 @@ vp::IoReqStatus InsituCacheCore::req_handler(vp::Block *__this, vp::IoReq *req)
 // (PEND lines too — their ready_cycle is cleared so the lazy sweep can't resurrect them), then gate
 // all upstream traffic for the walk's duration (l1d_busy_i). The response carries the duration so
 // the peripheral's FLUSH_STATUS spins for the right length.
+vp::IoReqStatus InsituCacheCore::config_handler(vp::Block *__this, vp::IoReq *req)
+{
+    InsituCacheCore *_this = static_cast<InsituCacheCore *>(__this);
+    uint32_t value = 0;
+    if (req->get_data() != nullptr) memcpy(&value, req->get_data(), req->get_size() < 4 ? req->get_size() : 4);
+    const uint32_t csr = (uint32_t)req->get_addr();
+    switch (csr) {
+        case 0:  // L1D_PRIVATE: repartition — recompute this bank's rotation width from the shared table.
+            _this->num_private_cache_ = (int32_t)value;
+            _this->rotate_bits_ = insitu::bits_to_rotate(
+                (uint32_t)_this->bank_index_, (uint32_t)_this->num_private_cache_, (uint32_t)_this->num_cache_,
+                insitu::RouteGeom::log2_up((uint32_t)_this->num_cache_),
+                insitu::RouteGeom::log2_up((uint32_t)_this->num_tiles_));
+            break;
+        case 2:  // XBAR_OFFSET: the BankSel LSB also shifts the unrotation geometry.
+            _this->rotate_geom_.dyn_offset = value;
+            break;
+        default: // csr 1 (L1D_ADDR): routing-only, the core doesn't route — ignore.
+            break;
+    }
+    return vp::IO_REQ_OK;
+}
+
 vp::IoReqStatus InsituCacheCore::flush_req_handler(vp::Block *__this, vp::IoReq *req)
 {
     InsituCacheCore *_this = static_cast<InsituCacheCore *>(__this);
@@ -355,6 +392,17 @@ vp::IoReqStatus InsituCacheCore::flush_req_handler(vp::Block *__this, vp::IoReq 
 vp::IoReqStatus InsituCacheCore::run_flush(vp::IoReq *req)
 {
     const int64_t now = clock.get_cycles();
+    // E3: the flush insn code rides in the req's address (the peripheral smuggles cp_l1d[CFG_L1D_INSN]).
+    // Participation is partition-class-selective (insitu_cache_tcdm_wrapper.sv: insn 0 = PRIVATE banks
+    // (bank < num_private), 1 = SHARED (bank >= num_private), 2 = ALL, 3 = invalidate-all NO writeback).
+    const uint32_t insn = (uint32_t)req->get_addr();
+    const bool no_wb   = (insn == 3);
+    const bool private_ = (insn == 0), shared_ = (insn == 1);
+    const bool participate = no_wb || (insn == 2) ||
+        (private_ && bank_index_ <  num_private_cache_) ||
+        (shared_  && bank_index_ >= num_private_cache_);
+    if (!participate) { req->inc_latency(0); return vp::IO_REQ_OK; }   // 0 latency; status reflects slowest participant
+
     uint64_t n_dirty = 0;
     for (uint32_t s = 0; s < num_sets_; s++) {
         WayMeta *ways = set_ways(s);
@@ -362,7 +410,7 @@ vp::IoReqStatus InsituCacheCore::run_flush(vp::IoReq *req)
             if (ways[w].status == INVALID) continue;
             if (ways[w].dirty) {
                 n_dirty++;
-                if (evict_itf_.is_bound()) {
+                if (evict_itf_.is_bound() && !no_wb) {   // insn 3 = invalidate-all: NO writeback
                     const uint64_t old_line = ((uint64_t)ways[w].tag << (geom_.off_bits + geom_.depth_bits)) |
                                               ((uint64_t)s << geom_.off_bits);
                     memcpy(evict_data_buf_.data(),

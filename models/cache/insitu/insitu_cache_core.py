@@ -30,7 +30,8 @@ class InsituCacheCore(Component):
     def __init__(self, parent: Component, name: str,
                  config: InsituCacheControllerConfig | None = None,
                  num_input_ports: int = 1,
-                 rotate_bits: int = 0, rotate_dyn_offset: int = 0, rotate_addr_width: int = 32):
+                 rotate_bits: int = 0, rotate_dyn_offset: int = 0, rotate_addr_width: int = 32,
+                 bank_index: int = 0, num_cache: int = 1, num_tiles: int = 1, num_private_cache: int = 0):
         if config is None:
             config = InsituCacheControllerConfig()
 
@@ -72,6 +73,12 @@ class InsituCacheCore(Component):
             'rotate_bits': rotate_bits,
             'rotate_dyn_offset': rotate_dyn_offset,
             'rotate_addr_width': rotate_addr_width,
+            # E3: this bank's identity (used by the config slave to repartition + recompute
+            # rotate_bits from the shared table, and by run_flush to be partition-class-selective).
+            'bank_index': bank_index,
+            'num_cache': num_cache,
+            'num_tiles': num_tiles,
+            'num_private_cache': num_private_cache,
         })
 
     def i_INPUT(self, port: int = 0) -> SlaveItf:
