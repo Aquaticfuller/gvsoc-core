@@ -265,6 +265,12 @@ class InsituCacheTile(Component):
             self.bind(self._ctrls[cb], 'evict',  self, 'l2')
             if n_ctrl > 1:
                 self.bind(self, f'flush_{cb}', self._ctrls[cb], 'flush')
+                # E3: runtime partition config pass-through (peripheral → this cell).
+                self.bind(self, f'config_core_{cb}', self._ctrls[cb], 'config')
+        # E3: runtime partition config pass-through to each per-port-class xbar.
+        if n_ctrl > 1:
+            for j in range(n_ppc):
+                self.bind(self, f'config_xbar_{j}', self._xbars[j], 'config')
 
         # Remote ports (cross-tile sharing): per port-class j, the xbar's remote-OUT slot (output index
         # n_ctrl) leaves the tile toward the group remote xbar; the remote-IN slot (input index n_cores)
@@ -296,6 +302,14 @@ class InsituCacheTile(Component):
     def i_FLUSH(self, ctrl: int) -> SlaveItf:
         """Flush/invalidate trigger for controller ``ctrl`` (a write invalidates its lines)."""
         return SlaveItf(self, f'flush_{ctrl}', signature='io')
+
+    def i_CONFIG_CORE(self, ctrl: int) -> SlaveItf:
+        """E3 runtime partition config for controller ``ctrl``."""
+        return SlaveItf(self, f'config_core_{ctrl}', signature='io')
+
+    def i_CONFIG_XBAR(self, port_class: int) -> SlaveItf:
+        """E3 runtime partition config for port-class crossbar ``port_class``."""
+        return SlaveItf(self, f'config_xbar_{port_class}', signature='io')
 
     def i_REMOTE_IN(self, port_class: int, slot: int = 0) -> SlaveItf:
         """Remote-in slave for port-class ``port_class``, remote slot ``slot`` (other tiles → this tile)."""

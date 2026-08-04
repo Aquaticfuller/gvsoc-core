@@ -90,6 +90,13 @@ class InsituCacheGroup(Component):
             for t in range(n_tiles):
                 for cb in range(ctrl_per_tile):
                     self.bind(self, f'flush_{t}_{cb}', self._tiles[t], f'flush_{cb}')
+                    # E3: runtime partition config pass-throughs (peripheral → each cell/xbar/rxbar).
+                    self.bind(self, f'config_core_{t}_{cb}', self._tiles[t], f'config_core_{cb}')
+            for t in range(n_tiles):
+                for j in range(n_ppc):
+                    self.bind(self, f'config_xbar_{t}_{j}', self._tiles[t], f'config_xbar_{j}')
+            for j in range(n_ppc):
+                self.bind(self, f'config_rxbar_{j}', self._rxbars[j], 'config')
 
     # ---------- port factories ----------
 
@@ -102,6 +109,15 @@ class InsituCacheGroup(Component):
 
     def i_FLUSH(self, tile: int, ctrl: int) -> SlaveItf:
         return SlaveItf(self, f'flush_{tile}_{ctrl}', signature='io')
+
+    def i_CONFIG_CORE(self, tile: int, ctrl: int) -> SlaveItf:
+        return SlaveItf(self, f'config_core_{tile}_{ctrl}', signature='io')
+
+    def i_CONFIG_XBAR(self, tile: int, port_class: int) -> SlaveItf:
+        return SlaveItf(self, f'config_xbar_{tile}_{port_class}', signature='io')
+
+    def i_CONFIG_RXBAR(self, port_class: int) -> SlaveItf:
+        return SlaveItf(self, f'config_rxbar_{port_class}', signature='io')
 
     def o_L2(self, itf: SlaveItf):
         """Fan-in of every tile's refill + eviction to a single external L2 slave."""
