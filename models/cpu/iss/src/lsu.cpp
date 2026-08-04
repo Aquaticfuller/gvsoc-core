@@ -582,6 +582,17 @@ bool Lsu::atomic(iss_insn_t *insn, iss_addr_t addr, int size, int reg_in, int re
         // For synchronous requests, free the request now with the proper latency, so that
         // it becomes available only after the latency has ellapsed
         this->free_req(req, this->iss.top.clock.get_cycles() + req->get_latency());
+#ifdef CONFIG_GVSOC_ISS_SCOREBOARD
+        // ...and mark the destination register pending for the same window (stall-on-use).
+        // Without this a sync-OK AMO completes instantly and a result-consuming spin loop
+        // (amoswap/bnez) free-runs at NB_OUTSTANDING-deep poll rate, flooding the lock bank
+        // — the RTL Snitch blocks on the AMO response, so each poll must pay the round trip.
+        // Observed at nb=16: spin-lock 16-core EOC 76.8k -> 1.62M (16x poll flood).
+        if (req->get_latency() > 0)
+        {
+            this->iss.regfile.scoreboard_reg_set_timestamp(reg_out, req->get_latency() + 1, CSR_PCER_LD_STALL);
+        }
+#endif
 #endif
 
         return false;
