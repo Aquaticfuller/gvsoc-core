@@ -69,6 +69,9 @@ public:
     // chaining gate to time the consumer's trailing chunks against the
     // producer's pipeline drain instead of its scoreboard release.
     int64_t commit_done_cycle;
+    // A reduction is a serial chain through the FPU (one element per round
+    // trip), not a lane-wide operation -- see the compute FSM.
+    bool is_reduction;
     // Earliest cycle at which this instruction may execute its next chunk,
     // accumulated from the pipeline drain of its (possibly already
     // released) input dependencies. Carried on the consumer because the
@@ -106,6 +109,14 @@ private:
     static void fsm_handler(vp::Block *__this, vp::ClockEvent *event);
 
     Vu &vu;
+    // TEMPORARY: which reduction algorithm the unit implements. True = serial
+    // chain through a single FU, one element per round trip (the MemPool-Spatz
+    // fork). False = reduce across the lanes, as upstream Spatz and Ara do,
+    // which runs at the generic lane-wide chunk rate instead. Drop the serial
+    // path once the fork realigns with upstream.
+    bool reduction_is_serial;
+    // Cycles per element of a serial reduction. Unused when not serial.
+    int reduction_step_latency;
     // Used for this block system traces
     vp::Trace trace;
     // Event for active state
@@ -835,5 +846,9 @@ inline void Vu::exec_insn_chunk(iss_insn_t *insn, PendingInsn *pending_insn, int
 
 inline void Vu::insn_handle_reduction()
 {
+    // Called once per CHUNK from rv32v_timed.hpp's vfred*/vred* handlers (which
+    // exec_insn_chunk reaches through insn->stub_handler), so this is a flat
+    // per-chunk cost, not a per-element rate. A unit which reduces serially
+    // overrides it in VuCompute::fsm_handler with reduction_step_latency.
     this->insn_latency = 3;
 }

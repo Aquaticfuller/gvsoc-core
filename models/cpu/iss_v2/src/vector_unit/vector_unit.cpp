@@ -138,6 +138,11 @@ PendingInsn *Vu::pending_insn_alloc(InsnEntry *entry)
     // ISA setup); slide-down and vmv chain like any other instruction.
     pending_insn->in_can_be_chained = insn->desc->chaining_factor != 0.0f;
     pending_insn->out_can_be_chained = insn->desc->out_chaining_factor != 0.0f;
+    // Tagged here so the compute FSM can charge a serial reduction per element
+    // rather than per lane-wide chunk. The whole family is vred*/vfred*.
+    const char *label = insn->desc->label;
+    pending_insn->is_reduction = label != nullptr &&
+        (strncmp(label, "vred", 4) == 0 || strncmp(label, "vfred", 5) == 0);
 
     return pending_insn;
 }

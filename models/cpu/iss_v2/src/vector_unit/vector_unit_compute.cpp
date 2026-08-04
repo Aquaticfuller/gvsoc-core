@@ -25,6 +25,12 @@ VuCompute::VuCompute(Vu &vu, std::string name)
 : VuBlock(&vu, name), vu(vu),
 fsm_event(this, &VuCompute::fsm_handler)
 {
+    // Absent from the config both read back 0, i.e. the lane-wide reduction.
+    this->reduction_is_serial =
+        vu.iss.get_js_config()->get_int("vu/reduction_is_serial") != 0;
+    this->reduction_step_latency = std::max<int>(1,
+        vu.iss.get_js_config()->get_int("vu/reduction_step_latency"));
+
     this->traces.new_trace("trace", &this->trace, vp::DEBUG);
     this->traces.new_trace_event("active", &this->event_active, 1);
     this->traces.new_trace_event("pc", &this->event_pc, 64);
@@ -107,6 +113,16 @@ void VuCompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             int nb_elem_per_cycle = (_this->vu.nb_lanes * _this->vu.lane_width /
                 _this->vu.iss.vector.sewb) >> insn->desc->elem_rate_shift;
 
+            // A serially-reducing unit feeds the accumulator back from the FPU
+            // result, so it retires one element per round trip instead of a
+            // lane-wide chunk per cycle.
+            bool serial_reduction = pending_insn->is_reduction &&
+                _this->reduction_is_serial;
+            if (serial_reduction)
+            {
+                nb_elem_per_cycle = 1;
+            }
+
             if (pending_insn->nb_bytes_done == 0)
             {
                 _this->event_pc.event((uint8_t *)&insn->addr);
@@ -139,9 +155,21 @@ void VuCompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
             _this->vu.insn_latency = 0;
             _this->vu.exec_insn_chunk(insn, pending_insn, _this->vstart, _this->vend, nb_elem_per_cycle);
-            if (_this->vu.insn_latency > 0)
+            // Each reduction step is an FPU round trip, so the accumulator
+            // element only becomes available after the pipeline latency. This
+            // overrides the flat cost Vu::insn_handle_reduction leaves in
+            // insn_latency, which is not a per-element rate.
+            if (serial_reduction)
             {
-                pending_insn->timestamp = _this->vu.iss.clock.get_cycles() + _this->vu.insn_latency - 1;
+                // One FPU round trip per element. The generic path below spaces
+                // chunks by latency-1, so set the interval directly here.
+                pending_insn->timestamp = _this->vu.iss.clock.get_cycles() +
+                    _this->reduction_step_latency;
+            }
+            else if (_this->vu.insn_latency > 0)
+            {
+                pending_insn->timestamp = _this->vu.iss.clock.get_cycles() +
+                    _this->vu.insn_latency - 1;
             }
 
             _this->vstart += nb_elem_per_cycle;
