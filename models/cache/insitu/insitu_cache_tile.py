@@ -181,7 +181,13 @@ class InsituCacheTile(Component):
             print(f'[insitu_cache_tile] WARNING: enable_rotation needs dyn_offset == log2(line) '
                   f'({dyn_off} != {line_log2}) — disabling rotation')
             en_rot = False
-        n_priv   = n_ctrl if config.num_tiles == 1 else 0   # xbar.py default (all-private / all-shared)
+        # E3.5: the elaboration-time partition (default = xbar.py's all-private/all-shared rule).
+        # config.num_private_cache (if set) overrides it — used by the calib TB, which has no
+        # peripheral and therefore freezes the partition at build time.
+        _n_priv_ovr = getattr(config, 'num_private_cache', None)
+        n_priv   = (_n_priv_ovr if _n_priv_ovr is not None
+                    else (n_ctrl if config.num_tiles == 1 else 0))
+        _priv_start = getattr(config, 'private_start_addr', 0xA0000000)
         bank_bits = (n_ctrl - 1).bit_length()
         tile_bits = (config.num_tiles - 1).bit_length()
         def _rot_bits(bank_port):
@@ -198,13 +204,15 @@ class InsituCacheTile(Component):
                 self, f'xbar_{j}',
                 num_cores=n_cores, num_cache=n_ctrl, num_remote_port=n_remote,
                 num_tiles=config.num_tiles, tile_id=config.tile_id,
+                num_private_cache=n_priv,
                 dynamic_offset=dyn_off, addr_width=config.addr_width,
                 xbar_latency_cycles=getattr(config, 'xbar_latency_cycles', 0),
                 enable_rotation=en_rot,
                 # E3.4: RTL reset value of the private boundary (used only in mixed partition mode;
                 # unobservable in all-shared/all-private so the default stays byte-identical). SW
-                # that calls l1d_part without l1d_addr relies on this RESVAL.
-                private_start_addr=0xA0000000))
+                # that calls l1d_part without l1d_addr relies on this RESVAL. E3.5: overridable
+                # via config.private_start_addr (calib TB frozen partition).
+                private_start_addr=_priv_start))
 
         use_coal = getattr(config, 'cell_coalescer', False)
         n_vlsu = n_ppc - 1   # lanes 0..n_ppc-2 = Spatz VLSU; the last lane (n_ppc-1) = Snitch/FPU scalar

@@ -69,10 +69,15 @@ InsituCacheXbar::InsituCacheXbar(vp::ComponentConf &conf) : vp::Component(conf)
     enable_rotation_    = cfg->get_child_bool("enable_rotation");
     forward_initiator_  = cfg->get_child_bool("forward_initiator");
 
+    // private_start_addr can exceed INT32_MAX (e.g. 0x80000000/0xA0000000): read it through the
+    // 64-bit path — get_child_int narrows to `int` and sign-extends, which silently routes every
+    // private-range access to the shared banks (found by the E3.5 partition gate).
+    const uint64_t priv_start = cfg->get("private_start_addr")
+        ? (uint64_t)cfg->get("private_start_addr")->get_int() : 0;
     geom_.init(/*n_cache*/num_cache_, /*n_remote*/num_remote_port_,
                /*n_cores*/cfg->get_child_int("num_cores"), /*n_tiles*/cfg->get_child_int("num_tiles"),
                /*dyn_offset*/cfg->get_child_int("dynamic_offset"), /*addr_w*/cfg->get_child_int("addr_width"),
-               /*priv_start*/(uint64_t)cfg->get_child_int("private_start_addr"));
+               /*priv_start*/priv_start);
 
     inputs_.resize(num_inputs_);
     outputs_.resize(num_outputs_);
