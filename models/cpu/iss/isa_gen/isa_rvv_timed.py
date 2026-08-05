@@ -206,6 +206,13 @@ Format_OPV_VX = [ OutVReg     (0, Range(7 , 5)),
                   UnsignedImm (0, Range(25, 1)),
 ]
 
+Format_OPV_VX_ACC = [ OutVReg     (0, Range(7 , 5)),
+                      InReg       (0, Range(15, 5)),#rs1
+                      InVReg      (1, Range(20, 5)),#vs2
+                      InVReg      (2, Range(7 , 5)),#vd accumulator/source
+                      UnsignedImm (0, Range(25, 1)),
+]
+
 Format_OPVV_F = [ OutVRegF     (0, Range(7 , 5)),
                InVRegF      (0, Range(15, 5)),#rs1/vs1
                InVRegF      (1, Range(20, 5)),#vs2
@@ -386,7 +393,7 @@ class Rv32v(IsaSubset):
             Instr('vwmulsu.vx'    ,   Format_OPV_VX  ,    '111010 - ----- ----- 110 ----- 1010111'),
 
             Instr('vmacc.vv'      ,   Format_OPV  ,    '101101 - ----- ----- 010 ----- 1010111'),
-            Instr('vmacc.vx'      ,   Format_OPV_VX  ,    '101101 - ----- ----- 110 ----- 1010111'),
+            Instr('vmacc.vx'      ,   Format_OPV_VX_ACC,   '101101 - ----- ----- 110 ----- 1010111'),
 
             Instr('vmadd.vv'      ,   Format_OPV  ,    '101001 - ----- ----- 010 ----- 1010111'),
             Instr('vmadd.vx'      ,   Format_OPV_VX  ,    '101001 - ----- ----- 110 ----- 1010111'),
