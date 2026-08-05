@@ -42,6 +42,21 @@ private:
         int64_t retry_delay;
     };
 
+    // Fill a read response with an address-derived pattern, so a checker can tell
+    // WHICH bytes of a line came back, not just that a response arrived.
+    static void fill_pattern(vp::IoReq *req)
+    {
+        if (req->get_is_write() || !req->get_data())
+        {
+            return;
+        }
+        uint64_t addr = req->get_addr();
+        for (uint64_t i = 0; i < req->get_size(); i++)
+        {
+            req->get_data()[i] = (uint8_t)(addr + i);
+        }
+    }
+
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req);
     static void deferred_resp_handler(vp::Block *__this, vp::ClockEvent *event);
     static void deferred_retry_handler(vp::Block *__this, vp::ClockEvent *event);
@@ -125,10 +140,7 @@ vp::IoReqStatus StubTarget::req_handler(vp::Block *__this, vp::IoReq *req)
     switch (b)
     {
         case Behavior::DONE:
-            if (!req->get_is_write() && req->get_data())
-            {
-                std::memset(req->get_data(), 0xAA, req->get_size());
-            }
+            StubTarget::fill_pattern(req);
             req->set_resp_status(vp::IO_RESP_OK);
             return vp::IO_REQ_DONE;
 
@@ -138,10 +150,7 @@ vp::IoReqStatus StubTarget::req_handler(vp::Block *__this, vp::IoReq *req)
 
         case Behavior::GRANTED:
         {
-            if (!req->get_is_write() && req->get_data())
-            {
-                std::memset(req->get_data(), 0xAA, req->get_size());
-            }
+            StubTarget::fill_pattern(req);
             req->set_resp_status(vp::IO_RESP_OK);
             int64_t due = now + r->resp_delay;
             Pending p{req, due};

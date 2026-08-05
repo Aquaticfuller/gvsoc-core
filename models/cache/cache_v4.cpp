@@ -165,7 +165,6 @@ private:
     // Refill state (only meaningful when pending_refill is set).
     cache_line_t *refill_line = nullptr;
     uint32_t      refill_tag = 0;
-    unsigned int  pending_line_offset = 0;
 
     // Set if a refill was denied by the downstream and must be retried on the
     // next retry() signal. Used only while a queued request is being drained —
@@ -321,13 +320,19 @@ vp::IoRespAck Cache::refill_resp(vp::Block *__this, vp::IoReq *req)
         cache_line_t *line = _this->refill_line;
         line->tag = _this->refill_tag;
 
+        // Derive the offset from the request we are answering. Hits are served
+        // throughout a refill, so a second miss can reach handle_req before this
+        // response lands; cache-wide offset state would be its, not ours.
+        unsigned int line_offset =
+            cpu_req->get_addr() & ((1U << _this->line_size_bits) - 1);
+
         if (!is_write)
         {
-            memcpy(data, &line->data[_this->pending_line_offset], size);
+            memcpy(data, &line->data[line_offset], size);
         }
         else
         {
-            memcpy(&line->data[_this->pending_line_offset], data, size);
+            memcpy(&line->data[line_offset], data, size);
         }
     }
 
@@ -533,7 +538,9 @@ cache_line_t *Cache::refill(int line_index, unsigned int addr, unsigned int tag,
                               vp::IoReq *cpu_req, bool *pending)
 {
     // Cache supports only one refill at a time. Queue the CPU req and back off.
-    if (this->pending_refill.get())
+    // A refill the downstream refused counts as busy: its vehicle is still owed
+    // a retry, so we must not start another one on top of it.
+    if (this->pending_refill.get() || this->refill_retry_pending)
     {
         this->refill_pending_reqs.push_back(cpu_req);
         *pending = true;
@@ -679,7 +686,10 @@ cache_line_t *Cache::get_line(vp::IoReq *req, unsigned int *line_index,
     cache_line_t *line = &this->lines[*line_index * this->cfg.ways];
     for (unsigned int i = 0; i < this->cfg.ways; i++)
     {
-        if (line->tag == *tag)
+        // An async refill streams straight into its victim, so that line's old
+        // tag is not a safe hit until the response retags it. Every other line
+        // stays available for the whole duration of the refill.
+        if (line->tag == *tag && !(this->pending_refill.get() && line == this->refill_line))
         {
             this->trace.msg(vp::Trace::LEVEL_TRACE, "Cache hit (way: %d)\n", i);
             return line;
@@ -713,7 +723,6 @@ vp::IoReqStatus Cache::handle_req(vp::IoReq *req)
         {
             if (pending)
             {
-                this->pending_line_offset = line_offset;
                 return vp::IO_REQ_GRANTED;
             }
             // Refill denied OR true error. The caller (input_req / fsm_handler)
@@ -789,16 +798,9 @@ vp::IoReqStatus Cache::input_req(vp::Block *__this, vp::IoReq *req)
 
     _this->io_event.event((uint8_t *)&offset);
 
-    // Cached path. If a refill is pending we must not start another one: queue
-    // this request and ack upstream with GRANTED. When the current refill
-    // resolves, fsm_handler will re-enter handle_req for this request.
-    if (_this->pending_refill.get() || _this->refill_retry_pending)
-    {
-        _this->refill_pending_reqs.push_back(req);
-        _this->check_state();
-        return vp::IO_REQ_GRANTED;
-    }
-
+    // Cached path. A refill in flight no longer gates the whole port: hits are
+    // served throughout it, and only a miss has to wait, which Cache::refill
+    // queues for us.
     vp::IoReqStatus st = _this->handle_req(req);
     if (st == vp::IO_REQ_DENIED)
     {

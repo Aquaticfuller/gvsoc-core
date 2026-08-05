@@ -39,6 +39,25 @@ private:
         bool sent = false;  // true once SEND has been attempted (and accepted) at least
     };
 
+    // Hex of the bytes actually delivered. The target fills reads with an
+    // address-derived pattern, so this shows WHICH part of a line came back —
+    // a response at the wrong offset is otherwise indistinguishable from a good one.
+    static std::string data_hex(ScheduleEntry *e)
+    {
+        if (e == NULL || e->is_write || e->data == NULL)
+        {
+            return "";
+        }
+        std::string s = " data=";
+        char buf[3];
+        for (uint64_t i = 0; i < e->size; i++)
+        {
+            snprintf(buf, sizeof(buf), "%02x", e->data[i]);
+            s += buf;
+        }
+        return s;
+    }
+
     static vp::IoReqStatus retry_default(vp::Block *) { return vp::IO_REQ_DONE; } // unused
     static vp::IoRespAck resp_handler(vp::Block *__this, vp::IoReq *req);
     static void retry_handler(vp::Block *__this, vp::IoRetryChannel);
@@ -164,9 +183,10 @@ void StubMaster::issue(ScheduleEntry *entry)
     switch (st)
     {
         case vp::IO_REQ_DONE:
-            printf("[%ld] %s DONE name=%s status=%d latency=%ld\n",
+            printf("[%ld] %s DONE name=%s status=%d latency=%ld%s\n",
                 now, this->logname.c_str(), entry->name.c_str(),
-                (int)entry->req->get_resp_status(), entry->req->get_latency());
+                (int)entry->req->get_resp_status(), entry->req->get_latency(),
+                StubMaster::data_hex(entry).c_str());
             break;
         case vp::IO_REQ_GRANTED:
             printf("[%ld] %s GRANTED name=%s\n",
@@ -186,9 +206,10 @@ vp::IoRespAck StubMaster::resp_handler(vp::Block *__this, vp::IoReq *req)
     ScheduleEntry *e = _this->entry_from_req(req);
     int64_t now = _this->clock.get_cycles();
     const char *name = e ? e->name.c_str() : "?";
-    printf("[%ld] %s RESP name=%s status=%d latency=%ld\n",
+    printf("[%ld] %s RESP name=%s status=%d latency=%ld%s\n",
         now, _this->logname.c_str(), name,
-        (int)req->get_resp_status(), req->get_latency());
+        (int)req->get_resp_status(), req->get_latency(),
+        StubMaster::data_hex(e).c_str());
     return vp::IO_RESP_ACCEPTED;
 }
 

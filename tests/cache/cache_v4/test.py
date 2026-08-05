@@ -101,6 +101,41 @@ def build_case(case_name: str) -> dict:
             'rules': rules,
         }
 
+    if case_name == 'stable_hit_during_refill':
+        # Prime one line synchronously, start an asynchronous refill in another
+        # set, then hit the primed line while that refill is still outstanding.
+        rules = [
+            dict(addr_min=0x00, addr_max=0x0F, behavior='done',
+                 resp_delay=0, retry_delay=0),
+            dict(addr_min=0x40, addr_max=0x4F, behavior='granted',
+                 resp_delay=30, retry_delay=0),
+        ]
+        return {
+            'cache_config': cache_cfg(),
+            'schedule': [
+                dict(cycle=10, addr=0x00, size=4, is_write=False, name='prime'),
+                dict(cycle=20, addr=0x40, size=4, is_write=False, name='miss'),
+                dict(cycle=22, addr=0x04, size=4, is_write=False, name='hit'),
+            ],
+            'rules': rules,
+        }
+
+    if case_name == 'refill_offset_vs_second_miss':
+        # Miss A is for a NON-ZERO offset inside its line and refills
+        # asynchronously. Miss B (different set, offset 0) arrives while that
+        # refill is still in flight. Each must be answered with the bytes at its
+        # OWN offset: cache-wide offset state would hand A the bytes B asked for.
+        rules = [dict(addr_min=0, addr_max=0xFFFF_FFFF, behavior='granted',
+                      resp_delay=30, retry_delay=0)]
+        return {
+            'cache_config': cache_cfg(),
+            'schedule': [
+                dict(cycle=10, addr=0x08, size=4, is_write=False, name='rA'),
+                dict(cycle=12, addr=0x40, size=4, is_write=False, name='rB'),
+            ],
+            'rules': rules,
+        }
+
     if case_name == 'bypass_done':
         # Cache disabled at reset, target returns DONE inline. The cache should
         # forward the request addr (after refill_shift/refill_offset transform) and
