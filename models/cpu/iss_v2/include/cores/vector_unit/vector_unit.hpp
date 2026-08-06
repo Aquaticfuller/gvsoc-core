@@ -374,6 +374,8 @@ private:
     std::deque<VlsuReq> reqs;
     // Requests which are not in flight
     std::vector<VlsuReq *> reqs_free;
+    // Number of store bursts waiting for their response
+    int nb_pending_stores;
 };
 
 #else
@@ -568,6 +570,8 @@ private:
     std::deque<VlsuReq> reqs;
     // Requests which are not in flight
     std::vector<VlsuReq *> reqs_free;
+    // Number of store bursts waiting for their response
+    int nb_pending_stores;
 };
 
 #endif // CONFIG_GVSOC_ISS_VLSU_V2

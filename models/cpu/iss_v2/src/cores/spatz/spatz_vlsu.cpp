@@ -126,6 +126,7 @@ void VuLsu::reset(bool active)
         {
             this->reqs_free.push_back(&req);
         }
+        this->nb_pending_stores = 0;
 
         while (!this->delayed_bursts.empty())
         {
@@ -313,6 +314,7 @@ void VuLsu::data_response(vp::Block *__this, vp::IoReq *req)
         _this->vu.exec_insn_chunk(insn, pending_insn, store_req->vstart,
             store_req->vstart + store_req->nb_elem, store_req->nb_elem);
         slot->nb_pending_bursts--;
+        _this->nb_pending_stores--;
 
         _this->trace.msg("Retiring store request (req: %p, pending insn bursts: %d)\n",
             req, slot->nb_pending_bursts);
@@ -484,10 +486,32 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         VuLsuPendingInsn &slot = _this->insns[_this->insn_ongoing];
         PendingInsn *pending_insn = slot.insn;
 
+        // Once an instruction started issuing, it owns the ports until it is done:
+        // only its first burst waits for the previous instruction.
+        bool phase_ready = true;
+        if (!_this->started)
+        {
+            // On RTL the load/store phase only switches once the previous instruction
+            // completed its accesses: a store completes when its responses are back, so
+            // anything waits for the outstanding stores to drain; a load completes when
+            // its elements reached the register file, which an empty ROB guarantees.
+            // Loads do not wait for each other, their bursts being issued independently
+            // of the commit queue.
+            phase_ready = _this->nb_pending_stores == 0;
+
+            if (_this->pending_is_write)
+            {
+                for (int i = 0; i < _this->nb_ports; i++)
+                {
+                    phase_ready &= _this->rob_count[i] == 0;
+                }
+            }
+        }
+
         // If the on-going instruction is ready and its instruction latency has elapsed,
         // try to send requests to available ports. A store reads the register file once
         // per burst, so it is checked burst by burst, at the elements that burst reads.
-        if (pending_insn->timestamp <= _this->vu.iss.clock.get_cycles() &&
+        if (phase_ready && pending_insn->timestamp <= _this->vu.iss.clock.get_cycles() &&
             (_this->pending_is_write || _this->vu.insn_ready(pending_insn)))
         {
             iss_insn_t *insn = _this->vu.iss.exec.get_insn(pending_insn->entry);
@@ -589,6 +613,7 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                         vlsu_req->data.assign(velem, velem + size);
                         req_data = vlsu_req->data.data();
 
+                        _this->nb_pending_stores++;
                         req->arg_push((void *)vlsu_req);
                     }
                     else
@@ -662,7 +687,9 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         }
     }
 
-    // Check if the first enqueued instruction must be removed.
+    // Check if the first enqueued instruction must be removed. A store is done once
+    // its bursts got their response, which also drains the block's stores, the next
+    // instruction being unable to issue before that.
     if (_this->nb_pending_insn.get() > 0)
     {
         VuLsuPendingInsn &slot = _this->insns[_this->insn_first];
