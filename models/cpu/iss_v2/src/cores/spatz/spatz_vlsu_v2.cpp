@@ -29,7 +29,7 @@
  *   - io_v2 has no grant callback. A burst denied at issue is parked on its
  *     port and re-issued synchronously inside retry(), as deny/retry arbiters
  *     such as interco.log_ico_v2 require; the issue bookkeeping the v1 grant
- *     callback performed happens there instead (see burst_issued).
+ *     callback performed happens at submission instead (see burst_issued).
  */
 
 #include <cpu/iss_v2/include/cores/vector_unit/vector_unit.hpp>
@@ -278,8 +278,10 @@ void VuLsu::handle_insn_store(VuLsu *_this, iss_insn_t *insn)
     _this->handle_access(insn, true, insn->in_regs[1]);
 }
 
-// Advance the sequencing state for a burst the downstream has just accepted.
-// Replaces the v1 grant callback, which io_v2 does not have.
+// Advance the sequencing state for a burst just submitted to its port. The RTL
+// output spill retains a back-pressured request, so a burst leaves the
+// instruction when it is sent, whatever the downstream answers. Issue loop
+// only: a burst parked in denied_reqs already entered that spill.
 void VuLsu::burst_issued(vp::IoReq *req, int port)
 {
     uint64_t size = req->get_size();
@@ -328,10 +330,10 @@ void VuLsu::port_retry_muxed(vp::Block *__this, int id, vp::IoRetryChannel)
         return;
     }
 
-    // Accepted: release the port and advance the burst.
+    // Accepted: release the port. The sequencing state advanced at submission
+    // and may already belong to the next instruction.
     _this->denied_reqs[id] = nullptr;
     _this->port_stalled[id] = false;
-    _this->burst_issued(req, id);
 
     if (err == vp::IO_REQ_DONE)
     {
@@ -723,23 +725,22 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
                     vp::IoReqStatus err = _this->ports[i].req(req);
 
+                    // The burst has left the instruction as soon as it is sent,
+                    // even when the downstream denies it.
+                    _this->burst_issued(req, i);
+
                     if (err == vp::IO_REQ_DENIED)
                     {
                         // Park the burst on its port; it is re-issued inside the
-                        // retry callback, which also advances the sequencing state.
+                        // retry callback.
                         _this->port_stalled[i] = true;
                         _this->denied_reqs[i] = req;
                     }
-                    else
+                    else if (err == vp::IO_REQ_DONE)
                     {
-                        _this->burst_issued(req, i);
-
-                        if (err == vp::IO_REQ_DONE)
-                        {
-                            _this->handle_done(req);
-                        }
-                        // GRANTED: completion arrives through port_resp_muxed.
+                        _this->handle_done(req);
                     }
+                    // GRANTED: completion arrives through port_resp_muxed.
                 }
             }
         }

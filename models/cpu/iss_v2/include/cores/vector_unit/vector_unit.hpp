@@ -222,9 +222,9 @@ private:
     static void port_retry_muxed(vp::Block *__this, int id, vp::IoRetryChannel);
     static vp::IoRespAck port_resp_muxed(vp::Block *__this, vp::IoReq *req, int id);
 
-    // Advance the issue bookkeeping of a burst the downstream just accepted.
-    // Replaces the v1 grant callback, which io_v2 does not have: a burst denied
-    // at issue time only advances once its retry succeeds.
+    // Advance the issue bookkeeping of a burst submitted to its port. denied_reqs
+    // models the RTL output spill, so a denied burst has already left the
+    // instruction and advances at submission, not when its retry succeeds.
     void burst_issued(vp::IoReq *req, int port);
     // Called when a request has been accepted with DONE: complete it now or
     // push it to the delayed-bursts queue for get_full_latency() cycles.
@@ -297,8 +297,8 @@ private:
     int vstart;
 
     // Independent static issue: global burst k belongs to port k % nb_ports.
-    // Each port keeps only its accepted-burst count and DENIED state; burst
-    // count/size are derived from the immutable transfer size and access mode.
+    // Each port keeps only its submitted-burst count and DENIED state; burst
+    // count/size derive from the transfer size and access mode.
     std::vector<int> port_burst;
     std::vector<bool> port_stalled;
     // Per-port request denied by the downstream and waiting for its retry()
