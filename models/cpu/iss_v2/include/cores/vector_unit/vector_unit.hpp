@@ -182,11 +182,23 @@ public:
 private:
     // Handler for internal FSM
     static void fsm_handler(vp::Block *__this, vp::ClockEvent *event);
+    // Handler called when a load instruction starts to be processed, in order to initialize the FSM
+    // for a read burst
     static void handle_insn_load(VuLsu *vlsu, iss_insn_t *insn);
+    // Handler called when a write instruction starts to be processed, in order to initialize the FSM
+    // for a write burst
     static void handle_insn_store(VuLsu *vlsu, iss_insn_t *insn);
+    // Handler called when a stride load instruction starts to be processed, in order to initialize
+    // the FSM for a read burst
     static void handle_insn_load_strided(VuLsu *vlsu, iss_insn_t *insn);
+    // Handler called when a strided write instruction starts to be processed, in order to
+    // initialize the FSM for a write burst
     static void handle_insn_store_strided(VuLsu *vlsu, iss_insn_t *insn);
+    // Handler called when an indexed load instruction starts to be processed, in order to initialize
+    // the FSM for a read burst
     static void handle_insn_load_indexed(VuLsu *vlsu, iss_insn_t *insn);
+    // Handler called when an indexed write instruction starts to be processed, in order to
+    // initialize the FSM for a write burst
     static void handle_insn_store_indexed(VuLsu *vlsu, iss_insn_t *insn);
 
     void handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stride=false, iss_reg_t stride=0, int reg_indexed=-1);
@@ -196,12 +208,14 @@ private:
     static void port_retry_muxed(vp::Block *__this, int id, vp::IoRetryChannel);
     static vp::IoRespAck port_resp_muxed(vp::Block *__this, vp::IoReq *req, int id);
 
-    // Called when a request has been accepted with DONE: either complete it
-    // now or push it to the delayed-bursts queue for get_full_latency()
-    // cycles.
+    // Advance the issue bookkeeping of a burst the downstream just accepted.
+    // Replaces the v1 grant callback, which io_v2 does not have: a burst denied
+    // at issue time only advances once its retry succeeds.
+    void burst_issued(vp::IoReq *req, int port);
+    // Called when a request has been accepted with DONE: complete it now or
+    // push it to the delayed-bursts queue for get_full_latency() cycles.
     void handle_done(vp::IoReq *req);
-    // Terminate one burst: commit its elements to the VRF (chaining) and
-    // retire it from the per-port in-order ROB.
+    // Terminate one burst: commit its elements to the VRF and retire it.
     void burst_done(vp::IoReq *req);
 
     // Number of instruction that can be enqueued at the same time
@@ -209,55 +223,80 @@ private:
 
     Vu &vu;
     vp::Trace trace;
+    // Event for active state
     vp::Trace event_active;
+    // Event for address of current AXI burst
     std::vector<vp::Trace> event_addr;
+    // Event for size of current AXI burst
     std::vector<vp::Trace> event_size;
+    // Event for write or read opcode of current AXI burst
     std::vector<vp::Trace> event_is_write;
+    // Event for PC of enqueued instructions
     vp::Trace event_queue;
+    // Event for PC of instruction being processed
     vp::Trace event_pc;
+    // Event for label of instruction being processed
     vp::Event event_label;
+    // Clock event used for scheduling FSM handler when at least one instruction has to be processed
     vp::ClockEvent fsm_event;
+    // Queue of pending instructions to be processed by this block
+    // The block process them in-order
     std::vector<VuLsuPendingInsn> insns;
+    // Base address of the current memory operation
     iss_addr_t pending_addr;
+    // Total size of the current load/store operation, fixed during execution
     iss_addr_t pending_size;
+    // Remaining size of the current load/store operation
+    iss_addr_t remaining_size;
+    // Write or read of the current load/store operation
     bool pending_is_write;
+    // Base pointer in the vector register file for the current memory operation
     uint8_t *pending_velem;
+    // Thsi indicates the vector register involved in the load/sotre operation.
+    // Used for vector chaining to commit elements to correct register.
     int pending_vreg;
+    // First valid instruction in the queue.
     int insn_first;
+    // First valid instruction in the queue waiting to be started
     int insn_first_waiting;
+    // Index in the queue where the next instruction should be pushed.
     int insn_last;
+    // Number of enqueued instructions
     vp::Register<uint8_t> nb_pending_insn;
+    // Number of instructions waiting to be started
     int nb_waiting_insn;
-    // Ports to the TCDM, used by VLSU for vector load and store operations.
-    // io_v2 master ports require retry/resp callbacks at construction time;
-    // we use the muxed variants so a single pair of callbacks dispatches by
-    // port id.
+    // Ports to the TCDM, used by VLSU for vector load and store operations
     std::vector<vp::IoMaster> ports;
-    // Queues of requests. Each port has its own queue to model limited
-    // outstanding requests.
-    std::vector<vp::Queue *> req_queues;
-    // Whole list of requests for all ports
-    std::vector<vp::IoReq> requests;
-    // Per-port request denied by the downstream and waiting for its retry()
-    // signal. A port with a parked request issues nothing else.
-    std::vector<vp::IoReq *> denied_reqs;
+    // Number of TCDM ports
     int nb_ports;
     iss_reg_t stride;
     bool strided;
     int elem_size;
     int reg_indexed;
-    int pending_elem;
     int inst_elem_size;
     int64_t op_timestamp;
     bool prev_is_write;
     bool started;
     int vstart;
 
-    // Ongoing instruction
-    int insn_ongoing;
+    // Independent static issue: global burst k belongs to port k % nb_ports.
+    // Each port keeps only its accepted-burst count and DENIED state; burst
+    // count/size are derived from the immutable transfer size and access mode.
+    std::vector<int> port_burst;
+    std::vector<bool> port_stalled;
+    // Per-port request denied by the downstream and waiting for its retry()
+    // signal. io_v2 requires the re-issue to happen inside the retry callback,
+    // so the request itself must be kept, not just the stalled flag.
+    std::vector<vp::IoReq *> denied_reqs;
 
-    // Bursts which have been handled synchronously with a delay. They are
-    // held here until their delay has elapsed.
+    // Instruction currently active in the VLSU. pending_insn->timestamp is reused across phases:
+    // 1. as an enqueue-cycle guard, 2. as the request issuing start time after instruction latency,
+    // and 3. for memory-response/retirement timing. Keeping this index separate from insn_first_waiting
+    // makes the phase explicit and prevents queued instructions from consuming their instruction latency
+    // before they become active.
+    int insn_ongoing;
+    // Bursts which have been handled synchronously with a delay. There are hold here until their
+    // delay has elapsed
     struct DelayedBurst
     {
         vp::IoReq *req;
@@ -274,8 +313,29 @@ private:
 
     std::priority_queue<DelayedBurst, std::vector<DelayedBurst>, DelayedBurstCompare> delayed_bursts;
 
-    // Per-port in-order reorder buffer entry. The request keeps a pointer to
-    // its entry in ``initiator`` (io_v2 has no arg stack).
+    // A burst in flight. Both loads and stores take their request from the same pool,
+    // and the request describes the elements it covers, so that it can be committed
+    // when it completes: through its ROB entry for a load, directly for a store.
+    struct VlsuReq
+    {
+        vp::IoReq req;
+        // Copy of the vector elements to be stored. The register file is read when the
+        // request is sent, but the request is only applied when it reaches the target,
+        // when a younger instruction may already have overwritten the register. Unused
+        // by loads, which write the register file from the response data.
+        std::vector<uint8_t> data;
+        // Instruction slot which issued the request
+        VuLsuPendingInsn *slot = nullptr;
+        // Port on which the request was sent
+        int port = 0;
+        // Vector register and range of elements covered by the request
+        int vreg = 0;
+        int vstart = 0;
+        int nb_elem = 0;
+    };
+
+    // Reorder Buffer for mempool configuration. It only tracks the completion order of
+    // the loads, the requests themselves being described by VlsuReq.
     struct VlsuRobEntry
     {
         // Port and id
@@ -289,17 +349,7 @@ private:
         bool valid = false;
 
         // Request itself
-        vp::IoReq *req = nullptr;
-
-        // Instruction slot which issued the request
-        VuLsuPendingInsn *slot = nullptr;
-
-        // Vector register
-        int vreg = 0;
-
-        int elem_size = 0;
-        int vstart = 0;
-        int size = 0;
+        VlsuReq *req = nullptr;
     };
 
     // Reorder buffer
@@ -310,6 +360,14 @@ private:
     std::vector<int> rob_first;
     // Number of allocated entries in the ROB for each port
     std::vector<int> rob_count;
+
+    // Requests, allocated on demand and recycled once their response is received. The
+    // pool puts no limit on the number of outstanding bursts, like RTL where the number
+    // of loads is limited by the ROB and the number of stores by nothing. A deque keeps
+    // the requests already in flight at a stable address while the pool grows.
+    std::deque<VlsuReq> reqs;
+    // Requests which are not in flight
+    std::vector<VlsuReq *> reqs_free;
 };
 
 #else
