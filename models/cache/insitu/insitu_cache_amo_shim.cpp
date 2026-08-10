@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include <cstdlib>
 #include <deque>
 
 #include <vp/vp.hpp>
@@ -37,6 +38,23 @@
 using namespace insitu;
 
 namespace {
+// A/B switch for the concurrent-atomic park queue: INSITU_AMO_PARK=0 restores the pre-park
+// behaviour (a second atomic overwrites the in-flight RMW state). Diagnostic only.
+// INSITU_AMO_DEBUG=1 traces the first N RMW state transitions to stderr (async bring-up).
+inline int amo_dbg()
+{
+    static const int v = [](){ const char *e = getenv("INSITU_AMO_DEBUG"); return e ? atoi(e) : 0; }();
+    return v;
+}
+inline int &amo_dbg_budget() { static int n = 400; return n; }
+
+inline bool park_enabled()
+{
+    static const bool v = [](){ const char *e = getenv("INSITU_AMO_PARK");
+                                return !(e && e[0] == '0'); }();
+    return v;
+}
+
 // engine IoReqOpcode → amo.hpp AmoOp (the two enums differ).
 inline uint8_t opcode_to_amo(vp::IoReqOpcode op)
 {
@@ -71,7 +89,7 @@ private:
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req);
     static void resp_handler(vp::Block *__this, vp::IoReq *req);
     // req_handler's body, callable again when a parked request is re-issued.
-    static vp::IoReqStatus handle(InsituCacheAmo *_this, vp::IoReq *req);
+    static vp::IoReqStatus handle(InsituCacheAmo *_this, vp::IoReq *req, bool parked);
     static void drain_park(InsituCacheAmo *_this);
 
     Reservation res_;
@@ -88,6 +106,7 @@ private:
     enum Phase { IDLE, AMO_READ, AMO_WRITE, SC_WRITE };
     Phase    phase_ = IDLE;
     std::deque<vp::IoReq*> park_q_;
+    uint64_t dbg_watch_addr_ = 0;   // first atomic's address (debug)
     // Synchronous-slave cache (cachepool run_request_sync): the sub-read/sub-write to the core complete
     // in-call (req returns IO_REQ_OK, not PENDING), so the whole RMW/SC resolves INSIDE req_handler. In that
     // case the shim must return IO_REQ_OK (the result is already written into the upstream req's data) and
@@ -139,21 +158,25 @@ InsituCacheAmo::InsituCacheAmo(vp::ComponentConf &conf) : vp::Component(conf)
 vp::IoReqStatus InsituCacheAmo::req_handler(vp::Block *__this, vp::IoReq *req)
 {
     InsituCacheAmo *_this = static_cast<InsituCacheAmo *>(__this);
-    // Lane busy with an RMW: only ANOTHER ATOMIC has to wait. It is the one that would overwrite
-    // phase_/orig_/scratch_/amo_addr_ and make the two RMWs complete into each other's result buffers.
-    // Plain READ/WRITE never touch that state, so they proceed as before — and B3's occupancy stamp in
-    // handle() already models the lane being held by the RMW, so parking them here as well would charge
-    // that same wait twice. Keeping the gate this narrow also keeps it off the calibrated path's neck:
-    // the cell coalescer below the shim answers PENDING by design even when the cache itself is a
-    // synchronous slave, so phase_ can stay non-IDLE across a call in v1 too.
-    if (_this->phase_ != IDLE) {
-        const vp::IoReqOpcode bop = req->get_opcode();
-        if (bop != vp::READ && bop != vp::WRITE) {
-            _this->park_q_.push_back(req);
-            return vp::IO_REQ_PENDING;
-        }
+    // Lane busy with an RMW: EVERY new request waits, whatever its opcode. This is what makes the
+    // read-modify-write atomic, and it is what `core_ready = 0` does in the RTL (spatz_cache_amo.sv
+    // holds it for the whole DoAMO/WriteBackAMO/Wait window).
+    //
+    // Parking only atomics is not enough. A plain store that slips between an RMW's read and its
+    // write-back is LOST, because the write-back then rewrites the pre-store value: the spin-lock
+    // kernel deadlocked with every amoswap returning old=0x1 forever, since the holder's release
+    // store (lock = 0) was overwritten by an in-flight swap's write-back (lock = 1) and the lock was
+    // never released again. On a synchronous-slave cache the whole RMW resolves inside req_handler so
+    // phase_ is always IDLE here and nothing can interleave; the async path made the window real.
+    if (_this->phase_ != IDLE && park_enabled()) {
+        _this->park_q_.push_back(req);
+        return vp::IO_REQ_PENDING;
     }
-    return handle(_this, req);
+    vp::IoReqStatus st = handle(_this, req, /*parked=*/false);
+    // If that RMW resolved synchronously, release whatever queued behind it — resp_handler's drain
+    // only runs on the async completion path.
+    if (_this->phase_ == IDLE) drain_park(_this);
+    return st;
 }
 
 // Drain parked requests once the lane is idle. We already answered PENDING upstream, so a request that
@@ -163,25 +186,34 @@ void InsituCacheAmo::drain_park(InsituCacheAmo *_this)
     while (_this->phase_ == IDLE && !_this->park_q_.empty()) {
         vp::IoReq *r = _this->park_q_.front();
         _this->park_q_.pop_front();
-        if (handle(_this, r) == vp::IO_REQ_OK) r->get_resp_port()->resp(r);
+        if (handle(_this, r, /*parked=*/true) == vp::IO_REQ_OK) r->get_resp_port()->resp(r);
     }
 }
 
-vp::IoReqStatus InsituCacheAmo::handle(InsituCacheAmo *_this, vp::IoReq *req)
+vp::IoReqStatus InsituCacheAmo::handle(InsituCacheAmo *_this, vp::IoReq *req, bool parked)
 {
     const vp::IoReqOpcode op = req->get_opcode();
     const uint64_t addr = req->get_addr();
     const uint32_t core = (uint32_t)req->get_initiator();
 
     // B3: a new request on this lane (any opcode) waits out the previous RMW's occupancy window.
+    // Skipped for a request that was parked: it already waited in real simulated time, so stamping
+    // the window on top would charge the same serialization twice.
     const int64_t now = _this->clock.get_cycles();
-    if (now < _this->rmw_busy_until_) req->inc_latency(_this->rmw_busy_until_ - now);
+    if (!parked && now < _this->rmw_busy_until_) req->inc_latency(_this->rmw_busy_until_ - now);
 
     // --- plain accesses: pass through ---
     if (op == vp::READ) {
         return _this->output_.req_forward(req);
     }
     if (op == vp::WRITE) {
+        if (amo_dbg() && amo_dbg_budget() > 0 && addr == _this->dbg_watch_addr_) {
+            amo_dbg_budget()--;
+            uint32_t v = 0; if (req->get_data()) memcpy(&v, req->get_data(), req->get_size() < 4 ? req->get_size() : 4);
+            fprintf(stderr, "[AMO %s] cyc=%ld PLAIN WRITE addr=0x%lx size=%u val=0x%x parked=%d\n",
+                    _this->get_path().c_str(), (long)_this->clock.get_cycles(),
+                    (unsigned long)addr, req->get_size(), v, (int)parked);
+        }
         _this->res_.on_foreign_access(core, addr, AMO_NONE, /*is_write=*/true);
         return _this->output_.req_forward(req);
     }
@@ -217,6 +249,7 @@ vp::IoReqStatus InsituCacheAmo::handle(InsituCacheAmo *_this, vp::IoReq *req)
     }
 
     // --- true AMO: read-modify-write ---
+    if (_this->dbg_watch_addr_ == 0) _this->dbg_watch_addr_ = addr;   // first atomic seen = the lock
     _this->phase_   = AMO_READ;
     _this->orig_    = req;
     _this->amo_op_  = opcode_to_amo(op);
@@ -229,6 +262,12 @@ vp::IoReqStatus InsituCacheAmo::handle(InsituCacheAmo *_this, vp::IoReq *req)
     _this->scratch_.set_data(_this->scratch_buf_);
     _this->in_sync_call_ = true; _this->sync_completed_ = false;
     vp::IoReqStatus st = _this->output_.req(&_this->scratch_);
+    if (amo_dbg() && amo_dbg_budget() > 0) {
+        amo_dbg_budget()--;
+        fprintf(stderr, "[AMO %s] cyc=%ld RMW issue op=%d addr=0x%lx sub_read_st=%d park=%zu\n",
+                _this->get_path().c_str(), (long)_this->clock.get_cycles(), (int)op,
+                (unsigned long)addr, (int)st, _this->park_q_.size());
+    }
     if (st == vp::IO_REQ_OK) { resp_handler(_this, &_this->scratch_); }
     _this->in_sync_call_ = false;
     return _this->sync_completed_ ? vp::IO_REQ_OK : vp::IO_REQ_PENDING;
@@ -237,10 +276,22 @@ vp::IoReqStatus InsituCacheAmo::handle(InsituCacheAmo *_this, vp::IoReq *req)
 void InsituCacheAmo::resp_handler(vp::Block *__this, vp::IoReq *req)
 {
     InsituCacheAmo *_this = static_cast<InsituCacheAmo *>(__this);
+    if (amo_dbg() && amo_dbg_budget() > 0) {
+        amo_dbg_budget()--;
+        fprintf(stderr, "[AMO %s] cyc=%ld resp phase=%d mine=%d\n", _this->get_path().c_str(),
+                (long)_this->clock.get_cycles(), (int)_this->phase_, (int)(req == &_this->scratch_));
+    }
     if (req != &_this->scratch_) return;   // not our scratch (shouldn't happen)
 
     if (_this->phase_ == AMO_READ) {
         memcpy(&_this->old_val_, _this->scratch_buf_, 4);
+        if (amo_dbg() && amo_dbg_budget() > 0) {
+            amo_dbg_budget()--;
+            fprintf(stderr, "[AMO %s] cyc=%ld RMW old=0x%x operand=0x%x -> new=0x%x addr=0x%lx\n",
+                    _this->get_path().c_str(), (long)_this->clock.get_cycles(), _this->old_val_,
+                    _this->b_val_, amo_alu(_this->amo_op_, _this->old_val_, _this->b_val_),
+                    (unsigned long)_this->amo_addr_);
+        }
         _this->rmw_read_lat_ = _this->scratch_.get_full_latency();   // B3: before scratch_ re-init
         const uint32_t newv = amo_alu(_this->amo_op_, _this->old_val_, _this->b_val_);
         memcpy(_this->scratch_buf_, &newv, 4);
