@@ -133,6 +133,15 @@ vp::IoReqStatus InsituCacheCellCoalescer::req_handler(vp::Block *__this, vp::IoR
     const uint32_t part_off = (uint32_t)(addr & (_this->part_bytes_ - 1));
     if (size > _this->word_bytes_ || part_off + size > _this->part_bytes_)
         return _this->output_.req_forward(req);
+    // SUB-WORD WRITES CANNOT RIDE THE MERGE. insitu_cache_coalesce.hpp merges a write by copying
+    // word_bytes_ bytes from the request's buffer to (word_index * word_bytes_) — it neither honours
+    // the byte offset WITHIN the word nor stops at the request's size. For a 1/2-byte store that
+    // over-reads the buffer and clobbers the neighbouring bytes of the same word, which corrupted
+    // the byte-enable kernel (29 FAIL lines the moment the coalescer was enabled at 16 cores).
+    // The RTL coalescer merges the Spatz lanes' 32-bit word accesses; sub-word stores are not part
+    // of that, so forward them individually.
+    if (req->get_is_write() && size != _this->word_bytes_)
+        return _this->output_.req_forward(req);
 
     // Reads AND writes accumulate into the coalescing window (write merge = C1); emitted next tick.
     _this->batch_.push_back(Pend{req, (uint32_t)input_id, addr, size, _this->clock.get_cycles()});
@@ -176,13 +185,20 @@ void InsituCacheCellCoalescer::tick(vp::Block *__this, vp::ClockEvent *event)
             // also queue two same-cycle same-port bursts). Matching on port alone would put the
             // SAME req in two groups → double resp() → arg_pop on empty in the VLSU (SIGSEGV,
             // reproduced by M48 linked-list at 4-core).
+            // Claim each matched entry IMMEDIATELY (p.done = true inside the loop). CoalGroup::ports
+            // can list the SAME port index twice — g->ports.push_back(a.port) is unconditional in
+            // insitu_cache_coalesce.hpp — because the coalescer's input index is the PORT CLASS, so
+            // two different cores (or tiles) hitting the same 16 B part on the same lane in the same
+            // cycle land in ONE group with a duplicated port index. Marking `done` only after the
+            // whole loop let both iterations re-find the SAME parked request, putting one IoReq* in
+            // grp.members twice -> split_and_resp() responded to it twice -> arg_pop on empty in the
+            // VLSU (SIGSEGV). Reproduced by fmatmul at 4 tiles; invisible at 1 tile/1 core per part.
             std::vector<Pend *> members;
             for (size_t k = 0; k < g.ports.size(); k++) {
                 for (auto &p : kv.second) {
-                    if (!p.done && p.port == g.ports[k]) { members.push_back(&p); break; }
+                    if (!p.done && p.port == g.ports[k]) { p.done = true; members.push_back(&p); break; }
                 }
             }
-            for (auto *mp : members) mp->done = true;
 
             if (g.is_write) {
                 // Coverage of the merged byte mask: only a FULL part can ride one wide write (the
@@ -240,6 +256,25 @@ void InsituCacheCellCoalescer::resp_handler(vp::Block *__this, vp::IoReq *req)
 void InsituCacheCellCoalescer::split_and_resp(int gi)
 {
     Group &grp = pool_[gi];
+    // Guard: a released group must never be split again, and no request may appear twice in the
+    // member list — responding to the same IoReq twice crashes the requester (this is exactly the
+    // duplicate-port-index bug fixed above, and the guard is how it would be caught next time).
+    if (!grp.active) return;
+    for (size_t k = 1; k < grp.members.size(); k++) {
+        for (size_t q = 0; q < k; q++) {
+            if (grp.members[k] == grp.members[q]) {
+                vp_warning_always(&this->trace_,
+                    "coalescer: duplicate request in merge group (gi=%d, k=%zu, q=%zu) - dropping the "
+                    "duplicate to avoid a double response\n", gi, k, q);
+                grp.members.erase(grp.members.begin() + k);
+                grp.off.erase(grp.off.begin() + k);
+                grp.sz.erase(grp.sz.begin() + k);
+                grp.park_cyc.erase(grp.park_cyc.begin() + k);
+                k--;
+                break;
+            }
+        }
+    }
     const int64_t lat = (int64_t)grp.wide.get_full_latency();
     const int64_t now = clock.get_cycles();
     for (size_t k = 0; k < grp.members.size(); k++) {
