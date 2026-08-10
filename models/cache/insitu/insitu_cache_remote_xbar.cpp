@@ -36,6 +36,7 @@ private:
 
     RouteGeom geom_;
     uint32_t  num_tiles_, nrpc_, n_slots_;
+    uint32_t  num_groups_ = 1, tiles_per_group_ = 1, group_id_ = 0, n_local_slots_ = 0;
     int32_t   hop_latency_cycles_;
     std::vector<vp::IoSlave *>  inputs_;
     std::vector<vp::IoMaster *> outputs_;
@@ -48,6 +49,14 @@ InsituCacheRemoteXbar::InsituCacheRemoteXbar(vp::ComponentConf &conf) : vp::Comp
     auto *cfg = this->get_js_config();
     num_tiles_          = cfg->get_child_int("num_tiles");
     nrpc_               = cfg->get_child_int("num_remote_port_core");
+    // P1 multi-group: the address TileID field is CLUSTER-GLOBAL, so a "remote" request may target a
+    // tile in this group or in another one. tiles_per_group + group_id let this crossbar tell them
+    // apart: same group -> a local tile slot; other group -> the NoC egress slots. num_groups==1
+    // keeps the single-group behaviour and does not create the NoC ports at all.
+    num_groups_       = cfg->get("num_groups")       ? cfg->get_child_int("num_groups")       : 1;
+    tiles_per_group_  = cfg->get("tiles_per_group")  ? cfg->get_child_int("tiles_per_group")  : num_tiles_;
+    group_id_         = cfg->get("group_id")         ? cfg->get_child_int("group_id")         : 0;
+    if (tiles_per_group_ == 0) tiles_per_group_ = num_tiles_;
     if (nrpc_ < 1) nrpc_ = 1;
     n_slots_            = num_tiles_ * nrpc_;    // NumInp = NumOut = NumTiles * NumRemotePortCore
     hop_latency_cycles_ = cfg->get_child_int("hop_latency_cycles");
@@ -57,16 +66,24 @@ InsituCacheRemoteXbar::InsituCacheRemoteXbar(vp::ComponentConf &conf) : vp::Comp
                /*dyn_offset*/cfg->get_child_int("dynamic_offset"), /*addr_w*/cfg->get_child_int("addr_width"),
                /*priv_start*/0);
 
-    inputs_.resize(n_slots_);
-    outputs_.resize(n_slots_);
-    for (uint32_t i = 0; i < n_slots_; i++) {
+    // Local slots address the tiles OF THIS GROUP; with >1 group, nrpc extra slots per direction
+    // carry off-group traffic to/from the L1 NoC.
+    n_local_slots_ = tiles_per_group_ * nrpc_;
+    const uint32_t n_noc = (num_groups_ > 1) ? nrpc_ : 0;
+    const uint32_t n_in  = n_local_slots_ + n_noc;
+    const uint32_t n_out = n_local_slots_ + n_noc;
+    inputs_.resize(n_in);
+    outputs_.resize(n_out);
+    for (uint32_t i = 0; i < n_in; i++) {
         inputs_[i] = new vp::IoSlave();
         inputs_[i]->set_req_meth_muxed(&InsituCacheRemoteXbar::req_handler, (int)i);
-        this->new_slave_port("in_" + std::to_string(i), inputs_[i]);
+        if (i < n_local_slots_) this->new_slave_port("in_" + std::to_string(i), inputs_[i]);
+        else                    this->new_slave_port("noc_in_" + std::to_string(i - n_local_slots_), inputs_[i]);
     }
-    for (uint32_t o = 0; o < n_slots_; o++) {
+    for (uint32_t o = 0; o < n_out; o++) {
         outputs_[o] = new vp::IoMaster();
-        this->new_master_port("out_" + std::to_string(o), outputs_[o]);
+        if (o < n_local_slots_) this->new_master_port("out_" + std::to_string(o), outputs_[o]);
+        else                    this->new_master_port("noc_out_" + std::to_string(o - n_local_slots_), outputs_[o]);
     }
 
     this->traces.new_trace("trace", &this->trace_, vp::DEBUG);
@@ -97,7 +114,16 @@ vp::IoReqStatus InsituCacheRemoteXbar::req_handler(vp::Block *__this, vp::IoReq 
     const uint32_t source = (uint32_t)input_id / _this->nrpc_;
     uint32_t target = _this->geom_.addr_tile(req->get_addr());
     if (target >= _this->num_tiles_) target = _this->num_tiles_ - 1;   // safety clamp
-    const uint32_t out = target * _this->nrpc_ + (source % _this->nrpc_);
+    // The TileID field is cluster-global: derive the owning group, then either land on one of this
+    // group's tiles or leave through the NoC egress.
+    const uint32_t tgt_group = target / _this->tiles_per_group_;
+    uint32_t out;
+    if (_this->num_groups_ > 1 && tgt_group != _this->group_id_) {
+        out = _this->n_local_slots_ + (source % _this->nrpc_);          // → L1 NoC
+    } else {
+        const uint32_t local_tile = target % _this->tiles_per_group_;
+        out = local_tile * _this->nrpc_ + (source % _this->nrpc_);
+    }
     if (_this->hop_latency_cycles_ > 0) req->inc_latency(_this->hop_latency_cycles_);
     _this->trace_.msg(vp::Trace::LEVEL_TRACE, "remote src=%u addr=0x%lx -> tile=%u slot=%u\n",
                       source, (unsigned long)req->get_addr(), target, out);

@@ -25,7 +25,8 @@ class InsituCacheRemoteXbar(Component):
 
     def __init__(self, parent: Component, name: str, *,
                  num_tiles: int, num_cores: int, num_cache: int, num_remote_port_core: int = 1,
-                 dynamic_offset: int = 6, addr_width: int = 32, hop_latency_cycles: int = 0):
+                 dynamic_offset: int = 6, addr_width: int = 32, hop_latency_cycles: int = 0,
+                 num_groups: int = 1, tiles_per_group: int = 0, group_id: int = 0):
         super().__init__(parent, name)
         self.add_sources(['cache/insitu/insitu_cache_remote_xbar.cpp'])
         self.add_properties({
@@ -36,7 +37,20 @@ class InsituCacheRemoteXbar(Component):
             'dynamic_offset': dynamic_offset,
             'addr_width': addr_width,
             'hop_latency_cycles': hop_latency_cycles,
+            # P1: num_groups>1 makes num_tiles the CLUSTER-GLOBAL tile count and adds the NoC
+            # egress/ingress slots; tiles_per_group + group_id say which targets are local.
+            'num_groups': num_groups,
+            'tiles_per_group': tiles_per_group if tiles_per_group else num_tiles,
+            'group_id': group_id,
         })
+
+    def i_NOC_IN(self, slot: int) -> SlaveItf:
+        """Off-group request arriving from the L1 NoC (routed on to a local tile)."""
+        return SlaveItf(self, f'noc_in_{slot}', signature='io')
+
+    def o_NOC_OUT(self, slot: int, itf: SlaveItf):
+        """Off-group request leaving toward the L1 NoC."""
+        self.itf_bind(f'noc_out_{slot}', itf, signature='io')
 
     def i_INPUT(self, slot: int) -> SlaveItf:
         """Input slot = src_tile*num_remote_port_core + r (a source tile's remote-out)."""
