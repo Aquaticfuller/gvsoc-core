@@ -27,6 +27,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include <deque>
+
 #include <vp/vp.hpp>
 #include <vp/itf/io.hpp>
 
@@ -68,13 +70,24 @@ public:
 private:
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req);
     static void resp_handler(vp::Block *__this, vp::IoReq *req);
+    // req_handler's body, callable again when a parked request is re-issued.
+    static vp::IoReqStatus handle(InsituCacheAmo *_this, vp::IoReq *req);
+    static void drain_park(InsituCacheAmo *_this);
 
     Reservation res_;
     uint32_t word_bytes_;
 
-    // single in-flight AMO/SC transaction (the scalar lane is single-outstanding → atomic).
+    // ONE in-flight AMO/SC transaction — one RMW unit per bank, as in the RTL (spatz_cache_amo.sv holds
+    // core_ready=0 for the whole DoAMO/WriteBackAMO/Wait window). With the synchronous-slave cache the
+    // whole RMW resolves inside req_handler, so phase_ is always IDLE on entry and nothing ever queues.
+    // With an ASYNC cache the sub-ops return PENDING and phase_ stays AMO_READ across ticks — a second
+    // AMO arriving then overwrote phase_/orig_/scratch_/amo_addr_ and the two RMWs completed into each
+    // other's result buffers (load-store_M16 reported `exp 0x3 got 0x2` plus its mirror image). Requests
+    // that arrive on a busy lane are therefore parked here and re-issued when the lane frees, which is
+    // also what the hardware does with core_ready.
     enum Phase { IDLE, AMO_READ, AMO_WRITE, SC_WRITE };
     Phase    phase_ = IDLE;
+    std::deque<vp::IoReq*> park_q_;
     // Synchronous-slave cache (cachepool run_request_sync): the sub-read/sub-write to the core complete
     // in-call (req returns IO_REQ_OK, not PENDING), so the whole RMW/SC resolves INSIDE req_handler. In that
     // case the shim must return IO_REQ_OK (the result is already written into the upstream req's data) and
@@ -126,6 +139,36 @@ InsituCacheAmo::InsituCacheAmo(vp::ComponentConf &conf) : vp::Component(conf)
 vp::IoReqStatus InsituCacheAmo::req_handler(vp::Block *__this, vp::IoReq *req)
 {
     InsituCacheAmo *_this = static_cast<InsituCacheAmo *>(__this);
+    // Lane busy with an RMW: only ANOTHER ATOMIC has to wait. It is the one that would overwrite
+    // phase_/orig_/scratch_/amo_addr_ and make the two RMWs complete into each other's result buffers.
+    // Plain READ/WRITE never touch that state, so they proceed as before — and B3's occupancy stamp in
+    // handle() already models the lane being held by the RMW, so parking them here as well would charge
+    // that same wait twice. Keeping the gate this narrow also keeps it off the calibrated path's neck:
+    // the cell coalescer below the shim answers PENDING by design even when the cache itself is a
+    // synchronous slave, so phase_ can stay non-IDLE across a call in v1 too.
+    if (_this->phase_ != IDLE) {
+        const vp::IoReqOpcode bop = req->get_opcode();
+        if (bop != vp::READ && bop != vp::WRITE) {
+            _this->park_q_.push_back(req);
+            return vp::IO_REQ_PENDING;
+        }
+    }
+    return handle(_this, req);
+}
+
+// Drain parked requests once the lane is idle. We already answered PENDING upstream, so a request that
+// now resolves synchronously (OK) is ours to resp(); a PENDING one is completed by the normal path.
+void InsituCacheAmo::drain_park(InsituCacheAmo *_this)
+{
+    while (_this->phase_ == IDLE && !_this->park_q_.empty()) {
+        vp::IoReq *r = _this->park_q_.front();
+        _this->park_q_.pop_front();
+        if (handle(_this, r) == vp::IO_REQ_OK) r->get_resp_port()->resp(r);
+    }
+}
+
+vp::IoReqStatus InsituCacheAmo::handle(InsituCacheAmo *_this, vp::IoReq *req)
+{
     const vp::IoReqOpcode op = req->get_opcode();
     const uint64_t addr = req->get_addr();
     const uint32_t core = (uint32_t)req->get_initiator();
@@ -248,6 +291,9 @@ void InsituCacheAmo::resp_handler(vp::Block *__this, vp::IoReq *req)
         _this->sync_completed_ = true;
     } else if (orig != nullptr) {
         orig->get_resp_port()->resp(orig);
+        // Lane is idle again — let whatever queued behind this RMW through (async path only; on the
+        // sync path nothing can be parked because phase_ never stays non-IDLE across a call).
+        drain_park(_this);
     }
 }
 

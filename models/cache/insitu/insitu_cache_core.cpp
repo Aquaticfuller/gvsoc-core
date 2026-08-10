@@ -58,6 +58,7 @@ private:
     static vp::IoReqStatus flush_req_handler(vp::Block *__this, vp::IoReq *req);
     static vp::IoReqStatus config_handler(vp::Block *__this, vp::IoReq *req);   // E3
     static void refill_resp_handler(vp::Block *__this, vp::IoReq *req);
+    static void evict_resp_handler(vp::Block *__this, vp::IoReq *req);
     static void tick(vp::Block *__this, vp::ClockEvent *event);
 
     void schedule_tick(int64_t cycles = 1);
@@ -88,6 +89,8 @@ private:
         uint8_t *line = &data_[((size_t)set * num_ways_ + (uint32_t)way) * cache_line_bytes_ + off];
         if (line_to_req) memcpy(req->get_data(), line, n);
         else             memcpy(line, req->get_data(), n);
+        dbg_ev(line_to_req ? "serve-rd" : "serve-wr", l2_addr(req->get_addr()), n,
+               (const uint8_t *)req->get_data());
     }
     void functional_write_mem(vp::IoReq *user_req) {
         if (!functional_writethrough_ || !evict_itf_.is_bound() || user_req->get_data() == nullptr) return;
@@ -103,6 +106,21 @@ private:
     // Inverse of the tile xbar's MSB rotation (route.hpp::rotate_addr — E1). The bank's tags/sets live
     // in ROTATED address space, so every L2-side egress (refill, dirty writeback, functional WT, and
     // the bypass fallback) must unrotate back to the global address before hitting the NoC.
+    // TEMP async bring-up instrumentation: INSITU_WATCH=0x<addr> traces one cache line end-to-end.
+    static uint64_t dbg_watch() {
+        static uint64_t v = [](){ const char *e = getenv("INSITU_WATCH");
+                                  return e ? strtoull(e, nullptr, 0) : 0ULL; }();
+        return v;
+    }
+    void dbg_ev(const char *tag, uint64_t l2a, uint32_t size, const uint8_t *d) {
+        const uint64_t w = dbg_watch();
+        if (!w || (l2a >> 6) != (w >> 6)) return;
+        uint32_t v = 0; if (d) memcpy(&v, d, size < 4 ? size : 4);
+        fprintf(stderr, "[WATCH %-8s] %s cyc=%ld l2a=0x%lx rot=%u sz=%u val=0x%x bank=%s\n", tag,
+                inline_sync_ ? "sync " : "async", (long)clock.get_cycles(),
+                (unsigned long)l2a, rotate_bits_, size, v, this->get_path().c_str());
+    }
+
     // rotate_bits_=0 (rotation disabled / N=0 bank) → identity.
     uint64_t l2_addr(uint64_t a) const {
         return rotate_bits_ ? rotate_geom_.unrotate_addr(a, rotate_bits_) : a;
@@ -183,7 +201,16 @@ private:
     // output FIFOs (structural, capacity-bounded)
     std::deque<vp::IoReq*> resp_fifo_;            // completed reads/writes to resp() (retr+resp merged)
     std::deque<uint64_t>   miss_fifo_;            // line addrs needing a refill
-    std::deque<uint64_t>   evic_fifo_;            // dirty line addrs to write back
+    // Async writeback queue. The dirty line's BYTES are snapshotted at eviction time: queuing only the
+    // address and handing evict_data_buf_ to the drain sent whatever that shared buffer last held — and
+    // on this path nothing ever fills it (only the sync-miss and flush paths do), so every async
+    // writeback wrote 64 bytes of ZEROS over L2. A later refill of the same line then read those zeros
+    // back, which is how fdotp's dotp_l.M turned from 0x2000 into 0 mid-run: the kernel then computed
+    // elem_per_core = 0, did no work, and still "passed" by verifying zeros against zeros.
+    struct EvictEnt { uint64_t addr; std::vector<uint8_t> data; };
+    std::deque<EvictEnt>   evic_fifo_;            // dirty lines to write back (addr + bytes)
+    std::vector<uint8_t>   evict_wb_buf_;         // bytes of the writeback currently in flight
+    bool                   evict_wb_pending_ = false;   // async L2: one writeback in flight at a time
     uint32_t retr_level_ = 0;
 
     // single-outstanding refill
@@ -301,6 +328,7 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
     new_slave_port("config", &config_itf_);
     refill_itf_.set_resp_meth(&InsituCacheCore::refill_resp_handler);
     new_master_port("refill", &refill_itf_);
+    evict_itf_.set_resp_meth(&InsituCacheCore::evict_resp_handler);
     new_master_port("evict", &evict_itf_);
 
     tick_event_ = event_new(&InsituCacheCore::tick);
@@ -316,7 +344,7 @@ void InsituCacheCore::reset(bool active)
     for (uint32_t s = 0; s < num_sets_; s++)
         for (uint32_t w = 0; w < num_ways_; w++) meta_[(size_t)s*num_ways_+w].lru = w;
     for (auto &q : mshr_) q.clear();
-    resp_fifo_.clear(); miss_fifo_.clear(); evic_fifo_.clear();
+    resp_fifo_.clear(); miss_fifo_.clear(); evic_fifo_.clear(); evict_wb_pending_ = false;
     in_q_.clear(); preread_q_ = PrereadTask{};
     refill_pending_ = refill_spill_valid_ = false; refill_ready_cycle_ = -1; retr_level_ = 0;
 }
@@ -338,17 +366,27 @@ vp::IoReqStatus InsituCacheCore::req_handler(vp::Block *__this, vp::IoReq *req)
 {
     InsituCacheCore *_this = static_cast<InsituCacheCore *>(__this);
     // Synchronous-slave (closed-loop): resolve in-call, return IO_REQ_OK — never PENDING/DENIED, never
-    // resp()/save() (the Spatz VLSU rejects async). The async path below is the open-loop calib path.
+    // resp() (the calibrated, deployed path). The async path below returns PENDING and resp()s later.
     if (_this->inline_sync_) return _this->run_request_sync(req);
+    //
+    // NO req->save() here, deliberately. save() arg_push'es 4 slots at `current_arg`, and for a request
+    // coming from the scalar LSU `current_arg` is 0 — but the LSU keeps its request id in ABSOLUTE slot 0
+    // (`req_id = *((int *)req->arg_get(0))`, iss/src/lsu.cpp), which arg_get() reads without any
+    // current_arg offset. save() therefore overwrites the id with the address, and restore() only pops
+    // the stack depth back — it never repairs the slot's contents. The LSU then dispatches
+    // stall_callback[req_id] on the wrong outstanding access: register writebacks get swapped between
+    // two in-flight loads (seen as `exp 0x3 got 0x2` + the mirror image in load-store_M16), and on a
+    // VLSU port the aliased index segfaulted in AraVlsu::data_response.
+    //
+    // We do not need it anyway: the core never mutates addr/size/data/is_write on a parked request (it
+    // keeps its own copies in preread_q_/mshr_), so there is nothing to save and restore.
     if (_this->in_q_.size() >= _this->in_q_cap_) {
         // Accept queue full: park the request (PENDING) and re-admit it as space frees (stage0_arbitrate).
         // Never DENY + drop — an async-capable master would wait forever for a resp() that never comes.
-        req->save();
         _this->admission_stall_q_.push_back(req);
         _this->schedule_tick();
         return vp::IO_REQ_PENDING;
     }
-    req->save();
     _this->in_q_.push_back(req);
     _this->schedule_tick();
     return vp::IO_REQ_PENDING;
@@ -786,7 +824,11 @@ bool InsituCacheCore::process_request(vp::IoReq *req)
         }
         uint64_t old_line = ((uint64_t)vline.tag << (geom_.off_bits + geom_.depth_bits)) |
                             ((uint64_t)set << geom_.off_bits);
-        evic_fifo_.push_back(old_line);
+        EvictEnt ent;
+        ent.addr = old_line;
+        const uint8_t *src = &data_[((size_t)set * num_ways_ + vw) * cache_line_bytes_];
+        ent.data.assign(src, src + cache_line_bytes_);   // snapshot BEFORE the refill overwrites the way
+        evic_fifo_.push_back(std::move(ent));
         cnt_evict_++;
     }
     CacheStatus before = vline.status;
@@ -816,8 +858,13 @@ void InsituCacheCore::install_refill()
     if (way < 0) return;  // already installed/flushed
 
     // install the fetched bytes
-    if (refill_req_.get_data() != nullptr)
+    if (refill_req_.get_data() != nullptr) {
         memcpy(&data_[((size_t)set*num_ways_+(uint32_t)way)*cache_line_bytes_], refill_req_.get_data(), cache_line_bytes_);
+        const uint64_t l2line = l2_addr(addr);
+        if (dbg_watch() && (l2line >> 6) == (dbg_watch() >> 6))
+            dbg_ev("refill", l2line + (dbg_watch() & 63), 4,
+                   refill_req_.get_data() + (dbg_watch() & 63));
+    }
     bank_.commit_write(clock.get_cycles(), (uint32_t)way, set);
 
     CacheStatus before = ways[way].status;
@@ -846,6 +893,15 @@ void InsituCacheCore::drain_outputs()
     // one completed access resp() per tick
     if (!resp_fifo_.empty()) {
         vp::IoReq *r = resp_fifo_.front(); resp_fifo_.pop_front();
+        // The request's arg stack is untouched by us (see req_handler) — the requester's own arguments
+        // are still on top, exactly where its resp callback expects them.
+        //
+        // Hand back the address the requester issued: the xbar rotates on the way in, and l2_addr() is
+        // the same inverse applied on every L2 egress (identity when rotate_bits_==0). The synchronous
+        // path gets this from the xbar instead, which can only un-rotate on an OK return. It matters
+        // downstream: the L1 NoC's network interface re-derives routing from req->get_addr(), and a
+        // rotated address parks the routing bits in the MSBs, outside every mapped window.
+        r->set_addr(l2_addr(r->get_addr()));
         r->get_resp_port()->resp(r);
     }
     // one refill issue per tick, single-outstanding: gate on refill_pending_ (async in flight),
@@ -873,14 +929,15 @@ void InsituCacheCore::drain_outputs()
         }
     }
     // one eviction issue per tick
-    if (!evic_fifo_.empty()) {
-        uint64_t line = evic_fifo_.front(); evic_fifo_.pop_front();
+    if (!evict_wb_pending_ && !evic_fifo_.empty()) {
+        EvictEnt ent = std::move(evic_fifo_.front()); evic_fifo_.pop_front();
+        evict_wb_buf_ = std::move(ent.data);   // must outlive the request when L2 answers PENDING
         evict_req_.init();
-        evict_req_.set_addr(l2_addr(line));
+        evict_req_.set_addr(l2_addr(ent.addr));
         evict_req_.set_size(cache_line_bytes_);
         evict_req_.set_is_write(true);
-        evict_req_.set_data(evict_data_buf_.data());
-        (void)evict_itf_.req(&evict_req_);
+        evict_req_.set_data(evict_wb_buf_.data());
+        if (evict_itf_.req(&evict_req_) == vp::IO_REQ_PENDING) evict_wb_pending_ = true;
     }
 }
 
@@ -888,7 +945,7 @@ void InsituCacheCore::stage0_arbitrate()
 {
     if (preread_q_.valid) return;   // stage-1 still holds a latched/stalled request
     // (refill install is handled separately in maybe_install_refill — it does not use preread_q_.)
-    // Re-admit parked requests as accept-queue space frees (they are already save()d).
+    // Re-admit parked requests as accept-queue space frees.
     while (!admission_stall_q_.empty() && in_q_.size() < in_q_cap_) {
         in_q_.push_back(admission_stall_q_.front());
         admission_stall_q_.pop_front();
@@ -898,6 +955,16 @@ void InsituCacheCore::stage0_arbitrate()
         preread_q_.valid = true; preread_q_.is_refill = false; preread_q_.req = r;
         preread_q_.addr = r->get_addr(); preread_q_.is_write = r->get_is_write();
     }
+}
+
+// A writeback completed. Only evict_req_ is tracked — the flush path reuses evict_req_ synchronously and
+// funcwr_req_ (functional write-through) also rides this port, so ignore anything that is not ours.
+void InsituCacheCore::evict_resp_handler(vp::Block *__this, vp::IoReq *req)
+{
+    InsituCacheCore *_this = static_cast<InsituCacheCore *>(__this);
+    if (req != &_this->evict_req_) return;
+    _this->evict_wb_pending_ = false;
+    _this->schedule_tick();
 }
 
 void InsituCacheCore::refill_resp_handler(vp::Block *__this, vp::IoReq *req)
