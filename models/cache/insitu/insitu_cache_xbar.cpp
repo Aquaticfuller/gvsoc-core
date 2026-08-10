@@ -138,16 +138,28 @@ vp::IoReqStatus InsituCacheXbar::req_handler(vp::Block *__this, vp::IoReq *req, 
     if (_this->forward_initiator_) req->set_initiator(input_id);
     if (_this->xbar_latency_cycles_ > 0) req->inc_latency(_this->xbar_latency_cycles_);
 
-    // MSB address rotation toward a LOCAL bank (hide the routing bits from tag/index). Off in Phase A1.
-    // When enabled, the matching refill un-rotation must run on the tile's refill egress.
+    // MSB address rotation toward a LOCAL bank (hide the routing bits from tag/index) — the bank's
+    // tags/sets live in rotated space and every L2 egress un-rotates via the core's l2_addr().
+    bool rotated = false;
     if (_this->enable_rotation_ && r.local && out_id < _this->num_cache_) {
         const uint32_t n = _this->geom_.bits_to_rotate(out_id, _this->num_private_cache_);
         req->set_addr(_this->geom_.rotate_addr(addr, n));
+        rotated = true;
     }
 
     _this->trace_.msg(vp::Trace::LEVEL_TRACE, "route in=%d addr=0x%lx -> out=%u local=%d\n",
                       input_id, (unsigned long)addr, out_id, (int)r.local);
-    return _this->outputs_[out_id]->req_forward(req);
+    vp::IoReqStatus st = _this->outputs_[out_id]->req_forward(req);
+
+    // Restore the caller's address once the bank has resolved the access. Rotation is an INTERNAL
+    // representation: mutating the request in place is invisible in a single group, but with the L1
+    // NoC in the path the network interface still owns that in-flight burst and re-derives routing
+    // from req->get_addr() — a rotated address (routing bits parked in the MSBs, e.g. 0x80003a80
+    // becoming 0xa8003800) then falls outside every mapped window, so the response never gets home
+    // and the NI's single pending-burst slot wedges. Only meaningful for the synchronous-slave path
+    // (the deployed one); an async cache would have to restore at response time instead.
+    if (rotated && st == vp::IO_REQ_OK) req->set_addr(addr);
+    return st;
 }
 
 extern "C" vp::Component *gv_new(vp::ComponentConf &config)
