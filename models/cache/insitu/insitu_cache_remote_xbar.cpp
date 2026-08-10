@@ -119,7 +119,11 @@ vp::IoReqStatus InsituCacheRemoteXbar::req_handler(vp::Block *__this, vp::IoReq 
     const uint32_t tgt_group = target / _this->tiles_per_group_;
     uint32_t out;
     if (_this->num_groups_ > 1 && tgt_group != _this->group_id_) {
-        out = _this->n_local_slots_ + (source % _this->nrpc_);          // → L1 NoC
+        // ONE egress port per port class toward the L1 NoC. The NI is a single injection point with
+        // one pending read burst and one pending write burst; giving it two masters (source%nrpc)
+        // doubles the contention on that single slot for no modelled benefit, and deviates from the
+        // arrangement proven at 256 cores in v2 (exactly one master per NI input).
+        out = _this->n_local_slots_;                                     // → L1 NoC
     } else {
         const uint32_t local_tile = target % _this->tiles_per_group_;
         out = local_tile * _this->nrpc_ + (source % _this->nrpc_);
