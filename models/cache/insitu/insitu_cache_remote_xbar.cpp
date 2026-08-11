@@ -38,6 +38,11 @@ private:
     RouteGeom geom_;
     uint32_t  num_tiles_, nrpc_, n_slots_;
     uint32_t  num_groups_ = 1, tiles_per_group_ = 1, group_id_ = 0, n_local_slots_ = 0;
+    // L1-NoC tunnel: an off-group request is re-addressed to base + tgt_group*stride + addr so the
+    // mesh routes on the destination WE computed from the current runtime geometry, rather than
+    // re-decoding the address against a map fixed at elaboration time. The NoC map strips it again
+    // via remove_offset, so the destination tile sees the original address.
+    uint64_t  noc_tunnel_base_ = 0, noc_tunnel_stride_ = 0;
     int32_t   hop_latency_cycles_;
     std::vector<vp::IoSlave *>  inputs_;
     std::vector<vp::IoMaster *> outputs_;
@@ -61,6 +66,11 @@ InsituCacheRemoteXbar::InsituCacheRemoteXbar(vp::ComponentConf &conf) : vp::Comp
     if (nrpc_ < 1) nrpc_ = 1;
     n_slots_            = num_tiles_ * nrpc_;    // NumInp = NumOut = NumTiles * NumRemotePortCore
     hop_latency_cycles_ = cfg->get_child_int("hop_latency_cycles");
+    // 64-bit reads: the tunnel windows live above 4 GiB, so get_child_int would truncate.
+    noc_tunnel_base_   = cfg->get("noc_tunnel_base")
+        ? (uint64_t)cfg->get("noc_tunnel_base")->get_int() : 0;
+    noc_tunnel_stride_ = cfg->get("noc_tunnel_stride")
+        ? (uint64_t)cfg->get("noc_tunnel_stride")->get_int() : 0;
 
     geom_.init(/*n_cache*/cfg->get_child_int("num_cache"), /*n_remote*/nrpc_,
                /*n_cores*/cfg->get_child_int("num_cores"), /*n_tiles*/num_tiles_,
@@ -125,6 +135,10 @@ vp::IoReqStatus InsituCacheRemoteXbar::req_handler(vp::Block *__this, vp::IoReq 
         // doubles the contention on that single slot for no modelled benefit, and deviates from the
         // arrangement proven at 256 cores in v2 (exactly one master per NI input).
         out = _this->n_local_slots_;                                     // → L1 NoC
+        if (_this->noc_tunnel_stride_ != 0) {
+            req->set_addr(_this->noc_tunnel_base_
+                          + (uint64_t)tgt_group * _this->noc_tunnel_stride_ + req->get_addr());
+        }
     } else {
         const uint32_t local_tile = target % _this->tiles_per_group_;
         out = local_tile * _this->nrpc_ + (source % _this->nrpc_);

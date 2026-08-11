@@ -19,6 +19,15 @@ from __future__ import annotations
 
 from gvsoc.systree import Component, SlaveItf
 
+# L1-NoC tunnel: off-group requests are re-addressed to `NOC_TUNNEL_BASE + group * NOC_TUNNEL_STRIDE
+# + addr` so the mesh routes on the destination the crossbar computed with the CURRENT runtime
+# geometry, instead of re-decoding the address with a map fixed at elaboration time (the interleaving
+# granularity is runtime-programmable via XBAR_OFFSET). The NoC map strips the tunnel again with
+# remove_offset, so the destination sees the untouched address. A full 32-bit space per group, above
+# 4 GiB where nothing else lives. The cluster imports these so both sides cannot drift.
+NOC_TUNNEL_BASE = 1 << 32
+NOC_TUNNEL_STRIDE = 1 << 32
+
 
 class InsituCacheRemoteXbar(Component):
     """One per-port-class inter-tile router: route by target tile-id."""
@@ -26,7 +35,9 @@ class InsituCacheRemoteXbar(Component):
     def __init__(self, parent: Component, name: str, *,
                  num_tiles: int, num_cores: int, num_cache: int, num_remote_port_core: int = 1,
                  dynamic_offset: int = 6, addr_width: int = 32, hop_latency_cycles: int = 0,
-                 num_groups: int = 1, tiles_per_group: int = 0, group_id: int = 0):
+                 num_groups: int = 1, tiles_per_group: int = 0, group_id: int = 0,
+                 noc_tunnel_base: int = NOC_TUNNEL_BASE,
+                 noc_tunnel_stride: int = NOC_TUNNEL_STRIDE):
         super().__init__(parent, name)
         self.add_sources(['cache/insitu/insitu_cache_remote_xbar.cpp'])
         self.add_properties({
@@ -42,6 +53,8 @@ class InsituCacheRemoteXbar(Component):
             'num_groups': num_groups,
             'tiles_per_group': tiles_per_group if tiles_per_group else num_tiles,
             'group_id': group_id,
+            'noc_tunnel_base': noc_tunnel_base,
+            'noc_tunnel_stride': noc_tunnel_stride,
         })
 
     def i_NOC_IN(self, slot: int) -> SlaveItf:
