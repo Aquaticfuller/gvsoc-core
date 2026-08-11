@@ -89,6 +89,7 @@ void AraVlsu::data_response(vp::Block *__this, vp::IoReq *req)
     AraVlsuPendingInsn *slot = (AraVlsuPendingInsn *)req->arg_pop();
     _this->req_queues[port_id]->push_back(req);
     slot->nb_pending_bursts--;
+    if (!_this->in_delayed_drain && _this->nb_unfilled_bursts > 0) _this->nb_unfilled_bursts--;
     // Only now, once the data has actually landed, tell the scoreboard the elements are
     // committed. Committing at issue time (as used to happen) is only safe when the
     // interconnect completes synchronously; CachePool's NUMA/cache paths routinely return
@@ -246,7 +247,9 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     while (!_this->delayed_bursts.empty() &&
            _this->delayed_bursts_timestamps.front() <= _this->ara.iss.top.clock.get_cycles())
     {
+        _this->in_delayed_drain = true;
         data_response(_this, _this->delayed_bursts.front());
+        _this->in_delayed_drain = false;
         _this->delayed_bursts.pop();
         _this->delayed_bursts_timestamps.pop();
     }
@@ -276,7 +279,7 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         PendingInsn *pending_insn = slot.insn;
 
         if (pending_insn->timestamp <=_this->ara.iss.top.clock.get_cycles() &&
-            _this->pending_size == 0)
+            _this->pending_size == 0 && _this->nb_unfilled_bursts == 0)
         {
             _this->event_label.event_string(pending_insn->insn->desc->label, false);
             _this->event_pc.event((uint8_t *)&pending_insn->pc);
@@ -385,6 +388,7 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                     // Async: data_response callback will push req back and decrement
                     // nb_pending_bursts once the response arrives from the interconnect.
                     slot.nb_pending_bursts++;
+                    _this->nb_unfilled_bursts++;   // data not in the vreg yet
                 }
                 else if (err == vp::IO_REQ_DENIED)
                 {
@@ -395,6 +399,7 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                     // The synchronous Router does not propagate grants so we don't
                     // rely on a grant callback; the response will close the burst.
                     slot.nb_pending_bursts++;
+                    _this->nb_unfilled_bursts++;   // data not in the vreg yet
                 }
                 else
                 {

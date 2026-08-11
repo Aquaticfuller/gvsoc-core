@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <vector>
 #include <deque>
+#include <unordered_map>
 #include <cstring>
 
 #include <vp/vp.hpp>
@@ -91,6 +92,7 @@ private:
         else             memcpy(line, req->get_data(), n);
         dbg_ev(line_to_req ? "serve-rd" : "serve-wr", l2_addr(req->get_addr()), n,
                (const uint8_t *)req->get_data());
+        shadow_check(req, line_to_req, n);
     }
     void functional_write_mem(vp::IoReq *user_req) {
         if (!functional_writethrough_ || !evict_itf_.is_bound() || user_req->get_data() == nullptr) return;
@@ -106,6 +108,42 @@ private:
     // Inverse of the tile xbar's MSB rotation (route.hpp::rotate_addr — E1). The bank's tags/sets live
     // in ROTATED address space, so every L2-side egress (refill, dirty writeback, functional WT, and
     // the bypass fallback) must unrotate back to the global address before hitting the NoC.
+    // INSITU_SHADOW=1: a per-bank shadow of the last value written to each 4-byte word, checked on
+    // every read serve. Any word this bank served differently from what was last written THROUGH it is
+    // a lost or stale store — which is exactly the failure shape of the async vector-stress mismatch
+    // (the test rewrites the same pattern every pass, so reordering is idempotent and only a dropped
+    // store can be observed). Words never written through this bank (loader-initialised data) are not
+    // in the map and are skipped, so the check cannot fire spuriously.
+    static bool shadow_on() {
+        static const bool v = [](){ const char *e = getenv("INSITU_SHADOW"); return e && e[0] != '0'; }();
+        return v;
+    }
+    std::unordered_map<uint64_t, uint32_t> shadow_;
+    void shadow_check(vp::IoReq *req, bool line_to_req, uint32_t nbytes)
+    {
+        if (!shadow_on() || req->get_data() == nullptr) return;
+        const uint64_t base = l2_addr(req->get_addr());
+        const uint8_t *d = (const uint8_t *)req->get_data();
+        for (uint32_t off = 0; off + 4 <= nbytes; off += 4) {
+            uint32_t v; memcpy(&v, d + off, 4);
+            const uint64_t a = base + off;
+            if (line_to_req) {
+                auto it = shadow_.find(a);
+                if (it != shadow_.end() && it->second != v) {
+                    static int budget = 30;
+                    if (budget > 0) {
+                        budget--;
+                        fprintf(stderr, "[SHADOW-MISMATCH %s] cyc=%ld addr=0x%lx served=0x%x last_written=0x%x\n",
+                                this->get_path().c_str(), (long)clock.get_cycles(),
+                                (unsigned long)a, v, it->second);
+                    }
+                }
+            } else {
+                shadow_[a] = v;
+            }
+        }
+    }
+
     // TEMP async bring-up instrumentation: INSITU_WATCH=0x<addr> traces one cache line end-to-end.
     static uint64_t dbg_watch() {
         static uint64_t v = [](){ const char *e = getenv("INSITU_WATCH");
@@ -186,6 +224,17 @@ private:
     // returns IO_REQ_DENIED.
     std::deque<vp::IoReq*> in_q_;
     uint32_t in_q_cap_ = 32;   // ~NumSpatzOutstandingLoads
+
+    // INSITU_INORDER_RESP=1: respond strictly in admission order. resp_fifo_ normally completes a hit
+    // immediately while an earlier miss is still parked in the MSHR, so a port can see its responses
+    // out of order — impossible on the synchronous path, where every access resolves in its own call.
+    // A/B knob for whether the requester (Spatz VLSU) tolerates that.
+    static bool inorder_resp() {
+        static const bool v = [](){ const char *e = getenv("INSITU_INORDER_RESP"); return e && e[0] != '0'; }();
+        return v;
+    }
+    std::unordered_map<vp::IoReq *, uint64_t> seq_;
+    uint64_t seq_next_ = 0, seq_expected_ = 0;
     // Admission stall queue: requests that arrived while in_q_ was full. They are parked (PENDING, never
     // dropped) and re-admitted as space frees — required for async-capable masters (the updated Spatz VLSU
     // treats PENDING/DENIED as async and waits for a resp(); a DENIED + dropped request would hang it).
@@ -380,6 +429,7 @@ vp::IoReqStatus InsituCacheCore::req_handler(vp::Block *__this, vp::IoReq *req)
     //
     // We do not need it anyway: the core never mutates addr/size/data/is_write on a parked request (it
     // keeps its own copies in preread_q_/mshr_), so there is nothing to save and restore.
+    if (inorder_resp()) _this->seq_[req] = _this->seq_next_++;
     if (_this->in_q_.size() >= _this->in_q_cap_) {
         // Accept queue full: park the request (PENDING) and re-admit it as space frees (stage0_arbitrate).
         // Never DENY + drop — an async-capable master would wait forever for a resp() that never comes.
@@ -892,7 +942,20 @@ void InsituCacheCore::drain_outputs()
 {
     // one completed access resp() per tick
     if (!resp_fifo_.empty()) {
-        vp::IoReq *r = resp_fifo_.front(); resp_fifo_.pop_front();
+        vp::IoReq *r = nullptr;
+        if (inorder_resp()) {
+            // only the next request in admission order may leave
+            for (auto it = resp_fifo_.begin(); it != resp_fifo_.end(); ++it) {
+                auto s = seq_.find(*it);
+                if (s != seq_.end() && s->second == seq_expected_) {
+                    r = *it; resp_fifo_.erase(it); seq_.erase(s); seq_expected_++;
+                    break;
+                }
+            }
+            if (r == nullptr) { schedule_tick(); return; }   // head not ready yet
+        } else {
+            r = resp_fifo_.front(); resp_fifo_.pop_front();
+        }
         // The request's arg stack is untouched by us (see req_handler) — the requester's own arguments
         // are still on top, exactly where its resp callback expects them.
         //

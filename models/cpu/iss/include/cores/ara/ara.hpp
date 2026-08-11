@@ -200,6 +200,19 @@ private:
     // cache latency instead of committing at issue. Mirrors the Ara variant's members.
     std::queue<vp::IoReq *> delayed_bursts;
     std::queue<int64_t> delayed_bursts_timestamps;
+    // Bursts whose DATA has not landed yet (the interconnect answered IO_REQ_PENDING/DENIED).
+    // Distinct from delayed_bursts: those completed synchronously with a latency, so their data is
+    // already in the vector register and only the commit is deferred. Used to stop the VLSU starting
+    // the next vector memory instruction while an earlier one's elements are still missing --
+    // `pending_size == 0` only means every burst was ISSUED, not that any of it arrived, and
+    // insn_commit() is called per burst, so a dependent instruction could otherwise read a
+    // partially-written register. That is how the async cache path silently produced a handful of
+    // stale words per core in cache-test-vector's stress phase while the cache itself stayed
+    // perfectly self-consistent. Always 0 on the synchronous path, so it costs nothing there.
+    int nb_unfilled_bursts = 0;
+    // True while fsm_handler drains delayed_bursts through data_response, so that path does not
+    // decrement the counter it never incremented.
+    bool in_delayed_drain = false;
 };
 
 #else
@@ -286,6 +299,8 @@ private:
     vp::Register<uint8_t> nb_pending_insn;
     // Number of instructions waiting to be started
     int nb_waiting_insn;
+
+
 };
 
 #endif
