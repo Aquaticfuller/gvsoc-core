@@ -114,6 +114,13 @@ class InsituCacheControllerConfig(Config):
     # models no arbitration at all.
     per_bank_l2_ports: bool = False
 
+    # v3-P3: the group provides an L2 instruction cache. The tiles' L1 I$ refills are
+    # aggregated 4->1 into it, and its own refill becomes the STRICT-PRIORITY input of the
+    # group's wide refill mux (16 bank ports + 1 instruction port = 17).
+    group_l2_icache: bool = False
+    group_l2_icache_size: int = 8192      # bytes
+    group_l2_icache_ways: int = 4
+
     functional_writethrough: bool = cfg_field(default=False, dump=True, desc=(
         "FUNCTIONAL coherence only (not a timing knob). When true, every write also pushes "
         "its real bytes straight to the backing memory (bypassing the coalescer, which carries "
