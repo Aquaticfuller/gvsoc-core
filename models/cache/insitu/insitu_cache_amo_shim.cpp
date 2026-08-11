@@ -134,6 +134,13 @@ private:
     // stamping the wait on arrivals. With an async cache the stamp is discarded by the requester, so
     // only real blocking reproduces the RTL's core_ready=0 behaviour.
     bool     structural_occupancy_ = false;
+    // With structural occupancy the lane is held for an ABSOLUTE window measured from RMW accept,
+    // modelling the RTL's core_ready=0 span (spatz_cache_amo.sv, ~15-20 cycles on a hit). It must not
+    // be additive: the sub-read and sub-write already consume real simulated time on the async path
+    // (about 10 cycles each once resp_latency_cycles is calibrated), so adding a further tail on top
+    // charged ~28 cycles per RMW and over-predicted spin-lock by 19.8%.
+    int32_t  rmw_window_cycles_ = 18;
+    int64_t  rmw_start_cyc_ = 0;
     vp::ClockEvent occ_event_;
     int64_t  rmw_busy_until_ = 0;
     int64_t  rmw_read_lat_ = 0;   // the scratch read's latency (captured before scratch_ re-init)
@@ -159,6 +166,11 @@ InsituCacheAmo::InsituCacheAmo(vp::ComponentConf &conf)
 
     structural_occupancy_ = cfg->get("structural_occupancy")
         ? cfg->get_child_bool("structural_occupancy") : false;
+    if (cfg->get("amo_rmw_window_cycles")) {
+        const int32_t w = cfg->get_child_int("amo_rmw_window_cycles");
+        if (w >= 0) rmw_window_cycles_ = w;
+    }
+    if (const char *e = getenv("INSITU_AMO_WINDOW")) rmw_window_cycles_ = atoi(e);
 
     input_.set_req_meth(&InsituCacheAmo::req_handler);
     this->new_slave_port("input", &input_);
@@ -261,6 +273,7 @@ vp::IoReqStatus InsituCacheAmo::handle(InsituCacheAmo *_this, vp::IoReq *req, bo
             return vp::IO_REQ_OK;   // SC fail: no memory write, synchronous response (data=1)
         }
         // success: write the store to the core, then return 0 on the write-back response.
+        _this->rmw_start_cyc_ = _this->clock.get_cycles();
         _this->phase_ = SC_WRITE;
         _this->orig_  = req;
         _this->scratch_.init();
@@ -277,6 +290,7 @@ vp::IoReqStatus InsituCacheAmo::handle(InsituCacheAmo *_this, vp::IoReq *req, bo
 
     // --- true AMO: read-modify-write ---
     if (_this->dbg_watch_addr_ == 0) _this->dbg_watch_addr_ = addr;   // first atomic seen = the lock
+    _this->rmw_start_cyc_ = _this->clock.get_cycles();
     _this->phase_   = AMO_READ;
     _this->orig_    = req;
     _this->amo_op_  = opcode_to_amo(op);
@@ -355,12 +369,20 @@ void InsituCacheAmo::resp_handler(vp::Block *__this, vp::IoReq *req)
         // RTL's "full refill time on a miss". SC has no separate read: write + RTT. The window
         // CHAINS: it starts after the previous RMW's window (the wait stamped at entry) — setting
         // busy = now + total would let overlapping windows shrink the serialization.
-        const int64_t total = (_this->rmw_read_lat_ > 0)
-            ? (_this->rmw_read_lat_ + 1 + _this->scratch_.get_full_latency())
-            : (_this->scratch_.get_full_latency() + _this->rmw_write_rtt_cycles_);
-        orig->inc_latency(total);
         const int64_t now = _this->clock.get_cycles();
-        _this->rmw_busy_until_ = (_this->rmw_busy_until_ > now ? _this->rmw_busy_until_ : now) + total;
+        if (_this->structural_occupancy_) {
+            // The requester already lived through the RMW in real time, so no stamp (it would be
+            // discarded anyway). Hold the lane out to the absolute end of the RTL's core_ready window,
+            // measured from accept — never beyond it, and never a moment less.
+            const int64_t end = _this->rmw_start_cyc_ + _this->rmw_window_cycles_;
+            _this->rmw_busy_until_ = (end > now) ? end : now;
+        } else {
+            const int64_t total = (_this->rmw_read_lat_ > 0)
+                ? (_this->rmw_read_lat_ + 1 + _this->scratch_.get_full_latency())
+                : (_this->scratch_.get_full_latency() + _this->rmw_write_rtt_cycles_);
+            orig->inc_latency(total);
+            _this->rmw_busy_until_ = (_this->rmw_busy_until_ > now ? _this->rmw_busy_until_ : now) + total;
+        }
         _this->rmw_read_lat_ = 0;
         _this->n_rmw_++; _this->lat_rmw_sum_ += (uint64_t)orig->get_full_latency();
     }
