@@ -22,6 +22,7 @@
 // inactive when num_tiles==1 (route_request always returns local).
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -149,6 +150,23 @@ vp::IoReqStatus InsituCacheXbar::req_handler(vp::Block *__this, vp::IoReq *req, 
 
     _this->trace_.msg(vp::Trace::LEVEL_TRACE, "route in=%d addr=0x%lx -> out=%u local=%d\n",
                       input_id, (unsigned long)addr, out_id, (int)r.local);
+    // INSITU_XBAR_DEBUG=N: budgeted stderr trace of the routing decision (the message above is
+    // LEVEL_TRACE, which plain --trace does not emit). N is the number of lines to print, so a late
+    // loop can be captured by asking for enough of them.
+    {
+        static const int dbg = [](){ const char *e = getenv("INSITU_XBAR_DEBUG"); return e ? atoi(e) : 0; }();
+        static int budget = dbg;
+        if (dbg && budget > 0) {
+            budget--;
+            fprintf(stderr, "[XBAR %s] cyc=%ld in=%d addr=0x%lx my_tile=%u target=%u local=%d "
+                            "out=%u n_cache=%u n_priv=%u geom(dyn=%u bank_bits=%u tile_w=%u ntiles=%u)\n",
+                    _this->get_path().c_str(), (long)_this->clock.get_cycles(), input_id,
+                    (unsigned long)addr, _this->tile_id_, _this->geom_.addr_tile(addr),
+                    (int)r.local, out_id, _this->num_cache_, _this->num_private_cache_,
+                    _this->geom_.dyn_offset, _this->geom_.cache_bank_bits,
+                    _this->geom_.tile_id_width, _this->geom_.num_tiles);
+        }
+    }
     vp::IoReqStatus st = _this->outputs_[out_id]->req_forward(req);
 
     // Restore the caller's address once the bank has resolved the access. Rotation is an INTERNAL

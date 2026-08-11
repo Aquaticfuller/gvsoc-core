@@ -133,13 +133,15 @@ vp::IoReqStatus InsituCacheRemoteXbar::req_handler(vp::Block *__this, vp::IoReq 
     // per-request message is LEVEL_TRACE, which plain --trace does not emit).
     {
         static const int dbg = [](){ const char *e = getenv("INSITU_RXBAR_DEBUG"); return e ? atoi(e) : 0; }();
-        static int budget = 300;
+        static int budget = dbg;   // the env value IS the budget (e.g. =3000 to catch a late loop)
         if (dbg && budget > 0) {
             budget--;
-            fprintf(stderr, "[RXBAR %s] cyc=%ld in=%d addr=0x%lx target=%u tgt_grp=%u my_grp=%u out=%u%s\n",
+            fprintf(stderr, "[RXBAR %s] cyc=%ld in=%d addr=0x%lx target=%u tgt_grp=%u my_grp=%u out=%u%s geom(dyn=%u bank_bits=%u tile_w=%u ntiles=%u)\n",
                     _this->get_path().c_str(), (long)_this->clock.get_cycles(), input_id,
                     (unsigned long)req->get_addr(), target, tgt_group, _this->group_id_, out,
-                    out == _this->n_local_slots_ ? " ->NOC" : " ->local");
+                    out == _this->n_local_slots_ ? " ->NOC" : " ->local",
+                    _this->geom_.dyn_offset, _this->geom_.cache_bank_bits,
+                    _this->geom_.tile_id_width, _this->geom_.num_tiles);
         }
     }
     if (_this->hop_latency_cycles_ > 0) req->inc_latency(_this->hop_latency_cycles_);
@@ -148,7 +150,7 @@ vp::IoReqStatus InsituCacheRemoteXbar::req_handler(vp::Block *__this, vp::IoReq 
     vp::IoReqStatus st = _this->outputs_[out]->req_forward(req);
     {
         static const int dbg = [](){ const char *e = getenv("INSITU_RXBAR_DEBUG"); return e ? atoi(e) : 0; }();
-        static int sbudget = 40;
+        static int sbudget = dbg;
         if (dbg && sbudget > 0) {
             sbudget--;
             fprintf(stderr, "[RXBAR-ST %s] cyc=%ld addr=0x%lx out=%u status=%d (0=OK 1=INVALID 2=DENIED 3=PENDING)\n",
