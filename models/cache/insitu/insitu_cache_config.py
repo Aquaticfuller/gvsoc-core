@@ -101,6 +101,14 @@ class InsituCacheControllerConfig(Config):
         "driver relies on for its same-line MSHR-merge throughput modelling (coal_cold). "
         "Single-outstanding-refill model."
     ))
+    # CALIBRATION (async path only). Structural delay in cycles between an access completing in
+    # the per-cycle core and its response being released. Latency stamped with inc_latency()
+    # never reaches the requester on the async path, so the RTL's warm read-hit cost has to be
+    # spent as real simulated time instead. 8 puts the measured served latency at 10.8 cycles
+    # against the RTL reference of 10 isolated / 7 streaming, and byte-enable within 1% of the
+    # calibrated synchronous path. Unused when inline_sync_miss is True.
+    resp_latency_cycles: int = 0
+
     functional_writethrough: bool = cfg_field(default=False, dump=True, desc=(
         "FUNCTIONAL coherence only (not a timing knob). When true, every write also pushes "
         "its real bytes straight to the backing memory (bypassing the coalescer, which carries "

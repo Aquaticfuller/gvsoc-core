@@ -26,6 +26,7 @@
 #include <vector>
 #include <deque>
 #include <unordered_map>
+#include <cstdlib>
 #include <cstring>
 
 #include <vp/vp.hpp>
@@ -51,6 +52,13 @@ public:
                 (unsigned long)cnt_flush_, (unsigned long)cnt_flush_dirty_,
                 (unsigned long)lat_sum_, (unsigned long)lat_b1_, (unsigned long)lat_clamp_,
                 (unsigned long)n_clamp_, (unsigned long)lat_winfo_, (unsigned long)lat_wcommit_);
+        // Measured per-access served latency on the ASYNC path: accept cycle -> resp cycle in real
+        // simulated time. This is the number to calibrate against the RTL reference (warm read-hit
+        // 10 cycles isolated / 7 streaming); stamped latency does not reach the requester here.
+        if (served_lat_n_)
+            fprintf(stderr, "[INSITU-CORE %s] served_lat_avg=%.2f over %lu accesses (resp_delay=%d)\n",
+                    this->get_path().c_str(), (double)served_lat_sum_ / (double)served_lat_n_,
+                    (unsigned long)served_lat_n_, (int)resp_latency_cycles_);
         vp::Component::stop();
     }
 
@@ -225,6 +233,17 @@ private:
     std::deque<vp::IoReq*> in_q_;
     uint32_t in_q_cap_ = 32;   // ~NumSpatzOutstandingLoads
 
+    // CALIBRATION (async path). Latency stamped with inc_latency() is DISCARDED by the requester on
+    // this path (iss lsu.cpp data_response zeroes pending_latency), so per-access latency here is
+    // whatever real simulated time the pipeline spends — about 2-3 cycles for a hit, against the
+    // RTL-derived reference of 10 cycles isolated / 7 streaming. resp_latency_cycles_ closes that gap
+    // STRUCTURALLY: a completed access becomes eligible to respond only this many cycles later, so the
+    // delay is real time the requester actually observes. 0 keeps the raw pipeline behaviour.
+    int32_t  resp_latency_cycles_ = 0;
+    // served-latency accounting, reported at stop(): accept cycle -> resp cycle, per access.
+    std::unordered_map<vp::IoReq *, int64_t> accept_cyc_;
+    uint64_t served_lat_sum_ = 0, served_lat_n_ = 0;
+
     // Admission stall queue: requests that arrived while in_q_ was full. They are parked (PENDING, never
     // dropped) and re-admitted as space frees — required for async-capable masters (the updated Spatz VLSU
     // treats PENDING/DENIED as async and waits for a resp(); a DENIED + dropped request would hang it).
@@ -238,7 +257,8 @@ private:
     std::vector<std::deque<vp::IoReq*>> mshr_;   // [num_sets*num_ways]
 
     // output FIFOs (structural, capacity-bounded)
-    std::deque<vp::IoReq*> resp_fifo_;            // completed reads/writes to resp() (retr+resp merged)
+    std::deque<vp::IoReq*> resp_fifo_;
+    std::deque<int64_t>    resp_done_cyc_;   // cycle each resp_fifo_ entry completed (structural delay)            // completed reads/writes to resp() (retr+resp merged)
     std::deque<uint64_t>   miss_fifo_;            // line addrs needing a refill
     // Async writeback queue. The dirty line's BYTES are snapshotted at eviction time: queuing only the
     // address and handing evict_data_buf_ to the drain sent whatever that shared buffer last held — and
@@ -324,6 +344,10 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
     // ROTATED space. Every L2-side egress unrotates via l2_addr(). rotate_bits=0 → identity (the
     // pre-E1 behaviour; also the single-bank / single-tile-N=0 case).
     rotate_bits_               = cfg->get_child_int("rotate_bits");
+    resp_latency_cycles_       = cfg->get("resp_latency_cycles")
+        ? cfg->get_child_int("resp_latency_cycles") : 0;
+    // INSITU_RESP_LAT overrides it, so the value can be swept without rebuilding during calibration.
+    if (const char *e = getenv("INSITU_RESP_LAT")) resp_latency_cycles_ = atoi(e);
     rotate_geom_.dyn_offset    = cfg->get_child_int("rotate_dyn_offset");
     rotate_geom_.addr_width    = cfg->get_child_int("rotate_addr_width");
     // E3: this bank's identity (default partition from elaboration; the config slave can repartition
@@ -383,7 +407,7 @@ void InsituCacheCore::reset(bool active)
     for (uint32_t s = 0; s < num_sets_; s++)
         for (uint32_t w = 0; w < num_ways_; w++) meta_[(size_t)s*num_ways_+w].lru = w;
     for (auto &q : mshr_) q.clear();
-    resp_fifo_.clear(); miss_fifo_.clear(); evic_fifo_.clear(); evict_wb_pending_ = false;
+    resp_fifo_.clear(); resp_done_cyc_.clear(); miss_fifo_.clear(); evic_fifo_.clear(); evict_wb_pending_ = false;
     in_q_.clear(); preread_q_ = PrereadTask{};
     refill_pending_ = refill_spill_valid_ = false; refill_ready_cycle_ = -1; retr_level_ = 0;
 }
@@ -419,6 +443,7 @@ vp::IoReqStatus InsituCacheCore::req_handler(vp::Block *__this, vp::IoReq *req)
     //
     // We do not need it anyway: the core never mutates addr/size/data/is_write on a parked request (it
     // keeps its own copies in preread_q_/mshr_), so there is nothing to save and restore.
+    _this->accept_cyc_[req] = _this->clock.get_cycles();
     if (_this->in_q_.size() >= _this->in_q_cap_) {
         // Accept queue full: park the request (PENDING) and re-admit it as space frees (stage0_arbitrate).
         // Never DENY + drop — an async-capable master would wait forever for a resp() that never comes.
@@ -834,7 +859,7 @@ bool InsituCacheCore::process_request(vp::IoReq *req)
             lru_update(geom_, ways, d.way, ways[d.way].status, ways[d.way].status);
             cnt_rd_hit_++;
         }
-        resp_fifo_.push_back(req);
+        resp_fifo_.push_back(req); resp_done_cyc_.push_back(clock.get_cycles());
         return true;
     }
 
@@ -923,7 +948,7 @@ void InsituCacheCore::install_refill()
         } else {
             exchange_line_data(r, set, way, /*line_to_req=*/true);
         }
-        resp_fifo_.push_back(r);
+        resp_fifo_.push_back(r); resp_done_cyc_.push_back(clock.get_cycles());
     }
 }
 
@@ -931,7 +956,22 @@ void InsituCacheCore::drain_outputs()
 {
     // one completed access resp() per tick
     if (!resp_fifo_.empty()) {
+        // Structural response latency: the head is not eligible until resp_latency_cycles_ have
+        // elapsed since it completed. Re-arm the tick so it is released on time.
+        if (resp_latency_cycles_ > 0) {
+            const int64_t done = resp_done_cyc_.empty() ? 0 : resp_done_cyc_.front();
+            const int64_t now  = clock.get_cycles();
+            if (now < done + resp_latency_cycles_) { schedule_tick(); return; }
+            if (!resp_done_cyc_.empty()) resp_done_cyc_.pop_front();
+        }
         vp::IoReq *r = resp_fifo_.front(); resp_fifo_.pop_front();
+        {
+            auto it = accept_cyc_.find(r);
+            if (it != accept_cyc_.end()) {
+                served_lat_sum_ += (uint64_t)(clock.get_cycles() - it->second); served_lat_n_++;
+                accept_cyc_.erase(it);
+            }
+        }
         // The request's arg stack is untouched by us (see req_handler) — the requester's own arguments
         // are still on top, exactly where its resp callback expects them.
         //
