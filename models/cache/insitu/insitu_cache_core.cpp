@@ -1021,7 +1021,14 @@ void InsituCacheCore::drain_outputs()
         evict_req_.set_size(cache_line_bytes_);
         evict_req_.set_is_write(true);
         evict_req_.set_data(evict_wb_buf_.data());
-        if (evict_itf_.req(&evict_req_) == vp::IO_REQ_PENDING) evict_wb_pending_ = true;
+        // DENIED counts as in flight, exactly like PENDING: the slave has taken ownership and will
+        // grant + complete it later (FlooNoc's NI queues a denied burst and calls grant() when it
+        // drains). Checking only for PENDING left the flag clear on DENIED, so the next tick re-issued
+        // the SAME evict_req_ — the L2 refill mesh saw one write pointer resubmitted every cycle,
+        // pushed onto the NI's denied queue each time, and every later drain incremented its
+        // outstanding-burst count until it wedged at the cap with nothing left to decrement it.
+        const vp::IoReqStatus est = evict_itf_.req(&evict_req_);
+        if (est == vp::IO_REQ_PENDING || est == vp::IO_REQ_DENIED) evict_wb_pending_ = true;
     }
 }
 
