@@ -515,14 +515,18 @@ vp::IoReqStatus InsituCacheCore::run_flush(vp::IoReq *req)
                 if (evict_itf_.is_bound() && !no_wb) {   // insn 3 = invalidate-all: NO writeback
                     const uint64_t old_line = ((uint64_t)ways[w].tag << (geom_.off_bits + geom_.depth_bits)) |
                                               ((uint64_t)s << geom_.off_bits);
-                    memcpy(evict_data_buf_.data(),
-                           &data_[((size_t)s * num_ways_ + w) * cache_line_bytes_], cache_line_bytes_);
-                    evict_req_.init();
-                    evict_req_.set_addr(l2_addr(old_line));
-                    evict_req_.set_size(cache_line_bytes_);
-                    evict_req_.set_is_write(true);
-                    evict_req_.set_data(evict_data_buf_.data());
-                    (void)evict_itf_.req(&evict_req_);      // writeback (sync store, buffer reused safely)
+                    // Queue it with its OWN data snapshot rather than issuing inline. Issuing inline
+                    // reused one request object and one buffer for every dirty line, which is only safe
+                    // while the downstream answers IO_REQ_OK inside the call. As soon as anything that
+                    // can answer PENDING sits in the path — the P3 refill mux — all of a flush's
+                    // writebacks shared one in-flight object and carried the last line's bytes, and
+                    // load-store (the flush-heavy kernel) reported data mismatches. No depth check:
+                    // a flush walk must be able to queue every dirty line it finds.
+                    EvictEnt ent;
+                    ent.addr = old_line;
+                    const uint8_t *src = &data_[((size_t)s * num_ways_ + w) * cache_line_bytes_];
+                    ent.data.assign(src, src + cache_line_bytes_);
+                    evic_fifo_.push_back(std::move(ent));
                 }
             }
             ways[w].status = INVALID;
@@ -532,6 +536,7 @@ vp::IoReqStatus InsituCacheCore::run_flush(vp::IoReq *req)
     }
     const int64_t dur = (int64_t)flush_base_cycles_ + (int64_t)n_dirty * flush_evict_cycles_;
     flush_busy_until_ = now + dur;
+    if (!evic_fifo_.empty()) schedule_tick();   // drain the queued writebacks
     cnt_flush_++;
     cnt_flush_dirty_ += n_dirty;
     req->inc_latency(dur);

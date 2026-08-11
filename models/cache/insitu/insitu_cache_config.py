@@ -109,6 +109,11 @@ class InsituCacheControllerConfig(Config):
     # calibrated synchronous path. Unused when inline_sync_miss is True.
     resp_latency_cycles: int = 0
 
+    # v3-P3: banks leave the tile on SEPARATE wide ports (l2_0..l2_{n-1}) instead of fanning
+    # into one, so the group can arbitrate all 16 bank refill ports explicitly. A bare fan-in
+    # models no arbitration at all.
+    per_bank_l2_ports: bool = False
+
     functional_writethrough: bool = cfg_field(default=False, dump=True, desc=(
         "FUNCTIONAL coherence only (not a timing knob). When true, every write also pushes "
         "its real bytes straight to the backing memory (bypassing the coalescer, which carries "

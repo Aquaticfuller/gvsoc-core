@@ -274,10 +274,16 @@ class InsituCacheTile(Component):
             else:
                 self._xbars[n_ppc - 1].o_OUTPUT(cb, self._ctrls[cb].i_INPUT(scalar_core_in))
 
-        # Refill + eviction (eviction rides the refill path) fan in to the tile's o_L2 master.
+        # Refill + eviction (eviction rides the refill path). By default every bank fans into the
+        # tile's single o_L2 master. With per_bank_l2_ports the banks instead leave on SEPARATE ports
+        # (l2_0..l2_{n-1}) so the group can arbitrate all of them explicitly — the intended design has
+        # 16 bank refill ports per group (4 tiles x 4 banks) reaching a 17->1 mux, and a bare fan-in
+        # models no arbitration at all (v3-P3).
+        per_bank_l2 = getattr(config, 'per_bank_l2_ports', False)
         for cb in range(n_ctrl):
-            self.bind(self._ctrls[cb], 'refill', self, 'l2')
-            self.bind(self._ctrls[cb], 'evict',  self, 'l2')
+            l2_port = f'l2_{cb}' if per_bank_l2 else 'l2'
+            self.bind(self._ctrls[cb], 'refill', self, l2_port)
+            self.bind(self._ctrls[cb], 'evict',  self, l2_port)
             if n_ctrl > 1:
                 self.bind(self, f'flush_{cb}', self._ctrls[cb], 'flush')
                 # E3: runtime partition config pass-through (peripheral → this cell).
@@ -333,6 +339,10 @@ class InsituCacheTile(Component):
     def o_REMOTE_OUT(self, port_class: int, slot: int, itf: SlaveItf):
         """Bind this tile's remote-out master for port-class ``port_class``, remote slot ``slot``."""
         self.itf_bind(f'remote_out_{port_class}_{slot}', itf, signature='io')
+
+    def o_L2_BANK(self, bank: int, itf: SlaveItf):
+        """Bind bank `bank`'s wide egress (refill + evict) — requires per_bank_l2_ports."""
+        self.itf_bind(f'l2_{bank}', itf, signature='io')
 
     def o_L2(self, itf: SlaveItf):
         """Bind the tile's L2 output to ``itf``.
