@@ -1023,6 +1023,11 @@ void InsituCacheCore::drain_outputs()
 void InsituCacheCore::stage0_arbitrate()
 {
     if (preread_q_.valid) return;   // stage-1 still holds a latched/stalled request
+    // F1 on the ASYNC path: the flush walk gates all upstream traffic (l1d_busy_i), and it has to do
+    // so STRUCTURALLY. run_flush() stamps the walk's duration with inc_latency() and run_request_sync()
+    // stamps the remaining wait for anything arriving during it — both are discarded on this path, so
+    // a flush cost nothing here and every flush-heavy kernel ran short (load-store_M16 -9.5%).
+    if (clock.get_cycles() < flush_busy_until_) { schedule_tick(); return; }
     // (refill install is handled separately in maybe_install_refill — it does not use preread_q_.)
     // Re-admit parked requests as accept-queue space frees.
     while (!admission_stall_q_.empty() && in_q_.size() < in_q_cap_) {
