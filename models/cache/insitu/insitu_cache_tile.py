@@ -249,7 +249,10 @@ class InsituCacheTile(Component):
         self._amos = []
         if use_amo:
             for cb in range(n_ctrl):
-                self._amos.append(InsituCacheAmo(self, f'amo_{cb}', word_bytes=4))
+                self._amos.append(InsituCacheAmo(
+                    self, f'amo_{cb}', word_bytes=4,
+                    # async cache -> hold the lane for real; sync cache -> keep the calibrated stamp
+                    structural_occupancy=not bool(getattr(config.controller, 'inline_sync_miss', True))))
 
         # xbar outputs → cells. The scalar lane (last) is the core's input 1 (with coalescer) or
         # input n_ppc-1 (A1), routed through the AMO shim when amo_lane is set.

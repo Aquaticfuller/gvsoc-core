@@ -24,14 +24,24 @@ class InsituCacheAmo(Component):
     """AMO/LR-SC shim: 1 input (scalar lane) → 1 output (to the cache core's scalar input)."""
 
     def __init__(self, parent: Component, name: str, *, word_bytes: int = 4,
-                 amo_rmw_write_rtt_cycles: int = -1):
+                 amo_rmw_write_rtt_cycles: int = -1,
+                 structural_occupancy: bool = False):
         super().__init__(parent, name)
         self.add_sources(['cache/insitu/insitu_cache_amo_shim.cpp'])
         self.add_properties({'word_bytes': word_bytes,
                              # B3 RMW lane occupancy: the write-back RTT used for SC (and as the
                              # write-side fallback). AMO end-to-end = scratch-read + 1 + scratch-write
                              # latencies (≈19 cy hit, ~refill on miss). -1 → C++ default 8.
-                             'amo_rmw_write_rtt_cycles': amo_rmw_write_rtt_cycles})
+                             'amo_rmw_write_rtt_cycles': amo_rmw_write_rtt_cycles,
+                             # Model the RMW lane occupancy by HOLDING the lane in real simulated
+                             # time instead of stamping latency on arrivals. Needed with an async
+                             # cache, whose requester discards stamped latency (iss lsu.cpp's
+                             # data_response zeroes pending_latency), so a stamp buys nothing and an
+                             # RMW costs only the 2 cycles its sub-ops take -- roughly 10x faster
+                             # than the RTL's core_ready=0 window, which lets spin-lock contenders
+                             # swamp the bank. Off for a synchronous cache, where the stamp reaches
+                             # the requester and is what the model is calibrated against.
+                             'structural_occupancy': structural_occupancy})
 
     def i_INPUT(self) -> SlaveItf:
         """Scalar-lane request input (from the tile's lane-4 crossbar)."""

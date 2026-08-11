@@ -46,7 +46,10 @@ inline int amo_dbg()
     static const int v = [](){ const char *e = getenv("INSITU_AMO_DEBUG"); return e ? atoi(e) : 0; }();
     return v;
 }
-inline int &amo_dbg_budget() { static int n = 400; return n; }
+// The env value IS the line budget (INSITU_AMO_DEBUG=200000 to reach late cycles). A fixed budget
+// here once made the shim look like it had gone silent after cycle 3886 when it had simply stopped
+// printing.
+inline int &amo_dbg_budget() { static int n = amo_dbg(); return n; }
 
 inline bool park_enabled()
 {
@@ -91,6 +94,8 @@ private:
     // req_handler's body, callable again when a parked request is re-issued.
     static vp::IoReqStatus handle(InsituCacheAmo *_this, vp::IoReq *req, bool parked);
     static void drain_park(InsituCacheAmo *_this);
+    // the occupancy window expired — release whatever queued behind it
+    static void occ_handler(vp::Block *__this, vp::ClockEvent *event);
 
     Reservation res_;
     uint32_t word_bytes_;
@@ -125,6 +130,11 @@ private:
     // bank-shared scalar lane is HELD from RMW accept until the write-back drains, ~15-20 cy on a
     // hit, full refill time on a miss). rmw_busy_until_ = the cycle the window ends; any new request
     // on the lane (any opcode) waits it out. rmw_write_rtt_cycles_ = the write-back RTT knob.
+    // structural_occupancy_: hold the lane in real simulated time for the whole RMW window instead of
+    // stamping the wait on arrivals. With an async cache the stamp is discarded by the requester, so
+    // only real blocking reproduces the RTL's core_ready=0 behaviour.
+    bool     structural_occupancy_ = false;
+    vp::ClockEvent occ_event_;
     int64_t  rmw_busy_until_ = 0;
     int64_t  rmw_read_lat_ = 0;   // the scratch read's latency (captured before scratch_ re-init)
     int32_t  rmw_write_rtt_cycles_ = 8;
@@ -136,7 +146,8 @@ private:
     uint64_t n_rmw_ = 0, lat_rmw_sum_ = 0;
 };
 
-InsituCacheAmo::InsituCacheAmo(vp::ComponentConf &conf) : vp::Component(conf)
+InsituCacheAmo::InsituCacheAmo(vp::ComponentConf &conf)
+: vp::Component(conf), occ_event_(this, &InsituCacheAmo::occ_handler)
 {
     auto *cfg = this->get_js_config();
     word_bytes_ = cfg->get_child_int("word_bytes");
@@ -145,6 +156,9 @@ InsituCacheAmo::InsituCacheAmo(vp::ComponentConf &conf) : vp::Component(conf)
     // (read-hit ~10 + 1 + 8 ≈ 19 cy end-to-end, matching the RTL's ~15-20 cy).
     int32_t wrtt = cfg->get_child_int("amo_rmw_write_rtt_cycles");
     if (wrtt >= 0) rmw_write_rtt_cycles_ = wrtt;
+
+    structural_occupancy_ = cfg->get("structural_occupancy")
+        ? cfg->get_child_bool("structural_occupancy") : false;
 
     input_.set_req_meth(&InsituCacheAmo::req_handler);
     this->new_slave_port("input", &input_);
@@ -168,8 +182,15 @@ vp::IoReqStatus InsituCacheAmo::req_handler(vp::Block *__this, vp::IoReq *req)
     // store (lock = 0) was overwritten by an in-flight swap's write-back (lock = 1) and the lock was
     // never released again. On a synchronous-slave cache the whole RMW resolves inside req_handler so
     // phase_ is always IDLE here and nothing can interleave; the async path made the window real.
-    if (_this->phase_ != IDLE && park_enabled()) {
+    const bool lane_busy = (_this->phase_ != IDLE) ||
+        (_this->structural_occupancy_ && _this->clock.get_cycles() < _this->rmw_busy_until_);
+    if (lane_busy && park_enabled()) {
         _this->park_q_.push_back(req);
+        if (_this->structural_occupancy_ && _this->phase_ == IDLE) {
+            // nothing else will wake us: schedule the drain for when the window ends
+            const int64_t d = _this->rmw_busy_until_ - _this->clock.get_cycles();
+            if (!_this->occ_event_.is_enqueued() && d > 0) _this->occ_event_.enqueue(d);
+        }
         return vp::IO_REQ_PENDING;
     }
     vp::IoReqStatus st = handle(_this, req, /*parked=*/false);
@@ -181,6 +202,12 @@ vp::IoReqStatus InsituCacheAmo::req_handler(vp::Block *__this, vp::IoReq *req)
 
 // Drain parked requests once the lane is idle. We already answered PENDING upstream, so a request that
 // now resolves synchronously (OK) is ours to resp(); a PENDING one is completed by the normal path.
+void InsituCacheAmo::occ_handler(vp::Block *__this, vp::ClockEvent *event)
+{
+    InsituCacheAmo *_this = static_cast<InsituCacheAmo *>(__this);
+    drain_park(_this);
+}
+
 void InsituCacheAmo::drain_park(InsituCacheAmo *_this)
 {
     while (_this->phase_ == IDLE && !_this->park_q_.empty()) {
@@ -287,10 +314,11 @@ void InsituCacheAmo::resp_handler(vp::Block *__this, vp::IoReq *req)
         memcpy(&_this->old_val_, _this->scratch_buf_, 4);
         if (amo_dbg() && amo_dbg_budget() > 0) {
             amo_dbg_budget()--;
-            fprintf(stderr, "[AMO %s] cyc=%ld RMW old=0x%x operand=0x%x -> new=0x%x addr=0x%lx\n",
+            fprintf(stderr, "[AMO %s] cyc=%ld RMW old=0x%x operand=0x%x -> new=0x%x addr=0x%lx initiator=%d\n",
                     _this->get_path().c_str(), (long)_this->clock.get_cycles(), _this->old_val_,
                     _this->b_val_, amo_alu(_this->amo_op_, _this->old_val_, _this->b_val_),
-                    (unsigned long)_this->amo_addr_);
+                    (unsigned long)_this->amo_addr_,
+                    _this->orig_ ? _this->orig_->get_initiator() : -1);
         }
         _this->rmw_read_lat_ = _this->scratch_.get_full_latency();   // B3: before scratch_ re-init
         const uint32_t newv = amo_alu(_this->amo_op_, _this->old_val_, _this->b_val_);
@@ -344,7 +372,13 @@ void InsituCacheAmo::resp_handler(vp::Block *__this, vp::IoReq *req)
         orig->get_resp_port()->resp(orig);
         // Lane is idle again — let whatever queued behind this RMW through (async path only; on the
         // sync path nothing can be parked because phase_ never stays non-IDLE across a call).
-        drain_park(_this);
+        if (_this->structural_occupancy_) {
+            const int64_t d = _this->rmw_busy_until_ - _this->clock.get_cycles();
+            if (d > 0) { if (!_this->occ_event_.is_enqueued()) _this->occ_event_.enqueue(d); }
+            else drain_park(_this);
+        } else {
+            drain_park(_this);
+        }
     }
 }
 
