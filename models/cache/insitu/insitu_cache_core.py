@@ -71,6 +71,7 @@ class InsituCacheCore(Component):
             # E1 MSB-rotation inverse: how many routing bits the tile xbar rotated into the MSB for
             # THIS bank (route.hpp::bits_to_rotate), + the rotation geometry. 0 → l2_addr() identity.
             'resp_latency_cycles': getattr(config, 'resp_latency_cycles', 0),
+            'miss_extra_cycles': getattr(config, 'miss_extra_cycles', 0),
             'rotate_bits': rotate_bits,
             'rotate_dyn_offset': rotate_dyn_offset,
             'rotate_addr_width': rotate_addr_width,

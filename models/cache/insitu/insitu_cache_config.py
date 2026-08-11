@@ -108,6 +108,12 @@ class InsituCacheControllerConfig(Config):
     # against the RTL reference of 10 isolated / 7 streaming, and byte-enable within 1% of the
     # calibrated synchronous path. Unused when inline_sync_miss is True.
     resp_latency_cycles: int = 0
+    # CALIBRATION (async path only). Extra structural delay for accesses that WAITED ON A REFILL.
+    # A hit and a miss cannot share one constant: the RTL reference is a warm read-hit of 10
+    # cycles isolated and a cold read-miss of MemLatency + 17. With resp_latency_cycles alone the
+    # measured isolated costs were HIT 10 (already exact) and MISS 62 against a target of 67, so
+    # 5 closes the miss side without touching the hit side. Unused when inline_sync_miss.
+    miss_extra_cycles: int = 0
 
     # v3-P3: banks leave the tile on SEPARATE wide ports (l2_0..l2_{n-1}) instead of fanning
     # into one, so the group can arbitrate all 16 bank refill ports explicitly. A bare fan-in

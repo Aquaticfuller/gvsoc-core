@@ -56,9 +56,16 @@ public:
         // simulated time. This is the number to calibrate against the RTL reference (warm read-hit
         // 10 cycles isolated / 7 streaming); stamped latency does not reach the requester here.
         if (served_lat_n_)
-            fprintf(stderr, "[INSITU-CORE %s] served_lat_avg=%.2f over %lu accesses (resp_delay=%d)\n",
+            fprintf(stderr, "[INSITU-CORE %s] served_lat_avg=%.2f over %lu accesses "
+                            "| HIT avg=%.2f min=%ld n=%lu | MISS avg=%.2f min=%ld n=%lu "
+                            "(resp_delay=%d miss_extra=%d)\n",
                     this->get_path().c_str(), (double)served_lat_sum_ / (double)served_lat_n_,
-                    (unsigned long)served_lat_n_, (int)resp_latency_cycles_);
+                    (unsigned long)served_lat_n_,
+                    hit_lat_n_ ? (double)hit_lat_sum_ / (double)hit_lat_n_ : 0.0,
+                    (long)hit_lat_min_, (unsigned long)hit_lat_n_,
+                    miss_lat_n_ ? (double)miss_lat_sum_ / (double)miss_lat_n_ : 0.0,
+                    (long)miss_lat_min_, (unsigned long)miss_lat_n_,
+                    (int)resp_latency_cycles_, (int)miss_extra_cycles_);
         vp::Component::stop();
     }
 
@@ -240,9 +247,19 @@ private:
     // STRUCTURALLY: a completed access becomes eligible to respond only this many cycles later, so the
     // delay is real time the requester actually observes. 0 keeps the raw pipeline behaviour.
     int32_t  resp_latency_cycles_ = 0;
+    // Miss-side term. A hit and a miss cannot share one constant: the RTL reference is a warm read-hit
+    // of 10 cycles isolated and a cold read-miss of MemLatency + 17, while this path reaches only about
+    // MemLatency + 11 (memory latency + ~3 pipeline + resp_latency_cycles_). This adds the remainder
+    // for accesses that actually waited on a refill, spent structurally like the rest.
+    int32_t  miss_extra_cycles_ = 0;
     // served-latency accounting, reported at stop(): accept cycle -> resp cycle, per access.
     std::unordered_map<vp::IoReq *, int64_t> accept_cyc_;
     uint64_t served_lat_sum_ = 0, served_lat_n_ = 0;
+    // split hit/miss, with the MINIMUM as well as the mean: the RTL figures are ISOLATED costs, which
+    // the mean overstates once several accesses queue behind one refill.
+    uint64_t hit_lat_sum_ = 0, hit_lat_n_ = 0, miss_lat_sum_ = 0, miss_lat_n_ = 0;
+    int64_t  hit_lat_min_ = -1, miss_lat_min_ = -1;
+    std::unordered_map<vp::IoReq *, bool> was_miss_;
 
     // Admission stall queue: requests that arrived while in_q_ was full. They are parked (PENDING, never
     // dropped) and re-admitted as space frees — required for async-capable masters (the updated Spatz VLSU
@@ -258,7 +275,7 @@ private:
 
     // output FIFOs (structural, capacity-bounded)
     std::deque<vp::IoReq*> resp_fifo_;
-    std::deque<int64_t>    resp_done_cyc_;   // cycle each resp_fifo_ entry completed (structural delay)            // completed reads/writes to resp() (retr+resp merged)
+    std::deque<int64_t>    resp_done_cyc_;   // READY cycle of each resp_fifo_ entry (structural delay)            // completed reads/writes to resp() (retr+resp merged)
     std::deque<uint64_t>   miss_fifo_;            // line addrs needing a refill
     // Async writeback queue. The dirty line's BYTES are snapshotted at eviction time: queuing only the
     // address and handing evict_data_buf_ to the drain sent whatever that shared buffer last held — and
@@ -348,6 +365,9 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
         ? cfg->get_child_int("resp_latency_cycles") : 0;
     // INSITU_RESP_LAT overrides it, so the value can be swept without rebuilding during calibration.
     if (const char *e = getenv("INSITU_RESP_LAT")) resp_latency_cycles_ = atoi(e);
+    miss_extra_cycles_ = cfg->get("miss_extra_cycles")
+        ? cfg->get_child_int("miss_extra_cycles") : 0;
+    if (const char *e = getenv("INSITU_MISS_EXTRA")) miss_extra_cycles_ = atoi(e);
     rotate_geom_.dyn_offset    = cfg->get_child_int("rotate_dyn_offset");
     rotate_geom_.addr_width    = cfg->get_child_int("rotate_addr_width");
     // E3: this bank's identity (default partition from elaboration; the config slave can repartition
@@ -407,7 +427,7 @@ void InsituCacheCore::reset(bool active)
     for (uint32_t s = 0; s < num_sets_; s++)
         for (uint32_t w = 0; w < num_ways_; w++) meta_[(size_t)s*num_ways_+w].lru = w;
     for (auto &q : mshr_) q.clear();
-    resp_fifo_.clear(); resp_done_cyc_.clear(); miss_fifo_.clear(); evic_fifo_.clear(); evict_wb_pending_ = false;
+    resp_fifo_.clear(); resp_done_cyc_.clear(); was_miss_.clear(); miss_fifo_.clear(); evic_fifo_.clear(); evict_wb_pending_ = false;
     in_q_.clear(); preread_q_ = PrereadTask{};
     refill_pending_ = refill_spill_valid_ = false; refill_ready_cycle_ = -1; retr_level_ = 0;
 }
@@ -864,7 +884,9 @@ bool InsituCacheCore::process_request(vp::IoReq *req)
             lru_update(geom_, ways, d.way, ways[d.way].status, ways[d.way].status);
             cnt_rd_hit_++;
         }
-        resp_fifo_.push_back(req); resp_done_cyc_.push_back(clock.get_cycles());
+        resp_fifo_.push_back(req);
+        resp_done_cyc_.push_back(clock.get_cycles() + resp_latency_cycles_);   // hit
+        was_miss_[req] = false;
         return true;
     }
 
@@ -953,7 +975,10 @@ void InsituCacheCore::install_refill()
         } else {
             exchange_line_data(r, set, way, /*line_to_req=*/true);
         }
-        resp_fifo_.push_back(r); resp_done_cyc_.push_back(clock.get_cycles());
+        resp_fifo_.push_back(r);
+        // waited on a refill: hit delay + the miss-side term
+        resp_done_cyc_.push_back(clock.get_cycles() + resp_latency_cycles_ + miss_extra_cycles_);
+        was_miss_[r] = true;
     }
 }
 
@@ -963,17 +988,26 @@ void InsituCacheCore::drain_outputs()
     if (!resp_fifo_.empty()) {
         // Structural response latency: the head is not eligible until resp_latency_cycles_ have
         // elapsed since it completed. Re-arm the tick so it is released on time.
-        if (resp_latency_cycles_ > 0) {
-            const int64_t done = resp_done_cyc_.empty() ? 0 : resp_done_cyc_.front();
-            const int64_t now  = clock.get_cycles();
-            if (now < done + resp_latency_cycles_) { schedule_tick(); return; }
-            if (!resp_done_cyc_.empty()) resp_done_cyc_.pop_front();
+        if (!resp_done_cyc_.empty()) {
+            if (clock.get_cycles() < resp_done_cyc_.front()) { schedule_tick(); return; }
+            resp_done_cyc_.pop_front();
         }
         vp::IoReq *r = resp_fifo_.front(); resp_fifo_.pop_front();
         {
             auto it = accept_cyc_.find(r);
             if (it != accept_cyc_.end()) {
-                served_lat_sum_ += (uint64_t)(clock.get_cycles() - it->second); served_lat_n_++;
+                const int64_t lat = clock.get_cycles() - it->second;
+                served_lat_sum_ += (uint64_t)lat; served_lat_n_++;
+                auto mit = was_miss_.find(r);
+                const bool miss = (mit != was_miss_.end()) && mit->second;
+                if (mit != was_miss_.end()) was_miss_.erase(mit);
+                if (miss) {
+                    miss_lat_sum_ += (uint64_t)lat; miss_lat_n_++;
+                    if (miss_lat_min_ < 0 || lat < miss_lat_min_) miss_lat_min_ = lat;
+                } else {
+                    hit_lat_sum_ += (uint64_t)lat; hit_lat_n_++;
+                    if (hit_lat_min_ < 0 || lat < hit_lat_min_) hit_lat_min_ = lat;
+                }
                 accept_cyc_.erase(it);
             }
         }
