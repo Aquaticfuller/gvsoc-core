@@ -14,6 +14,7 @@
 // remote-in). Route: out = addr_tile = addr[dynamic_offset + log2(NumCache) +: TileIDWidth] (route.hpp).
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -128,10 +129,34 @@ vp::IoReqStatus InsituCacheRemoteXbar::req_handler(vp::Block *__this, vp::IoReq 
         const uint32_t local_tile = target % _this->tiles_per_group_;
         out = local_tile * _this->nrpc_ + (source % _this->nrpc_);
     }
+    // INSITU_RXBAR_DEBUG=1: budgeted stderr trace of the routing decision (the component's own
+    // per-request message is LEVEL_TRACE, which plain --trace does not emit).
+    {
+        static const int dbg = [](){ const char *e = getenv("INSITU_RXBAR_DEBUG"); return e ? atoi(e) : 0; }();
+        static int budget = 300;
+        if (dbg && budget > 0) {
+            budget--;
+            fprintf(stderr, "[RXBAR %s] cyc=%ld in=%d addr=0x%lx target=%u tgt_grp=%u my_grp=%u out=%u%s\n",
+                    _this->get_path().c_str(), (long)_this->clock.get_cycles(), input_id,
+                    (unsigned long)req->get_addr(), target, tgt_group, _this->group_id_, out,
+                    out == _this->n_local_slots_ ? " ->NOC" : " ->local");
+        }
+    }
     if (_this->hop_latency_cycles_ > 0) req->inc_latency(_this->hop_latency_cycles_);
     _this->trace_.msg(vp::Trace::LEVEL_TRACE, "remote src=%u addr=0x%lx -> tile=%u slot=%u\n",
                       source, (unsigned long)req->get_addr(), target, out);
-    return _this->outputs_[out]->req_forward(req);
+    vp::IoReqStatus st = _this->outputs_[out]->req_forward(req);
+    {
+        static const int dbg = [](){ const char *e = getenv("INSITU_RXBAR_DEBUG"); return e ? atoi(e) : 0; }();
+        static int sbudget = 40;
+        if (dbg && sbudget > 0) {
+            sbudget--;
+            fprintf(stderr, "[RXBAR-ST %s] cyc=%ld addr=0x%lx out=%u status=%d (0=OK 1=INVALID 2=DENIED 3=PENDING)\n",
+                    _this->get_path().c_str(), (long)_this->clock.get_cycles(),
+                    (unsigned long)req->get_addr(), out, (int)st);
+        }
+    }
+    return st;
 }
 
 extern "C" vp::Component *gv_new(vp::ComponentConf &config)
