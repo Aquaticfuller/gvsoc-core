@@ -159,6 +159,10 @@ public:
     // Bursts of the operation not yet committed to the vector register file. Loads
     // only: store bursts commit one by one on their response.
     int nb_remaining_bursts;
+    // Spatz H1 runahead safety (spatz_vlsu.sv dual_safe): a burst-mode unit-stride
+    // load with no tail phase. Only such an instruction may be admitted while an
+    // elder load is still draining.
+    bool burst_safe = false;
 };
 
 #if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
@@ -349,6 +353,12 @@ private:
         int vreg = 0;
         int vstart = 0;
         int nb_elem = 0;
+        // VRF destination of a burst load (response beats carry their own
+        // payload on an IoV2Beat port, so the words are copied in on arrival).
+        uint8_t *velem = nullptr;
+        // Allocator-backed request used instead of the embedded one for write
+        // beats on an IoV2Beat port (the beat protocol takes ownership).
+        vp::IoReq *req_ext = nullptr;
     };
 
     // Reorder Buffer for mempool configuration. It only tracks the completion order of
@@ -387,6 +397,77 @@ private:
     std::vector<VlsuReq *> reqs_free;
     // Number of store bursts waiting for their response
     int nb_pending_stores;
+
+    // ------------------------------------------------------------------
+    // Spatz port-0 burst loads (RTL spatz_vlsu.sv, teranoc_spatz).
+    //
+    // A burst-safe load (unit-stride VLE, e32, 64B-aligned, vl within one ROB
+    // batch, vstart==0) issues 64B requests on port 0 only, one per
+    // burst_issue_latency cycles (the BlockAlloc decide->reserve->send cadence),
+    // bounded by word-granular ROB0 room. Responses stream back per beat; the
+    // commit drain retires burst_recv_ports words per cycle in order (TwinROB0
+    // pair commit). A vl not multiple of the burst size runs a legacy multi-port
+    // single-word tail phase once every burst word has committed.
+    // ------------------------------------------------------------------
+    int burst_enable;         // vu/burst_enable master switch
+    int burst_max_words;      // words per full burst (RTL MaxBurstWords = 16)
+    int burst_bytes;          // burst_max_words * 4
+    int burst_rob_words;      // port-0 ROB depth in words (RTL spatz_vlsu_rob_depth)
+    int burst_block_alloc;    // 1: 3-cycle cadence, 0: 18-cycle id walk
+    int burst_dual_load;      // 1: full serialization, 2: H1 runahead
+    int burst_recv_ports;     // ROB0 fill/commit width (TwinROB0, 1 or 2)
+    int burst_issue_latency;  // cycles between successive burst sends
+
+    // Ongoing-instruction burst phase state
+    bool burst_mode;          // the ongoing instruction issues bursts on port 0
+    iss_addr_t burst_full_bytes; // bytes covered by full bursts (rest is tail)
+    bool tail_phase;          // burst region drained, tail issuing via legacy path
+    iss_addr_t tail_base;     // byte offset of the tail region in this operation
+    int64_t port0_next_issue; // next cycle a burst may leave port 0
+
+    // Word-granular port-0 burst ROB. Entries are burst-granular; capacity is
+    // tracked in words (rob0_words_used) to reproduce the RTL room check
+    // (status_cnt <= NumWords - BlockWords).
+    struct BurstRobEntry
+    {
+        bool allocated = false;
+        VlsuReq *req = nullptr;
+        VuLsuPendingInsn *slot = nullptr;
+        int nb_words = 0;         // words covered (burst_max_words for a full burst)
+        int words_arrived = 0;    // response beats received
+        int words_committed = 0;  // words committed to the VRF
+        uint32_t word_mask = 0;   // per-word arrival bits (beats land out of order)
+    };
+    std::vector<BurstRobEntry> brob;
+    int brob_next;            // next entry to allocate
+    int brob_first;           // oldest in flight (commit head)
+    int brob_count;           // allocated entries
+    int brob_words_used;      // word-granular occupancy
+
+    // True when the waiting instruction is a burst-safe unit-stride load (H1
+    // admission condition, evaluated from live vector config — see .cpp).
+    bool next_insn_burst_safe(VuLsuPendingInsn &slot);
+    // Per-cycle burst commit drain: up to burst_recv_ports words from the ROB
+    // head, in issue order.
+    void burst_commit_drain();
+    // Port-0 burst issue step, called from fsm_handler while a burst-mode
+    // instruction is in its burst phase.
+    void burst_issue_step(int64_t cycles);
+    // True when an io_v2 initiator back-link points at a burst ROB entry (as
+    // opposed to a legacy VlsuRobEntry/VlsuReq). brob is never resized after
+    // construction, so its storage is stable.
+    bool brob_owns(void *initiator)
+    {
+        BurstRobEntry *p = (BurstRobEntry *)initiator;
+        return this->burst_enable && !this->brob.empty() &&
+            p >= this->brob.data() && p < this->brob.data() + this->brob.size();
+    }
+
+    // Allocator for write beats on the IoV2Beat port 0 (store beats are owned
+    // by the downstream once accepted). One load port is reserved for bursts:
+    // with burst_enable, non-burst loads stripe across ports [1, nb_ports).
+    vp::IoReqAllocator *beat_allocator = nullptr;
+    int load_port_base = 0;
 };
 
 #else
