@@ -302,17 +302,28 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
         this->port_burst[p] = 0;
     }
 
-    // Spatz port-0 burst mode (RTL spatz_vlsu.sv use_port0_burst_req): a
-    // unit-stride VLE load, e32, vl covering [one burst, one ROB batch], 64B
-    // aligned base, vstart == 0. Only full bursts are formed; a sub-burst
-    // remainder runs as a legacy multi-port tail phase once the burst region
-    // has fully committed (RTL tail phase waits for mem_pending == 0).
+    // Spatz port-0 burst mode (RTL spatz_vlsu.sv use_port0_burst_req, :223-234):
+    // a unit-stride VLE load, e32, vl covering [one burst, one ROB batch], 64B
+    // aligned base. Only full bursts are formed; a sub-burst remainder runs as
+    // a legacy multi-port tail phase once the burst region has fully committed
+    // (RTL tail phase waits for mem_pending == 0).
+    //
+    // vstart is deliberately NOT a conjunct here. The RTL's burst gate is a
+    // 5-way AND that does not test it; `mem_is_vstart_zero` exists but feeds
+    // the H1 RUNAHEAD gate instead (:899, :922), which is a different
+    // mechanism. next_insn_burst_safe() below carries it, matching that
+    // placement. Untestable on the current kernels (vstart is 0 throughout),
+    // so this is latent-mismatch removal, not a behaviour change: the issue
+    // path already offsets by vstart (see burst_issue_step).
     this->burst_mode = this->burst_enable && !is_write && !do_stride && reg_indexed == -1
         && elem_size == 4
-        && this->vstart == 0
         && this->pending_size >= (iss_addr_t)this->burst_bytes
         && this->pending_size <= (iss_addr_t)(this->burst_rob_words * 4)
         && ((this->pending_addr & (iss_addr_t)(this->burst_bytes - 1)) == 0);
+    if (!is_write)
+    {
+        if (this->burst_mode) this->vp_load_burst++; else this->vp_load_nonburst++;
+    }
     this->burst_full_bytes = this->burst_mode ?
         (this->pending_size / this->burst_bytes) * this->burst_bytes : 0;
     this->tail_phase = false;
@@ -915,7 +926,8 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 "VLSU core=%p insns=%lu avg_lat=%.1f inflight=%.2f samples=%lu"
                 " insn_act=%lu no_insn=%lu pair_commit=%lu single_commit=%lu"
                 " wait_beats=%lu req_stall=%lu blk_stall=%lu insn_ret=%lu dual_adv=%lu"
-                " split_n=%lu issue=%.1f flight=%.1f commit=%.1f\n",
+                " split_n=%lu issue=%.1f flight=%.1f commit=%.1f"
+                " load_burst=%lu load_nonburst=%lu\n",
                 (void *)_this, (unsigned long)_this->stat_insns,
                 _this->stat_insns ? (double)_this->stat_lat_issue / _this->stat_insns : 0.0,
                 (double)_this->stat_inflight_acc / _this->stat_inflight_n,
@@ -926,7 +938,9 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 (unsigned long)_this->vp_blk_stall, (unsigned long)_this->vp_insn_ret,
                 (unsigned long)_this->vp_dual_adv, (unsigned long)_this->lat_n,
                 (double)_this->lat_issue / ln, (double)_this->lat_flight / ln,
-                (double)_this->lat_commit / ln);
+                (double)_this->lat_commit / ln,
+                (unsigned long)_this->vp_load_burst,
+                (unsigned long)_this->vp_load_nonburst);
             fflush(vlsu_f);
         }
     }

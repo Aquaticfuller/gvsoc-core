@@ -321,6 +321,12 @@ private:
     uint64_t vp_blk_stall = 0;     // c_blkstall: burst eligible but not fired
     uint64_t vp_insn_ret = 0;      // c_ret:      instructions retired
     uint64_t vp_dual_adv = 0;      // c_dual:     H1 runahead fired
+    // Burst-path eligibility (RTL use_port0_burst_req, a 5-way AND). A load
+    // that fails ANY conjunct silently falls back to the word-interleaved
+    // path and becomes vl/4 single-word requests instead of vl/64 bursts, so
+    // the drop-off rate has to be measured, not assumed.
+    uint64_t vp_load_burst = 0;
+    uint64_t vp_load_nonburst = 0;
     // Stage split of L, accumulated at retire.
     uint64_t lat_n = 0, lat_issue = 0, lat_flight = 0, lat_commit = 0;
     // Ports to the TCDM, used by VLSU for vector load and store operations
