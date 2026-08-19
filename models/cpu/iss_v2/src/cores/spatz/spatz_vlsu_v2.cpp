@@ -32,6 +32,8 @@
  *     callback performed happens at submission instead (see burst_issued).
  */
 
+#include <cstdio>
+#include <cstdlib>
 #include <cpu/iss_v2/include/cores/vector_unit/vector_unit.hpp>
 
 VuLsu::VuLsu(Vu &vu, Iss &iss)
@@ -842,6 +844,35 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     VuLsu *_this = (VuLsu *)__this;
 
+    // Requester-side latency instrumentation: sample in-flight instructions
+    // on every active cycle; dump a per-VLSU window to the stats file.
+    _this->stat_inflight_acc +=
+        (uint64_t)(_this->nb_pending_insn.get() - _this->nb_waiting_insn);
+    _this->stat_inflight_n++;
+    if (_this->stat_inflight_n >= 65536)
+    {
+        static FILE *vlsu_f = nullptr;
+        if (!vlsu_f)
+        {
+            const char *vp = getenv("TERANOC_VLSU_STATS_PATH");
+            vlsu_f = fopen(vp ? vp : "/tmp/vlsu_stats.log", "a");
+        }
+        if (vlsu_f)
+        {
+            fprintf(vlsu_f,
+                "VLSU core=%p insns=%lu avg_lat=%.1f inflight=%.2f samples=%lu\n",
+                (void *)_this, (unsigned long)_this->stat_insns,
+                _this->stat_insns ? (double)_this->stat_lat_issue / _this->stat_insns : 0.0,
+                (double)_this->stat_inflight_acc / _this->stat_inflight_n,
+                (unsigned long)_this->stat_inflight_n);
+            fflush(vlsu_f);
+        }
+        _this->stat_insns = 0;
+        _this->stat_lat_issue = 0;
+        _this->stat_inflight_acc = 0;
+        _this->stat_inflight_n = 0;
+    }
+
 
     // Check if any synchronous delayed burst need to be terminated
     while (!_this->delayed_bursts.empty() &&
@@ -937,6 +968,7 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             pending_insn->timestamp = _this->vu.iss.clock.get_cycles() + insn->latency;
             ((void (*)(VuLsu *, iss_insn_t *))insn->decoder_item->u.insn.block_handler)(_this, insn);
             _this->insn_ongoing = _this->insn_first_waiting;
+            _this->insns[_this->insn_ongoing].issued_at = _this->vu.iss.clock.get_cycles();
             _this->insn_first_waiting = (_this->insn_first_waiting + 1) % VuLsu::queue_size;
             _this->nb_waiting_insn--;
         }
@@ -1201,6 +1233,13 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             _this->nb_pending_insn.dec(1);
             slot.done = false;
             pending_insn->timestamp = _this->vu.iss.clock.get_cycles() + 1;
+            // Requester-side latency instrumentation: issue->retire latency.
+            _this->stat_insns++;
+            if (slot.issued_at > 0)
+            {
+                _this->stat_lat_issue += (uint64_t)(
+                    _this->vu.iss.clock.get_cycles() - slot.issued_at);
+            }
             _this->vu.insn_end(pending_insn);
         }
     }

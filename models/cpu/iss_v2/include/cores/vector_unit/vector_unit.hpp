@@ -163,6 +163,9 @@ public:
     // load with no tail phase. Only such an instruction may be admitted while an
     // elder load is still draining.
     bool burst_safe = false;
+    // Cycle the instruction actually started issuing (requester-side latency
+    // instrumentation: retire - issued_at = the load's core-visible latency).
+    int64_t issued_at = 0;
 };
 
 #if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
@@ -286,6 +289,14 @@ private:
     vp::Register<uint8_t> nb_pending_insn;
     // Number of instructions waiting to be started
     int nb_waiting_insn;
+    // Requester-side latency instrumentation (RTL comparison: VLE latency L,
+    // loads-in-flight N — spatz_bottleneck_analysis_and_plan.md): per-VLSU
+    // completed memory instructions, summed issue->retire latency, and
+    // active-cycle samples of in-flight instructions.
+    uint64_t stat_insns = 0;
+    uint64_t stat_lat_issue = 0;
+    uint64_t stat_inflight_acc = 0;
+    uint64_t stat_inflight_n = 0;
     // Ports to the TCDM, used by VLSU for vector load and store operations
     std::vector<vp::IoMaster> ports;
     // Number of TCDM ports
