@@ -849,7 +849,17 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     _this->stat_inflight_acc +=
         (uint64_t)(_this->nb_pending_insn.get() - _this->nb_waiting_insn);
     _this->stat_inflight_n++;
-    if (_this->stat_inflight_n >= 65536)
+    // Dump cadence: the FSM only ticks while the VLSU has work, so a short
+    // kernel may never reach a large interval. TERANOC_VLSU_STATS_PERIOD
+    // overrides it (default 1024 active cycles).
+    static int vlsu_period = 0;
+    if (__builtin_expect(vlsu_period == 0, 0))
+    {
+        const char *pe = getenv("TERANOC_VLSU_STATS_PERIOD");
+        vlsu_period = pe ? atoi(pe) : 1024;
+        if (vlsu_period <= 0) vlsu_period = 1024;
+    }
+    if (_this->stat_inflight_n % (uint64_t)vlsu_period == 0)
     {
         static FILE *vlsu_f = nullptr;
         if (!vlsu_f)
@@ -867,10 +877,6 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 (unsigned long)_this->stat_inflight_n);
             fflush(vlsu_f);
         }
-        _this->stat_insns = 0;
-        _this->stat_lat_issue = 0;
-        _this->stat_inflight_acc = 0;
-        _this->stat_inflight_n = 0;
     }
 
 
