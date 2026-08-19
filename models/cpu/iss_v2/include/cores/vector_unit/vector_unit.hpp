@@ -171,6 +171,13 @@ public:
     // must be a port-0 burst load, but the elder only has to be a load
     // (commit_insn_q.is_load).
     bool is_load = false;
+    // Stage timestamps splitting the issue->retire latency L into
+    //   issue  = last request handed to memory - start of issuing
+    //   flight = first response beat - last request issued
+    //   commit = retire - first response beat
+    // so it can be diffed against the RTL's [VPERF] partition.
+    int64_t t_last_req = -1;
+    int64_t t_first_beat = -1;
 };
 
 #if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
@@ -302,6 +309,20 @@ private:
     uint64_t stat_lat_issue = 0;
     uint64_t stat_inflight_acc = 0;
     uint64_t stat_inflight_n = 0;
+    // Counterparts of the RTL's [VPERF] counters (spatz_vlsu.sv:2003-2020),
+    // deliberately using the SAME definitions so the two sides can be diffed
+    // counter by counter rather than argued about.
+    uint64_t vp_insn_act = 0;      // c_insn:     cycles with a load resident
+    uint64_t vp_no_insn = 0;       // c_noinsn:   cycles with nothing resident
+    uint64_t vp_pair_commit = 0;   // c_pairok:   2-wide commit cycles
+    uint64_t vp_single_commit = 0; // c_single:   1-wide commit cycles
+    uint64_t vp_wait_beats = 0;    // c_waitbeat: commit stalled on the head beat
+    uint64_t vp_req_stall = 0;     // c_reqstall: port-0 request stalled
+    uint64_t vp_blk_stall = 0;     // c_blkstall: burst eligible but not fired
+    uint64_t vp_insn_ret = 0;      // c_ret:      instructions retired
+    uint64_t vp_dual_adv = 0;      // c_dual:     H1 runahead fired
+    // Stage split of L, accumulated at retire.
+    uint64_t lat_n = 0, lat_issue = 0, lat_flight = 0, lat_commit = 0;
     // Ports to the TCDM, used by VLSU for vector load and store operations
     std::vector<vp::IoMaster> ports;
     // Number of TCDM ports

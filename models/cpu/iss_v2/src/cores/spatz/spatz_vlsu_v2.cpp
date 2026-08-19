@@ -343,6 +343,8 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
     // H1 runahead safety (RTL dual_safe): burst-mode load without a tail.
     slot.burst_safe = this->burst_mode && (this->pending_size == this->burst_full_bytes);
     slot.is_load = !is_write;
+    slot.t_last_req = -1;
+    slot.t_first_beat = -1;
 
     // ON RTL, it takes some time to switch from one instruction to another, and more if it is from
     // load to store, probably due to latency to write to regfile.
@@ -392,6 +394,10 @@ void VuLsu::burst_issued(vp::IoReq *req, int port)
     this->port_burst[port]++;
     this->remaining_size -= size;
 
+    if (this->remaining_size == 0 && slot->t_last_req < 0)
+    {
+        slot->t_last_req = this->vu.iss.clock.get_cycles();
+    }
     if (this->remaining_size == 0)
     {
         PendingInsn *pending_insn = slot->insn;
@@ -464,6 +470,14 @@ vp::IoRespAck VuLsu::port_resp_muxed(vp::Block *__this, vp::IoReq *req, int id)
             // (zero-copy); the beat only conveys arrival + index.
             entry->word_mask |= 1u << idx;
             entry->words_arrived++;
+            // Start of the commit stage for the owning instruction. Burst
+            // responses arrive BEAT BY BEAT on this path (the whole-burst
+            // path in burst_done is only taken for synchronous DONE), which
+            // is why stamping it only there left the split empty.
+            if (entry->slot != nullptr && entry->slot->t_first_beat < 0)
+            {
+                entry->slot->t_first_beat = _this->vu.iss.clock.get_cycles();
+            }
         }
         _this->fsm_event.enable();
         return vp::IO_RESP_ACCEPTED;
@@ -527,6 +541,10 @@ void VuLsu::burst_done(vp::IoReq *req)
         entry->words_arrived = entry->nb_words;
         entry->word_mask = entry->nb_words >= 32 ? 0xFFFFFFFFu :
             ((1u << entry->nb_words) - 1);
+        if (entry->slot != nullptr && entry->slot->t_first_beat < 0)
+        {
+            entry->slot->t_first_beat = _this->vu.iss.clock.get_cycles();
+        }
         return;
     }
 
@@ -694,6 +712,7 @@ bool VuLsu::next_insn_burst_safe(VuLsuPendingInsn &slot)
 void VuLsu::burst_commit_drain()
 {
     int budget = this->burst_recv_ports;
+    int committed_this_cycle = 0;
     while (budget > 0 && this->brob_count > 0)
     {
         BurstRobEntry &entry = this->brob[this->brob_first];
@@ -701,6 +720,12 @@ void VuLsu::burst_commit_drain()
         // out of order, the ROB absorbs that by index).
         if (!(entry.word_mask & (1u << entry.words_committed)))
         {
+            // RTL c_waitbeat: an entry is resident but its head beat has not
+            // landed, so the commit port idles this cycle.
+            if (committed_this_cycle == 0)
+            {
+                this->vp_wait_beats++;
+            }
             break;
         }
         int n = 1;
@@ -712,6 +737,8 @@ void VuLsu::burst_commit_drain()
         }
         entry.words_committed += n;
         budget -= n;
+        committed_this_cycle += n;
+        if (n == 2) this->vp_pair_commit++; else this->vp_single_commit++;
         this->vu.insn_commit(entry.slot->insn, n * 4);
         if (entry.words_committed == entry.nb_words)
         {
@@ -750,15 +777,18 @@ void VuLsu::burst_issue_step(int64_t cycles)
     // A denied burst holds the port until its retry succeeds.
     if (this->port_stalled[0])
     {
+        this->vp_req_stall++;   // RTL c_reqstall: request up, memory not ready
         return;
     }
     // BlockAlloc cadence (decide -> reserve -> send).
     if (cycles < this->port0_next_issue)
     {
+        this->vp_blk_stall++;   // RTL c_blkstall: eligible but not fired yet
         return;
     }
     if (this->brob_words_used > this->burst_rob_words - this->burst_max_words)
     {
+        this->vp_blk_stall++;   // no ROB room: the other half of blk_stall
         return;
     }
 
@@ -848,9 +878,18 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
     // Requester-side latency instrumentation: sample in-flight instructions
     // on every active cycle; dump a per-VLSU window to the stats file.
-    _this->stat_inflight_acc +=
-        (uint64_t)(_this->nb_pending_insn.get() - _this->nb_waiting_insn);
+    int resident = _this->nb_pending_insn.get() - _this->nb_waiting_insn;
+    _this->stat_inflight_acc += (uint64_t)resident;
     _this->stat_inflight_n++;
+    // RTL c_insn / c_noinsn: is a LOAD sitting at the commit head this cycle?
+    if (resident > 0 && _this->insns[_this->insn_first].is_load)
+    {
+        _this->vp_insn_act++;
+    }
+    else if (resident == 0)
+    {
+        _this->vp_no_insn++;
+    }
     // Dump cadence: the FSM only ticks while the VLSU has work, so a short
     // kernel may never reach a large interval. TERANOC_VLSU_STATS_PERIOD
     // overrides it (default 1024 active cycles).
@@ -871,12 +910,23 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         }
         if (vlsu_f)
         {
+            double ln = _this->lat_n ? (double)_this->lat_n : 1.0;
             fprintf(vlsu_f,
-                "VLSU core=%p insns=%lu avg_lat=%.1f inflight=%.2f samples=%lu\n",
+                "VLSU core=%p insns=%lu avg_lat=%.1f inflight=%.2f samples=%lu"
+                " insn_act=%lu no_insn=%lu pair_commit=%lu single_commit=%lu"
+                " wait_beats=%lu req_stall=%lu blk_stall=%lu insn_ret=%lu dual_adv=%lu"
+                " split_n=%lu issue=%.1f flight=%.1f commit=%.1f\n",
                 (void *)_this, (unsigned long)_this->stat_insns,
                 _this->stat_insns ? (double)_this->stat_lat_issue / _this->stat_insns : 0.0,
                 (double)_this->stat_inflight_acc / _this->stat_inflight_n,
-                (unsigned long)_this->stat_inflight_n);
+                (unsigned long)_this->stat_inflight_n,
+                (unsigned long)_this->vp_insn_act, (unsigned long)_this->vp_no_insn,
+                (unsigned long)_this->vp_pair_commit, (unsigned long)_this->vp_single_commit,
+                (unsigned long)_this->vp_wait_beats, (unsigned long)_this->vp_req_stall,
+                (unsigned long)_this->vp_blk_stall, (unsigned long)_this->vp_insn_ret,
+                (unsigned long)_this->vp_dual_adv, (unsigned long)_this->lat_n,
+                (double)_this->lat_issue / ln, (double)_this->lat_flight / ln,
+                (double)_this->lat_commit / ln);
             fflush(vlsu_f);
         }
     }
@@ -950,6 +1000,7 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         VuLsuPendingInsn &elder = _this->insns[_this->insn_first];
         start_ok = elder.is_load &&
             _this->next_insn_burst_safe(_this->insns[_this->insn_first_waiting]);
+        if (start_ok) _this->vp_dual_adv++;   // RTL c_dual
     }
     else
     {
@@ -1248,10 +1299,22 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             pending_insn->timestamp = _this->vu.iss.clock.get_cycles() + 1;
             // Requester-side latency instrumentation: issue->retire latency.
             _this->stat_insns++;
+            _this->vp_insn_ret++;
+            int64_t now = _this->vu.iss.clock.get_cycles();
             if (slot.issued_at > 0)
             {
-                _this->stat_lat_issue += (uint64_t)(
-                    _this->vu.iss.clock.get_cycles() - slot.issued_at);
+                _this->stat_lat_issue += (uint64_t)(now - slot.issued_at);
+                // Split L into issue / flight / commit. Only loads that took
+                // the burst path carry both stamps; the rest are counted in
+                // L but not in the split, so lat_n is reported separately.
+                if (slot.t_last_req >= 0 && slot.t_first_beat >= 0 &&
+                    slot.t_first_beat >= slot.t_last_req)
+                {
+                    _this->lat_n++;
+                    _this->lat_issue += (uint64_t)(slot.t_last_req - slot.issued_at);
+                    _this->lat_flight += (uint64_t)(slot.t_first_beat - slot.t_last_req);
+                    _this->lat_commit += (uint64_t)(now - slot.t_first_beat);
+                }
             }
             _this->vu.insn_end(pending_insn);
         }
