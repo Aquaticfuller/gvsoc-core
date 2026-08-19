@@ -25,6 +25,7 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "cpu/iss/flexfloat/flexfloat.h"
+#include "cpu/iss/flexfloat/ff_fenv_fast.h"
 #include "int.h"
 #include <stdint.h>
 #include <math.h>
@@ -66,21 +67,21 @@
 
 #define FLOAT_EXEC_1(name, a, e, m ,res)            \
     FLOAT_INIT_1(a, e, m)                           \
-    feclearexcept(FE_ALL_EXCEPT);                   \
+    ff_clearexcept(FE_ALL_EXCEPT);                   \
     name(&ff_res, &ff_a);                           \
     update_fflags_fenv(iss);                        \
     res = flexfloat_get_bits(&ff_res);
 
 #define FLOAT_EXEC_2(name, a, b, e, m ,res)         \
     FLOAT_INIT_2(a, b, e, m)                        \
-    feclearexcept(FE_ALL_EXCEPT);                   \
+    ff_clearexcept(FE_ALL_EXCEPT);                   \
     name(&ff_res, &ff_a, &ff_b);                    \
     update_fflags_fenv(iss);                        \
     res = flexfloat_get_bits(&ff_res);
 
 #define FLOAT_EXEC_3(name, a, b, c, e, m ,res)      \
     FLOAT_INIT_3(a, b, c, e, m)                     \
-    feclearexcept(FE_ALL_EXCEPT);                   \
+    ff_clearexcept(FE_ALL_EXCEPT);                   \
     name(&ff_res, &ff_a, &ff_b, &ff_c);             \
     update_fflags_fenv(iss);                        \
     res = flexfloat_get_bits(&ff_res);
@@ -3720,7 +3721,7 @@ static inline void lib_FNMACCVV (Iss *iss, int vs1,     int vs2, int vd, bool vm
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
 
             FLOAT_INIT_3(data2, data1, data3, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_a.value = -ff_a.value;
             ff_c.value = -ff_c.value;
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
@@ -3753,7 +3754,7 @@ static inline void lib_FNMACCVF (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
 
             FLOAT_INIT_3(data1, data2, data3, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_a.value = -ff_a.value;
             ff_c.value = -ff_c.value;
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
@@ -3788,7 +3789,7 @@ static inline void lib_FMSACVV  (Iss *iss, int vs1,     int vs2, int vd, bool vm
 
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
             FLOAT_INIT_3(data2, data1, data3, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_c.value = -ff_c.value;
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
@@ -3818,7 +3819,7 @@ static inline void lib_FMSACVF  (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
         if(!mask(vm,bin)){
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
             FLOAT_INIT_3(data1, data2, data3, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_c.value = -ff_c.value;
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
@@ -3851,7 +3852,7 @@ static inline void lib_FNMSACVV (Iss *iss, int vs1,     int vs2, int vd, bool vm
 
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
             FLOAT_INIT_3(data1, data2, data3, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_a.value = -ff_a.value;
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
@@ -3881,7 +3882,7 @@ static inline void lib_FNMSACVF (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
         if(!mask(vm,bin)){
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
             FLOAT_INIT_3(data1, data2, data3, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_a.value = -ff_a.value;
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
@@ -3914,7 +3915,7 @@ static inline void lib_FMADDVV  (Iss *iss, int vs1,     int vs2, int vd, bool vm
 
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
             FLOAT_INIT_3(data1, data3, data2, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);            
@@ -3943,7 +3944,7 @@ static inline void lib_FMADDVF  (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
         if(!mask(vm,bin)){
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
             FLOAT_INIT_3(data1, data3, data2, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -3975,7 +3976,7 @@ static inline void lib_FNMADDVV (Iss *iss, int vs1,     int vs2, int vd, bool vm
 
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
             FLOAT_INIT_3(data1, data3, data2, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_a.value = -ff_a.value;
             ff_c.value = -ff_c.value;
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
@@ -4006,7 +4007,7 @@ static inline void lib_FNMADDVF (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
         if(!mask(vm,bin)){
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
             FLOAT_INIT_3(data1, data3, data2, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_a.value = -ff_a.value;
             ff_c.value = -ff_c.value;
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
@@ -4040,7 +4041,7 @@ static inline void lib_FMSUBVV  (Iss *iss, int vs1,     int vs2, int vd, bool vm
 
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
             FLOAT_INIT_3(data1, data3, data2, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_c.value = -ff_c.value;
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
@@ -4070,7 +4071,7 @@ static inline void lib_FMSUBVF  (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
         if(!mask(vm,bin)){
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
             FLOAT_INIT_3(data1, data3, data2, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_c.value = -ff_c.value;
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
@@ -4103,7 +4104,7 @@ static inline void lib_FNMSUBVV (Iss *iss, int vs1,     int vs2, int vd, bool vm
 
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
             FLOAT_INIT_3(data1, data3, data2, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_a.value = -ff_a.value;
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
@@ -4133,7 +4134,7 @@ static inline void lib_FNMSUBVF (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
         if(!mask(vm,bin)){
             int old = setFFRoundingMode(iss, iss->csr.fcsr.frm);
             FLOAT_INIT_3(data1, data3, data2, e, m)
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_a.value = -ff_a.value;
             ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
@@ -4248,7 +4249,7 @@ static inline void lib_FWADDVV  (Iss *iss, int vs1,     int vs2, int vd, bool vm
             ff_init(&ff_res, env2);
             flexfloat_set_bits(&ff_a, data1);
             flexfloat_set_bits(&ff_b, data2);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_add(&ff_res, &ff_a, &ff_b);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4284,7 +4285,7 @@ static inline void lib_FWADDVF  (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
             ff_init(&ff_res, env2);
             flexfloat_set_bits(&ff_a, data1);
             flexfloat_set_bits(&ff_b, data2);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_add(&ff_res, &ff_a, &ff_b);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4322,7 +4323,7 @@ static inline void lib_FWADDWV  (Iss *iss, int vs1,     int vs2, int vd, bool vm
             ff_init(&ff_res, env2);
             flexfloat_set_bits(&ff_a, data1);
             flexfloat_set_bits(&ff_b, data2);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_add(&ff_res, &ff_a, &ff_b);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4358,7 +4359,7 @@ static inline void lib_FWADDWF  (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
             ff_init(&ff_res, env2);
             flexfloat_set_bits(&ff_a, data1);
             flexfloat_set_bits(&ff_b, data2);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_add(&ff_res, &ff_a, &ff_b);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4396,7 +4397,7 @@ static inline void lib_FWSUBVV  (Iss *iss, int vs1,     int vs2, int vd, bool vm
             ff_init(&ff_res, env2);
             flexfloat_set_bits(&ff_a, data2);
             flexfloat_set_bits(&ff_b, data1);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_sub(&ff_res, &ff_a, &ff_b);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4433,7 +4434,7 @@ static inline void lib_FWSUBVF  (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
             ff_init(&ff_res, env2);
             flexfloat_set_bits(&ff_a, data2);
             flexfloat_set_bits(&ff_b, data1);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_sub(&ff_res, &ff_a, &ff_b);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4471,7 +4472,7 @@ static inline void lib_FWSUBWV  (Iss *iss, int vs1,     int vs2, int vd, bool vm
             ff_init(&ff_res, env2);
             flexfloat_set_bits(&ff_a, data2);
             flexfloat_set_bits(&ff_b, data1);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_sub(&ff_res, &ff_a, &ff_b);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4508,7 +4509,7 @@ static inline void lib_FWSUBWF  (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
             ff_init(&ff_res, env2);
             flexfloat_set_bits(&ff_a, data2);
             flexfloat_set_bits(&ff_b, data1);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_sub(&ff_res, &ff_a, &ff_b);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4546,7 +4547,7 @@ static inline void lib_FWMULVV  (Iss *iss, int vs1,     int vs2, int vd, bool vm
             ff_init(&ff_res, env2);
             flexfloat_set_bits(&ff_a, data1);
             flexfloat_set_bits(&ff_b, data2);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_mul(&ff_res, &ff_a, &ff_b);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4583,7 +4584,7 @@ static inline void lib_FWMULVF  (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
             ff_init(&ff_res, env2);
             flexfloat_set_bits(&ff_a, data1);
             flexfloat_set_bits(&ff_b, data2);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_mul(&ff_res, &ff_a, &ff_b);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4624,7 +4625,7 @@ static inline void lib_FWMACCVV (Iss *iss, int vs1,     int vs2, int vd, bool vm
             flexfloat_set_bits(&ff_a, data1);
             flexfloat_set_bits(&ff_b, data2);
             flexfloat_set_bits(&ff_c, data3);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_macc(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4664,7 +4665,7 @@ static inline void lib_FWMACCVF (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
             flexfloat_set_bits(&ff_a, data1);
             flexfloat_set_bits(&ff_b, data2);
             flexfloat_set_bits(&ff_c, data3);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_macc(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4705,7 +4706,7 @@ static inline void lib_FWMSACVV (Iss *iss, int vs1,     int vs2, int vd, bool vm
             flexfloat_set_bits(&ff_a, data1);
             flexfloat_set_bits(&ff_b, data2);
             flexfloat_set_bits(&ff_c, data3);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_msac(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4745,7 +4746,7 @@ static inline void lib_FWMSACVF (Iss *iss, int vs2, int64_t rs1, int vd, bool vm
             flexfloat_set_bits(&ff_a, data1);
             flexfloat_set_bits(&ff_b, data2);
             flexfloat_set_bits(&ff_c, data3);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_msac(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4786,7 +4787,7 @@ static inline void lib_FWNMSACVV(Iss *iss, int vs1,     int vs2, int vd, bool vm
             flexfloat_set_bits(&ff_a, data1);
             flexfloat_set_bits(&ff_b, data2);
             flexfloat_set_bits(&ff_c, data3);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_nmsac(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);
@@ -4826,7 +4827,7 @@ static inline void lib_FWNMSACVF(Iss *iss, int vs2, int64_t rs1, int vd, bool vm
             flexfloat_set_bits(&ff_a, data1);
             flexfloat_set_bits(&ff_b, data2);
             flexfloat_set_bits(&ff_c, data3);
-            feclearexcept(FE_ALL_EXCEPT);
+            ff_clearexcept(FE_ALL_EXCEPT);
             ff_nmsac(&ff_res, &ff_a, &ff_b, &ff_c);
             update_fflags_fenv(iss);
             res = flexfloat_get_bits(&ff_res);

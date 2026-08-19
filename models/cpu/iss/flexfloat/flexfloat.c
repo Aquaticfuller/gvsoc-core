@@ -16,6 +16,7 @@
 */
 
 #include "flexfloat.h"
+#include "ff_fenv_fast.h"
 // To avoid manually discerning backend-type for calls from math.h
 #include <tgmath.h>
 
@@ -274,13 +275,21 @@ void flexfloat_sanitize(flexfloat_t *a)
 #ifdef FLEXFLOAT_FLAGS
         // Inexact results raise an exception
         if(flexfloat_round_bit(a, exp) || flexfloat_sticky_bit(a, exp))
-            feraiseexcept(FE_INEXACT);
+            ff_raiseexcept(FE_INEXACT);
         // As rounding uses FP operations, we don't want to tarnish the accrued flags
         fexcept_t flags;
-        fegetexceptflag(&flags, FE_ALL_EXCEPT);
+#ifdef FF_FENV_FAST_SUPPORTED
+        unsigned int ff_saved_mxcsr = 0;
+        if (ff_fenv_fast_enabled())
+        {
+            ff_saved_mxcsr = ff_mxcsr_read();
+        }
+        else
+#endif
+        ff_getexceptflag(&flags, FE_ALL_EXCEPT);
 #endif
         // Rounding mode
-        int mode = fegetround();
+        int mode = ff_getround();
         if(mode == FE_TONEAREST && flexfloat_nearest_rounding(a, exp))
         {
             int_t rounding_value = flexfloat_rounding_value(a, exp, sign);
@@ -298,7 +307,19 @@ void flexfloat_sanitize(flexfloat_t *a)
         }
 #ifdef FLEXFLOAT_FLAGS
         // Restore flags from before
-        fesetexceptflag(&flags, FE_ALL_EXCEPT);
+#ifdef FF_FENV_FAST_SUPPORTED
+        if (ff_fenv_fast_enabled())
+        {
+            // Only the sticky flags may have moved above, so writing the
+            // captured register back restores exactly them.
+            if (ff_mxcsr_read() != ff_saved_mxcsr)
+            {
+                ff_mxcsr_write(ff_saved_mxcsr);
+            }
+        }
+        else
+#endif
+        ff_setexceptflag(&flags, FE_ALL_EXCEPT);
 #endif
         //a->value = a->value;
         __asm__ __volatile__ ("" ::: "memory");
@@ -324,7 +345,7 @@ void flexfloat_sanitize(flexfloat_t *a)
     {
 #ifdef FLEXFLOAT_FLAGS
         // Raise the underflow exception
-        feraiseexcept(FE_UNDERFLOW);
+        ff_raiseexcept(FE_UNDERFLOW);
 #endif
         uint_t denorm = flexfloat_denorm_frac(a, exp);
         if(denorm == 0) // value too low to be represented, return zero
@@ -357,8 +378,8 @@ void flexfloat_sanitize(flexfloat_t *a)
     {
 #ifdef FLEXFLOAT_FLAGS
         // Raise the proper overflow exception, unless a DIV/0 exception had occured
-        if (!fetestexcept(FE_DIVBYZERO))
-            feraiseexcept(FE_OVERFLOW | FE_INEXACT);
+        if (!ff_testexcept(FE_DIVBYZERO))
+            ff_raiseexcept(FE_OVERFLOW | FE_INEXACT);
 #endif
         exp = inf_exp;
     }
@@ -366,7 +387,7 @@ void flexfloat_sanitize(flexfloat_t *a)
     {
 #ifdef FLEXFLOAT_FLAGS
         // Raise the proper overflow exception
-        feraiseexcept(FE_OVERFLOW | FE_INEXACT);
+        ff_raiseexcept(FE_OVERFLOW | FE_INEXACT);
 #endif
         exp = inf_exp;
         frac = UINT_C(0);
@@ -647,18 +668,33 @@ INLINE void ff_fma(flexfloat_t *dest, const flexfloat_t *a, const flexfloat_t *b
            (b->desc.exp_bits == c->desc.exp_bits) && (b->desc.frac_bits == c->desc.frac_bits));
     #ifdef FLEXFLOAT_ROUNDING
     // Change the rounding mode according to the error direction if we need to do manual rounding for RNE
-    int mode = fegetround();
+    int mode = ff_getround();
     bool eff_sub = flexfloat_sign(a) ^ flexfloat_sign(b) ^ flexfloat_sign(c);
     if (a->desc.frac_bits < NUM_BITS_FRAC && mode == FE_TONEAREST) {
         if (!eff_sub) { // in this case, we need to round away from zero
+#ifdef FF_FENV_FAST_SUPPORTED
+            if (ff_fenv_fast_enabled())
+            {
+                // Flags and rounding control share one register: capture it,
+                // run the trial, then a single write both restores the
+                // pre-trial flags and installs the directed rounding mode.
+                unsigned int saved = ff_mxcsr_read();
+                double try = fma(a->value, b->value, c->value);
+                ff_mxcsr_write((saved & ~FF_MXCSR_ROUND_MASK) |
+                               ((unsigned int)((try >= 0) ? FE_UPWARD : FE_DOWNWARD) << 3));
+            }
+            else
+#endif
+            {
             fexcept_t flags;
-            fegetexceptflag(&flags, FE_ALL_EXCEPT); // get accrued flags to not tarnish them here
+            ff_getexceptflag(&flags, FE_ALL_EXCEPT); // get accrued flags to not tarnish them here
             double try = fma(a->value, b->value, c->value);
-            (try >= 0) ? fesetround(FE_UPWARD) : fesetround(FE_DOWNWARD);
-            fesetexceptflag(&flags, FE_ALL_EXCEPT); // restore flags here
+            (try >= 0) ? ff_setround(FE_UPWARD) : ff_setround(FE_DOWNWARD);
+            ff_setexceptflag(&flags, FE_ALL_EXCEPT); // restore flags here
+            }
         } else {
 #ifdef OLD
-            fesetround(FE_TOWARDZERO); // just truncate
+            ff_setround(FE_TOWARDZERO); // just truncate
 #endif
         }
     }
@@ -671,7 +707,7 @@ INLINE void ff_fma(flexfloat_t *dest, const flexfloat_t *a, const flexfloat_t *b
     #endif
     #ifdef FLEXFLOAT_ROUNDING
     if (a->desc.frac_bits < NUM_BITS_FRAC && mode == FE_TONEAREST)
-        fesetround(FE_TONEAREST); // restore rounding
+        ff_setround(FE_TONEAREST); // restore rounding
     #endif
     flexfloat_sanitize(dest);
     #ifdef FLEXFLOAT_STATS
@@ -685,17 +721,32 @@ INLINE void ff_fnma(flexfloat_t *dest, const flexfloat_t *a, const flexfloat_t *
            (b->desc.exp_bits == c->desc.exp_bits) && (b->desc.frac_bits == c->desc.frac_bits));
     #ifdef FLEXFLOAT_ROUNDING
     // Change the rounding mode according to the error direction if we need to do manual rounding for RNE
-    int mode = fegetround();
+    int mode = ff_getround();
     bool eff_sub = flexfloat_sign(a) ^ flexfloat_sign(b) ^ flexfloat_sign(c);
     if (a->desc.frac_bits < NUM_BITS_FRAC && mode == FE_TONEAREST) {
         if (!eff_sub) { // in this case, we need to round away from zero
+#ifdef FF_FENV_FAST_SUPPORTED
+            if (ff_fenv_fast_enabled())
+            {
+                // Flags and rounding control share one register: capture it,
+                // run the trial, then a single write both restores the
+                // pre-trial flags and installs the directed rounding mode.
+                unsigned int saved = ff_mxcsr_read();
+                double try = fma(a->value, b->value, c->value);
+                ff_mxcsr_write((saved & ~FF_MXCSR_ROUND_MASK) |
+                               ((unsigned int)((try >= 0) ? FE_UPWARD : FE_DOWNWARD) << 3));
+            }
+            else
+#endif
+            {
             fexcept_t flags;
-            fegetexceptflag(&flags, FE_ALL_EXCEPT); // get accrued flags to not tarnish them here
+            ff_getexceptflag(&flags, FE_ALL_EXCEPT); // get accrued flags to not tarnish them here
             double try = fma(a->value, b->value, c->value);
-            (try >= 0) ? fesetround(FE_UPWARD) : fesetround(FE_DOWNWARD);
-            fesetexceptflag(&flags, FE_ALL_EXCEPT); // restore flags here
+            (try >= 0) ? ff_setround(FE_UPWARD) : ff_setround(FE_DOWNWARD);
+            ff_setexceptflag(&flags, FE_ALL_EXCEPT); // restore flags here
+            }
         } else {
-            fesetround(FE_TOWARDZERO); // just truncate
+            ff_setround(FE_TOWARDZERO); // just truncate
         }
     }
     #endif
@@ -708,7 +759,7 @@ INLINE void ff_fnma(flexfloat_t *dest, const flexfloat_t *a, const flexfloat_t *
     #endif
     #ifdef FLEXFLOAT_ROUNDING
     if (a->desc.frac_bits < NUM_BITS_FRAC && mode == FE_TONEAREST)
-        fesetround(FE_TONEAREST); // restore rounding
+        ff_setround(FE_TONEAREST); // restore rounding
     #endif
     flexfloat_sanitize(dest);
     #ifdef FLEXFLOAT_STATS
@@ -738,7 +789,7 @@ INLINE bool ff_le(const flexfloat_t *a, const flexfloat_t *b) {
     assert((a->desc.exp_bits == b->desc.exp_bits) && (a->desc.frac_bits == b->desc.frac_bits));
     #if defined(FLEXFLOAT_FLAGS) && !defined(FLEXFLOAT_CORRECT_CMP_FLAGS)
     if (isnan(a->value) || isnan(b->value))
-        feraiseexcept(FE_INVALID);
+        ff_raiseexcept(FE_INVALID);
     #endif
     #ifdef FLEXFLOAT_STATS
     if(StatsEnabled) getOpStats(a->desc)->cmp += 1;
@@ -750,7 +801,7 @@ INLINE bool ff_lt(const flexfloat_t *a, const flexfloat_t *b) {
     assert((a->desc.exp_bits == b->desc.exp_bits) && (a->desc.frac_bits == b->desc.frac_bits));
     #if defined(FLEXFLOAT_FLAGS) && !defined(FLEXFLOAT_CORRECT_CMP_FLAGS)
     if (isnan(a->value) || isnan(b->value))
-        feraiseexcept(FE_INVALID);
+        ff_raiseexcept(FE_INVALID);
     #endif
     #ifdef FLEXFLOAT_STATS
     if(StatsEnabled) getOpStats(a->desc)->cmp += 1;
@@ -762,7 +813,7 @@ INLINE bool ff_ge(const flexfloat_t *a, const flexfloat_t *b) {
     assert((a->desc.exp_bits == b->desc.exp_bits) && (a->desc.frac_bits == b->desc.frac_bits));
     #if defined(FLEXFLOAT_FLAGS) && !defined(FLEXFLOAT_CORRECT_CMP_FLAGS)
     if (isnan(a->value) || isnan(b->value))
-        feraiseexcept(FE_INVALID);
+        ff_raiseexcept(FE_INVALID);
     #endif
     #ifdef FLEXFLOAT_STATS
     if(StatsEnabled) getOpStats(a->desc)->cmp += 1;
@@ -774,7 +825,7 @@ INLINE bool ff_gt(const flexfloat_t *a, const flexfloat_t *b) {
     assert((a->desc.exp_bits == b->desc.exp_bits) && (a->desc.frac_bits == b->desc.frac_bits));
     #if defined(FLEXFLOAT_FLAGS) && !defined(FLEXFLOAT_CORRECT_CMP_FLAGS)
     if (isnan(a->value) || isnan(b->value))
-        feraiseexcept(FE_INVALID);
+        ff_raiseexcept(FE_INVALID);
     #endif
     #ifdef FLEXFLOAT_STATS
     if(StatsEnabled) getOpStats(a->desc)->cmp += 1;

@@ -1430,6 +1430,7 @@ static inline unsigned int lib_VEC_PACK_SC_HL_16(Iss *s, unsigned int a, unsigne
 // Floating-Point Emulation
 
 #include "cpu/iss/flexfloat/flexfloat.h"
+#include "cpu/iss/flexfloat/ff_fenv_fast.h"
 #include <stdint.h>
 #include <math.h>
 #include <fenv.h>
@@ -1464,21 +1465,21 @@ static inline unsigned int lib_VEC_PACK_SC_HL_16(Iss *s, unsigned int a, unsigne
 
 #define FF_EXEC_1(s, name, a, e, m) \
     FF_INIT_(a, e, m)               \
-    feclearexcept(FE_ALL_EXCEPT);   \
+    ff_clearexcept(FE_ALL_EXCEPT);   \
     name(&ff_res, &ff_a);           \
     update_fflags_fenv(s);          \
     return flexfloat_get_bits(&ff_res);
 
 #define FF_EXEC_2(s, name, a, b, e, m) \
     FF_INIT_2(a, b, e, m)              \
-    feclearexcept(FE_ALL_EXCEPT);      \
+    ff_clearexcept(FE_ALL_EXCEPT);      \
     name(&ff_res, &ff_a, &ff_b);       \
     update_fflags_fenv(s);             \
     return flexfloat_get_bits(&ff_res);
 
 #define FF_EXEC_3(s, name, a, b, c, e, m) \
     FF_INIT_3(a, b, c, e, m)              \
-    feclearexcept(FE_ALL_EXCEPT);         \
+    ff_clearexcept(FE_ALL_EXCEPT);         \
     name(&ff_res, &ff_a, &ff_b, &ff_c);   \
     update_fflags_fenv(s);                \
     return flexfloat_get_bits(&ff_res);
@@ -1496,7 +1497,7 @@ static inline void clear_fflags(Iss *iss, unsigned long int fflags)
 // updates the fflags from fenv exceptions
 static inline void update_fflags_fenv(Iss *iss)
 {
-    int ex = fetestexcept(FE_ALL_EXCEPT);
+    int ex = ff_testexcept(FE_ALL_EXCEPT);
     int flags = !!(ex & FE_INEXACT) |
                 !!(ex & FE_UNDERFLOW) << 1 |
                 !!(ex & FE_OVERFLOW) << 2 |
@@ -1639,7 +1640,7 @@ static inline unsigned long int lib_flexfloat_avg(Iss *s, unsigned long int a, u
     FF_INIT_2(a, b, e, m)
     flexfloat_t ff_two;
     ff_init_int(&ff_two, 2, (flexfloat_desc_t){e, m});
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     ff_add(&ff_res, &ff_a, &ff_b);
     ff_div(&ff_res, &ff_res, &ff_two);
     update_fflags_fenv(s);
@@ -1650,7 +1651,7 @@ static inline unsigned long int lib_flexfloat_avg(Iss *s, unsigned long int a, u
 static inline unsigned long int lib_flexfloat_itof(Iss *s, unsigned long int a, uint8_t e, uint8_t m)
 {
     flexfloat_t ff_a;
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     ff_init_int(&ff_a, a, (flexfloat_desc_t){e, m});
     update_fflags_fenv(s);
     return flexfloat_get_bits(&ff_a);
@@ -1676,7 +1677,7 @@ static inline unsigned long int lib_flexfloat_msub(Iss *s, unsigned long int a, 
 {
     FF_INIT_3(a, b, c, e, m)
     ff_inverse(&ff_c, &ff_c);
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
     update_fflags_fenv(s);
     return flexfloat_get_bits(&ff_res);
@@ -1686,7 +1687,7 @@ static inline unsigned long int lib_flexfloat_nmsub(Iss *s, unsigned long int a,
 {
     FF_INIT_3(a, b, c, e, m)
     ff_inverse(&ff_a, &ff_a);
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     ff_fma(&ff_res, &ff_a, &ff_b, &ff_c);
     update_fflags_fenv(s);
     return flexfloat_get_bits(&ff_res);
@@ -1695,7 +1696,7 @@ static inline unsigned long int lib_flexfloat_nmsub(Iss *s, unsigned long int a,
 static inline unsigned long int lib_flexfloat_nmadd(Iss *s, unsigned long int a, unsigned long int b, unsigned long int c, uint8_t e, uint8_t m)
 {
     FF_INIT_3(a, b, c, e, m)
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     ff_fnma(&ff_res, &ff_a, &ff_b, &ff_c);
     update_fflags_fenv(s);
     return flexfloat_get_bits(&ff_res);
@@ -1703,20 +1704,20 @@ static inline unsigned long int lib_flexfloat_nmadd(Iss *s, unsigned long int a,
 
 static inline unsigned long int setFFRoundingMode(Iss *s, unsigned long int mode)
 {
-    int old = fegetround();
+    int old = ff_getround();
     switch (mode)
     {
     case 0:
-        fesetround(FE_TONEAREST);
+        ff_setround(FE_TONEAREST);
         break;
     case 1:
-        fesetround(FE_TOWARDZERO);
+        ff_setround(FE_TOWARDZERO);
         break;
     case 2:
-        fesetround(FE_DOWNWARD);
+        ff_setround(FE_DOWNWARD);
         break;
     case 3:
-        fesetround(FE_UPWARD);
+        ff_setround(FE_UPWARD);
         break;
     case 4:
         printf("Unimplemented roudning mode nearest ties to max magnitude");
@@ -1727,16 +1728,16 @@ static inline unsigned long int setFFRoundingMode(Iss *s, unsigned long int mode
         switch (s->csr.fcsr.frm)
         {
         case 0:
-            fesetround(FE_TONEAREST);
+            ff_setround(FE_TONEAREST);
             break;
         case 1:
-            fesetround(FE_TOWARDZERO);
+            ff_setround(FE_TOWARDZERO);
             break;
         case 2:
-            fesetround(FE_DOWNWARD);
+            ff_setround(FE_DOWNWARD);
             break;
         case 3:
-            fesetround(FE_UPWARD);
+            ff_setround(FE_UPWARD);
             break;
         case 4:
             printf("Unimplemented roudning mode nearest ties to max magnitude");
@@ -1750,7 +1751,7 @@ static inline unsigned long int setFFRoundingMode(Iss *s, unsigned long int mode
 
 static inline void restoreFFRoundingMode(unsigned long int mode)
 {
-    fesetround(mode);
+    ff_setround(mode);
 }
 
 static inline unsigned long int lib_flexfloat_madd_round(Iss *s, unsigned long int a, unsigned long int b, unsigned long int c, uint8_t e, uint8_t m, unsigned long int round)
@@ -1829,7 +1830,7 @@ static inline unsigned long int lib_flexfloat_sqrt_round(Iss *s, unsigned long i
 {
     int old = setFFRoundingMode(s, round);
     FF_INIT_1(a, e, m)
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     ff_init_double(&ff_res, sqrt(ff_get_double(&ff_a)), env);
     update_fflags_fenv(s);
     restoreFFRoundingMode(old);
@@ -2086,7 +2087,7 @@ static inline unsigned long int lib_flexfloat_eq(Iss *s, unsigned long int a, un
         return 0;
     }
     FF_INIT_2(a, b, e, m)
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     int32_t res = ff_eq(&ff_a, &ff_b);
     update_fflags_fenv(s);
     return res;
@@ -2098,7 +2099,7 @@ static inline unsigned long int lib_flexfloat_ne(Iss *s, unsigned long int a, un
     if (IsNan(a, e, m) || IsNan(b, e, m))
         return 0;
     FF_INIT_2(a, b, e, m)
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     int32_t res = (ff_eq(&ff_a, &ff_b) == 0);
     update_fflags_fenv(s);
     return res;
@@ -2112,7 +2113,7 @@ static inline unsigned long int lib_flexfloat_lt(Iss *s, unsigned long int a, un
         return 0;
     }
     FF_INIT_2(a, b, e, m)
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     int32_t res = ff_lt(&ff_a, &ff_b);
     update_fflags_fenv(s);
     return res;
@@ -2126,7 +2127,7 @@ static inline unsigned long int lib_flexfloat_ge(Iss *s, unsigned long int a, un
         return 0;
     }
     FF_INIT_2(a, b, e, m)
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     int32_t res = (ff_lt(&ff_a, &ff_b) == 0);
     update_fflags_fenv(s);
     return res;
@@ -2140,7 +2141,7 @@ static inline unsigned long int lib_flexfloat_le(Iss *s, unsigned long int a, un
         return 0;
     }
     FF_INIT_2(a, b, e, m)
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     int32_t res = ff_le(&ff_a, &ff_b);
     update_fflags_fenv(s);
     return res;
@@ -2154,7 +2155,7 @@ static inline unsigned long int lib_flexfloat_gt(Iss *s, unsigned long int a, un
         return 0;
     }
     FF_INIT_2(a, b, e, m)
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     int32_t res = (ff_le(&ff_a, &ff_b) == 0);
     update_fflags_fenv(s);
     return res;
@@ -2392,7 +2393,7 @@ static inline int lib_flexfloat_cvt_ff_x_round(Iss *s, int a, uint8_t e, uint8_t
     flexfloat_t ff_a;
     a &= (0x1ULL << (e + m + 1)) - 1;
     a = (a ^ sign_mask) - sign_mask;
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     ff_init_int(&ff_a, a, (flexfloat_desc_t){e, m});
     update_fflags_fenv(s);
     restoreFFRoundingMode(old);
@@ -2405,7 +2406,7 @@ static inline unsigned long int lib_flexfloat_cvt_ff_xu_round(Iss *s, unsigned l
     int old = setFFRoundingMode(s, round);
     flexfloat_t ff_a;
     a &= (0x1ULL << (e + m + 1)) - 1;
-    feclearexcept(FE_ALL_EXCEPT);
+    ff_clearexcept(FE_ALL_EXCEPT);
     ff_init_long(&ff_a, (unsigned long)a, (flexfloat_desc_t){e, m});
     update_fflags_fenv(s);
     restoreFFRoundingMode(old);
