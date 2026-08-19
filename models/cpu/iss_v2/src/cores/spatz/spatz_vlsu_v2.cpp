@@ -152,6 +152,7 @@ void VuLsu::reset(bool active)
             slot.done = false;
             slot.nb_remaining_bursts = 0;
             slot.burst_safe = false;
+            slot.is_load = false;
         }
 
         this->burst_mode = false;
@@ -341,6 +342,7 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
     }
     // H1 runahead safety (RTL dual_safe): burst-mode load without a tail.
     slot.burst_safe = this->burst_mode && (this->pending_size == this->burst_full_bytes);
+    slot.is_load = !is_write;
 
     // ON RTL, it takes some time to switch from one instruction to another, and more if it is from
     // load to store, probably due to latency to write to regfile.
@@ -939,9 +941,14 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     else if (_this->nb_waiting_insn > 0 && _this->remaining_size == 0 &&
         started_unretired < 2)
     {
-        // H1: elder fully issued and burst-safe, next is a burst-safe load.
+        // H1: elder fully issued, next is a burst-safe load. The elder only has
+        // to be a LOAD -- the RTL's dual_adv gates it on commit_insn_q.is_load,
+        // not on the elder being burst-shaped itself (spatz_vlsu.sv:914-922).
+        // Requiring elder.burst_safe here refused runahead whenever the elder
+        // was a plain or tailed load, which is why the model reached N=1.06
+        // against the RTL's 1.23 on the same kernel.
         VuLsuPendingInsn &elder = _this->insns[_this->insn_first];
-        start_ok = elder.burst_safe &&
+        start_ok = elder.is_load &&
             _this->next_insn_burst_safe(_this->insns[_this->insn_first_waiting]);
     }
     else

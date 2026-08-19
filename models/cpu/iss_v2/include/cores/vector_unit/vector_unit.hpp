@@ -166,6 +166,11 @@ public:
     // Cycle the instruction actually started issuing (requester-side latency
     // instrumentation: retire - issued_at = the load's core-visible latency).
     int64_t issued_at = 0;
+    // Is this a load? The H1 runahead gate gives the elder and the younger
+    // instruction DIFFERENT requirements (spatz_vlsu.sv dual_adv): the younger
+    // must be a port-0 burst load, but the elder only has to be a load
+    // (commit_insn_q.is_load).
+    bool is_load = false;
 };
 
 #if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
