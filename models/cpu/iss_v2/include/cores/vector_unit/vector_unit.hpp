@@ -327,6 +327,13 @@ private:
     // the drop-off rate has to be measured, not assumed.
     uint64_t vp_load_burst = 0;
     uint64_t vp_load_nonburst = 0;
+    // Beat ARRIVAL rate at the VLSU, to separate "beats arrive one per cycle"
+    // from "the commit drain fails to pair them". The RTL pairs 100% of its
+    // commit cycles (ParityDrain, 2.00 words/cycle); we pair 31%, so one of
+    // those two stages is the culprit and these counters say which.
+    int64_t beat_last_cycle = -1;
+    uint64_t beat_cycles = 0;    // distinct cycles in which any beat arrived
+    uint64_t beat_total = 0;     // beats arrived
     // Stage split of L, accumulated at retire.
     uint64_t lat_n = 0, lat_issue = 0, lat_flight = 0, lat_commit = 0;
     // Ports to the TCDM, used by VLSU for vector load and store operations
@@ -456,6 +463,7 @@ private:
     int burst_max_words;      // words per full burst (RTL MaxBurstWords = 16)
     int burst_bytes;          // burst_max_words * 4
     int burst_rob_words;      // port-0 ROB depth in words (RTL spatz_vlsu_rob_depth)
+    int burst_sub_word;       // BurstSubWord: e16 may burst (SPATZ_VLSU_BURST_EW16)
     int burst_block_alloc;    // 1: 3-cycle cadence, 0: 18-cycle id walk
     int burst_dual_load;      // 1: full serialization, 2: H1 runahead
     int burst_recv_ports;     // ROB0 fill/commit width (TwinROB0, 1 or 2)

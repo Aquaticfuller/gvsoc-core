@@ -93,6 +93,7 @@ event_label(*this, "label", 0, gv::Vcd_event_type_string)
     // absent (targets without burst support keep the legacy behavior exactly).
     js::Config *cfg = iss.get_js_config();
     this->burst_enable = cfg->get_int("vu/burst_enable");
+    this->burst_sub_word = cfg->get_int("vu/burst_sub_word");
     this->burst_max_words = cfg->get_int("vu/burst_max_words");
     if (this->burst_max_words <= 0) this->burst_max_words = 16;
     this->burst_bytes = this->burst_max_words * 4;
@@ -316,7 +317,13 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
     // so this is latent-mismatch removal, not a behaviour change: the issue
     // path already offsets by vstart (see burst_issue_step).
     this->burst_mode = this->burst_enable && !is_write && !do_stride && reg_indexed == -1
-        && elem_size == 4
+        // RTL spatz_vlsu.sv:227 -- BurstSubWord ? (vsew != EW_8) : (vsew == EW_32).
+        // Everything else in this gate is already in BYTES and needs no change
+        // for e16: a 64 B burst is 16 four-byte MEMORY words whatever the
+        // element width, so pending_size, the rob-word ceiling, the alignment
+        // test and the beat indexing (/4, beat*4) all stay correct.
+        && (this->burst_sub_word ? (elem_size == 4 || elem_size == 2)
+                                 : (elem_size == 4))
         && this->pending_size >= (iss_addr_t)this->burst_bytes
         && this->pending_size <= (iss_addr_t)(this->burst_rob_words * 4)
         && ((this->pending_addr & (iss_addr_t)(this->burst_bytes - 1)) == 0);
@@ -485,9 +492,16 @@ vp::IoRespAck VuLsu::port_resp_muxed(vp::Block *__this, vp::IoReq *req, int id)
             // responses arrive BEAT BY BEAT on this path (the whole-burst
             // path in burst_done is only taken for synchronous DONE), which
             // is why stamping it only there left the split empty.
+            int64_t bnow = _this->vu.iss.clock.get_cycles();
+            _this->beat_total++;
+            if (bnow != _this->beat_last_cycle)
+            {
+                _this->beat_last_cycle = bnow;
+                _this->beat_cycles++;
+            }
             if (entry->slot != nullptr && entry->slot->t_first_beat < 0)
             {
-                entry->slot->t_first_beat = _this->vu.iss.clock.get_cycles();
+                entry->slot->t_first_beat = bnow;
             }
         }
         _this->fsm_event.enable();
@@ -927,7 +941,7 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 " insn_act=%lu no_insn=%lu pair_commit=%lu single_commit=%lu"
                 " wait_beats=%lu req_stall=%lu blk_stall=%lu insn_ret=%lu dual_adv=%lu"
                 " split_n=%lu issue=%.1f flight=%.1f commit=%.1f"
-                " load_burst=%lu load_nonburst=%lu\n",
+                " load_burst=%lu load_nonburst=%lu beats=%lu beat_cyc=%lu\n",
                 (void *)_this, (unsigned long)_this->stat_insns,
                 _this->stat_insns ? (double)_this->stat_lat_issue / _this->stat_insns : 0.0,
                 (double)_this->stat_inflight_acc / _this->stat_inflight_n,
@@ -940,7 +954,9 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 (double)_this->lat_issue / ln, (double)_this->lat_flight / ln,
                 (double)_this->lat_commit / ln,
                 (unsigned long)_this->vp_load_burst,
-                (unsigned long)_this->vp_load_nonburst);
+                (unsigned long)_this->vp_load_nonburst,
+                (unsigned long)_this->beat_total,
+                (unsigned long)_this->beat_cycles);
             fflush(vlsu_f);
         }
     }
