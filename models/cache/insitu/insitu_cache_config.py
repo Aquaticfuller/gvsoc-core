@@ -108,6 +108,16 @@ class InsituCacheControllerConfig(Config):
     # against the RTL reference of 10 isolated / 7 streaming, and byte-enable within 1% of the
     # calibrated synchronous path. Unused when inline_sync_miss is True.
     resp_latency_cycles: int = 0
+    # Hit-side FLOOR (0 = off, use resp_latency_cycles as a tail addend instead). When > 0 a hit
+    # becomes eligible to respond at max(now, arrival + hit_latency_floor), i.e. the RTL's hit
+    # latency is a total measured END TO END from the request's arrival rather than a constant added
+    # on top of whatever the pipeline already spent. That distinction is invisible in isolation and
+    # dominant under load: with the addend the model ran +60.8 % on the RTL's own 64-core RLC
+    # baseline, moving ~8,100 kernel cycles per cycle of the constant. Misses keep the addend --
+    # their dominant term is the refill's real memory latency, which is not double-counted, and the
+    # addend is calibrated exactly on the RTL cold-miss reference (MemLatency + 17).
+    # See prompt/rtl_multigroup_comparison_2026-08-25.md.
+    hit_latency_floor: int = 0
     # CALIBRATION (async path only). Extra structural delay for accesses that WAITED ON A REFILL.
     # A hit and a miss cannot share one constant: the RTL reference is a warm read-hit of 10
     # cycles isolated and a cold read-miss of MemLatency + 17. With resp_latency_cycles alone the

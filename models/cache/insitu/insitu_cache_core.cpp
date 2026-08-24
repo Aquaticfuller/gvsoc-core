@@ -58,14 +58,14 @@ public:
         if (served_lat_n_)
             fprintf(stderr, "[INSITU-CORE %s] served_lat_avg=%.2f over %lu accesses "
                             "| HIT avg=%.2f min=%ld n=%lu | MISS avg=%.2f min=%ld n=%lu "
-                            "(resp_delay=%d miss_extra=%d)\n",
+                            "(resp_delay=%d miss_extra=%d hit_floor=%d)\n",
                     this->get_path().c_str(), (double)served_lat_sum_ / (double)served_lat_n_,
                     (unsigned long)served_lat_n_,
                     hit_lat_n_ ? (double)hit_lat_sum_ / (double)hit_lat_n_ : 0.0,
                     (long)hit_lat_min_, (unsigned long)hit_lat_n_,
                     miss_lat_n_ ? (double)miss_lat_sum_ / (double)miss_lat_n_ : 0.0,
                     (long)miss_lat_min_, (unsigned long)miss_lat_n_,
-                    (int)resp_latency_cycles_, (int)miss_extra_cycles_);
+                    (int)resp_latency_cycles_, (int)miss_extra_cycles_, (int)hit_latency_floor_);
         vp::Component::stop();
     }
 
@@ -86,6 +86,7 @@ private:
     void install_refill();                 // refill block
     void drain_outputs();                  // one beat per output FIFO
     void stage0_arbitrate();               // pick next preread task
+    int64_t hit_ready_cyc(vp::IoReq *req);  // eligibility cycle for a hit (floor or legacy addend)
     bool any_work() const;
 
     // --- functional data (RETAINED from controller.cpp:118-130) ---
@@ -247,6 +248,26 @@ private:
     // STRUCTURALLY: a completed access becomes eligible to respond only this many cycles later, so the
     // delay is real time the requester actually observes. 0 keeps the raw pipeline behaviour.
     int32_t  resp_latency_cycles_ = 0;
+    // HIT-side FLOOR (preferred over the addend above; > 0 enables it).
+    //
+    // resp_latency_cycles_ is an ADDEND at the pipeline tail: a hit becomes eligible
+    // `resp_latency_cycles_` cycles after it completes. Isolated that is right — the pipeline costs
+    // ~2 cycles, +8 lands on the RTL's 10. Under load it is wrong, because the request has ALREADY
+    // spent real time queueing in in_q_, in stage-0/stage-1, on bank conflicts and on MSHR waits, and
+    // the 8 is added on top of all of it. The error is per-access, so it compounds: measured against
+    // the RTL's own 64-core RLC baseline (reports/rlc_64core_baseline_2026-08-24) the model ran
+    // +60.8 %, and sweeping this constant moved the kernel by ~8,100 cycles PER CYCLE of the constant
+    // — at 0 the fastest cores matched RTL to 0.6 %. See prompt/rtl_multigroup_comparison_2026-08-25.md.
+    //
+    // The floor expresses what the RTL number actually means: a hit takes `hit_latency_floor_` cycles
+    // END TO END from arrival, not "pipeline plus a constant". Eligibility becomes
+    // max(now, accept_cyc + floor), so an isolated hit still lands exactly on the floor while a loaded
+    // hit that already spent more than that adds nothing.
+    //
+    // Applies to HITS only. The miss path keeps the addend: its dominant term is the refill's real
+    // memory latency, which is genuinely serial rather than double-counted, and the addend is
+    // calibrated exactly on the RTL's cold-miss reference (MemLatency + 17 = 67 at ML=50).
+    int32_t  hit_latency_floor_ = 0;
     // Miss-side term. A hit and a miss cannot share one constant: the RTL reference is a warm read-hit
     // of 10 cycles isolated and a cold read-miss of MemLatency + 17, while this path reaches only about
     // MemLatency + 11 (memory latency + ~3 pipeline + resp_latency_cycles_). This adds the remainder
@@ -365,6 +386,10 @@ InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
         ? cfg->get_child_int("resp_latency_cycles") : 0;
     // INSITU_RESP_LAT overrides it, so the value can be swept without rebuilding during calibration.
     if (const char *e = getenv("INSITU_RESP_LAT")) resp_latency_cycles_ = atoi(e);
+    hit_latency_floor_ = cfg->get("hit_latency_floor")
+        ? cfg->get_child_int("hit_latency_floor") : 0;
+    // INSITU_HIT_FLOOR overrides it, so the floor can be swept without rebuilding during calibration.
+    if (const char *e = getenv("INSITU_HIT_FLOOR")) hit_latency_floor_ = atoi(e);
     miss_extra_cycles_ = cfg->get("miss_extra_cycles")
         ? cfg->get_child_int("miss_extra_cycles") : 0;
     if (const char *e = getenv("INSITU_MISS_EXTRA")) miss_extra_cycles_ = atoi(e);
@@ -885,7 +910,7 @@ bool InsituCacheCore::process_request(vp::IoReq *req)
             cnt_rd_hit_++;
         }
         resp_fifo_.push_back(req);
-        resp_done_cyc_.push_back(clock.get_cycles() + resp_latency_cycles_);   // hit
+        resp_done_cyc_.push_back(hit_ready_cyc(req));   // hit
         was_miss_[req] = false;
         return true;
     }
@@ -933,6 +958,23 @@ bool InsituCacheCore::process_request(vp::IoReq *req)
     miss_fifo_.push_back(addr_line(addr));
     if (is_write) cnt_wr_miss_++; else cnt_rd_miss_++;
     return true;   // miss allocated, refill queued
+}
+
+// Cycle at which a HIT becomes eligible to respond.
+//
+// With hit_latency_floor_ > 0 this is a FLOOR measured from the request's arrival
+// (accept_cyc_), so time the request already spent queueing counts toward it instead of being
+// added to it. Falls back to the legacy tail-addend when the floor is disabled, or when the
+// arrival stamp is missing (it is erased at drain, so a request can only be absent if it was
+// never admitted through req_handler).
+int64_t InsituCacheCore::hit_ready_cyc(vp::IoReq *req)
+{
+    const int64_t now = clock.get_cycles();
+    if (hit_latency_floor_ <= 0) return now + resp_latency_cycles_;
+    auto it = accept_cyc_.find(req);
+    if (it == accept_cyc_.end()) return now + resp_latency_cycles_;
+    const int64_t floor_cyc = it->second + hit_latency_floor_;
+    return floor_cyc > now ? floor_cyc : now;
 }
 
 void InsituCacheCore::install_refill()
