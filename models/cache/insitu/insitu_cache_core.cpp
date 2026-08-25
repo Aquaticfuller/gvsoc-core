@@ -66,6 +66,13 @@ public:
                     miss_lat_n_ ? (double)miss_lat_sum_ / (double)miss_lat_n_ : 0.0,
                     (long)miss_lat_min_, (unsigned long)miss_lat_n_,
                     (int)resp_latency_cycles_, (int)miss_extra_cycles_, (int)hit_latency_floor_);
+        // Unconditional: a run that lost bytes to cross-line truncation must never look clean.
+        if (n_xline_)
+            fprintf(stderr, "[INSITU-CORE %s] *** XLINE TRUNCATIONS: %lu (rd=%lu wr=%lu) "
+                            "%lu BYTES SILENTLY DROPPED -- DATA IS WRONG ***\n",
+                    this->get_path().c_str(), (unsigned long)n_xline_,
+                    (unsigned long)n_xline_rd_, (unsigned long)n_xline_wr_,
+                    (unsigned long)xline_bytes_lost_);
         vp::Component::stop();
     }
 
@@ -95,12 +102,33 @@ private:
         uint32_t off = (uint32_t)(req->get_addr() & (cache_line_bytes_ - 1));
         uint32_t n = (uint32_t)req->get_size();
         if (off + n > cache_line_bytes_) {
-            static int _xl_warns = 0;
-            if (_xl_warns < 12) {
+            // KNOWN DEFECT (2026-08-25): a straddling access is TRUNCATED, not split. The tail bytes
+            // are dropped -- silently, with IO_REQ_OK still returned -- so a write loses its tail and a
+            // read leaves the requester's buffer stale. Splitting into two line lookups (each of which
+            // may independently hit, miss or be pending) is a real change to the core FSM and has not
+            // been made. See prompt/rtl_multigroup_comparison_2026-08-25.md and the WORKLOG entry.
+            //
+            // Until then, at least make it LOUD. This went unnoticed for a long time because it was
+            // invisible three times over: the per-event warning is capped, the cap was on a FUNCTION-
+            // LOCAL static and therefore shared across every cache instance in the simulation (so 12
+            // events total, not 12 per bank), and stderr is swallowed by the `gvsoc` wrapper -- only
+            // install/bin/gvsoc_launcher shows it. The counters below are per-instance and uncapped,
+            // and stop() reports them unconditionally, so a contaminated run can no longer look clean.
+            if (n_xline_ < 12) {
                 fprintf(stderr, "[XLINE] cross-line access addr=0x%lx size=%u off=%u (line=%u) %s -> TRUNCATED\n",
                         (unsigned long)req->get_addr(), n, off, cache_line_bytes_, line_to_req ? "rd" : "wr");
-                _xl_warns++;
             }
+            n_xline_++;
+            if (line_to_req) n_xline_rd_++; else n_xline_wr_++;
+            xline_bytes_lost_ += (uint64_t)(off + n - cache_line_bytes_);
+            // The stop() summary below is NOT sufficient on its own: these kernels routinely fail to
+            // reach end-of-simulation in this harness, so a stop-time-only report is silent for
+            // exactly the runs that need it. Emit a running total at power-of-two milestones instead --
+            // bounded (~30 lines per instance for any realistic count) but never silent about scale.
+            if (n_xline_ >= 16 && (n_xline_ & (n_xline_ - 1)) == 0)
+                fprintf(stderr, "[XLINE] %s: %lu truncations so far, %lu bytes dropped\n",
+                        this->get_path().c_str(), (unsigned long)n_xline_,
+                        (unsigned long)xline_bytes_lost_);
             n = cache_line_bytes_ - off;
         }
         uint8_t *line = &data_[((size_t)set * num_ways_ + (uint32_t)way) * cache_line_bytes_ + off];
@@ -268,6 +296,9 @@ private:
     // memory latency, which is genuinely serial rather than double-counted, and the addend is
     // calibrated exactly on the RTL's cold-miss reference (MemLatency + 17 = 67 at ML=50).
     int32_t  hit_latency_floor_ = 0;
+    // Cross-line truncation accounting (see exchange_line_data). Per-instance and uncapped, unlike
+    // the printed warning -- a run that silently lost bytes must not be able to look clean at stop().
+    uint64_t n_xline_ = 0, n_xline_rd_ = 0, n_xline_wr_ = 0, xline_bytes_lost_ = 0;
     // Miss-side term. A hit and a miss cannot share one constant: the RTL reference is a warm read-hit
     // of 10 cycles isolated and a cold read-miss of MemLatency + 17, while this path reaches only about
     // MemLatency + 11 (memory latency + ~3 pipeline + resp_latency_cycles_). This adds the remainder
