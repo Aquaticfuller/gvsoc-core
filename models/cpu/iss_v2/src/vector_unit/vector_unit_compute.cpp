@@ -18,8 +18,55 @@
  * Authors: Germain Haugou (germain.haugou@gmail.com)
  */
 
+#include <map>
+#include <string>
 #include "cpu/iss_v2/include/iss.hpp"
 #include "cpu/iss_v2/include/cores/vector_unit/vector_unit.hpp"
+
+// --- FPU utilisation probe (TERANOC_FPU_UTIL_PATH) ---------------------------
+// Mirrors the RTL's [FPUG] per-group series so the two can be plotted together.
+// exec_insn_chunk retires (vend - vstart) elements in ONE cycle, which is this
+// model's equivalent of the RTL's per-group lane-busy cycles.
+//
+// Only `vf*` mnemonics are counted: that is FPU utilisation, not vector-unit
+// occupancy -- integer and memory vector ops would inflate it.
+//
+// File-static, deliberately NOT a class member: model .so's embed model/engine
+// types by value and the build does not track headers as a dependency, so
+// changing a class layout leaves stale .so's that segfault during construction.
+// A static here changes no layout. Single clock-engine thread, so no locking.
+namespace {
+struct FpuAcc { int64_t win = -1; uint64_t elems = 0; std::string path; };
+inline void fpu_probe(vp::Component &core, const char *label, int nelem, int64_t cycle)
+{
+    static bool checked = false; static const char *out = nullptr; static int64_t period = 1000;
+    if (!checked)
+    {
+        checked = true;
+        out = getenv("TERANOC_FPU_UTIL_PATH");
+        const char *p = getenv("TERANOC_FPU_UTIL_PERIOD");
+        if (p && atoi(p) > 0) period = atoi(p);
+    }
+    if (!out || nelem <= 0) return;
+    if (!(label && label[0] == 'v' && label[1] == 'f')) return;   // FP ops only
+    static std::map<void *, FpuAcc> acc;
+    static FILE *f = nullptr;
+    if (!f) { f = fopen(out, "a"); if (!f) { out = nullptr; return; } }
+    FpuAcc &a = acc[(void *)&core];
+    if (a.path.empty()) a.path = core.get_path();
+    int64_t w = cycle / period;
+    if (a.win < 0) a.win = w;
+    if (w != a.win)
+    {
+        fprintf(f, "[FPUC] path=%s win=%ld cyc=%ld elems=%lu\n",
+                a.path.c_str(), (long)a.win, (long)(a.win * period),
+                (unsigned long)a.elems);
+        a.win = w; a.elems = 0;
+    }
+    a.elems += (uint64_t)nelem;
+}
+}   // namespace
+
 
 VuCompute::VuCompute(Vu &vu, std::string name)
 : VuBlock(&vu, name), vu(vu),
@@ -155,6 +202,8 @@ void VuCompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
             _this->vu.insn_latency = 0;
             _this->vu.exec_insn_chunk(insn, pending_insn, _this->vstart, _this->vend, nb_elem_per_cycle);
+            fpu_probe(_this->vu.iss, insn->desc->label, _this->vend - _this->vstart,
+                      _this->vu.iss.clock.get_cycles());
             // Each reduction step is an FPU round trip, so the accumulator
             // element only becomes available after the pipeline latency. This
             // overrides the flat cost Vu::insn_handle_reduction leaves in
