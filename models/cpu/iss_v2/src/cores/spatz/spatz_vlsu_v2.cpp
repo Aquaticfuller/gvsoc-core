@@ -32,6 +32,18 @@
  *     callback performed happens at submission instead (see burst_issued).
  */
 
+#include <map>
+#include <set>
+#include <utility>
+
+// Retirement-stall diagnostic state (TERANOC_VLSU_STALL_PATH). File-scope and
+// keyed by instance: adding members would change the class layout, and model
+// .so's embed these types by value while the build does not track headers as a
+// dependency -- stale .so's then segfault during construction.
+namespace { std::map<const void *, long> vlsu_stall_streak;
+            std::map<std::pair<const void *,int>, long> vlsu_retry_rx, vlsu_retry_redeny;
+            std::map<const void *, long> vlsu_last_retire;
+            std::set<const void *> vlsu_stall_reported; }
 #include <cstdio>
 #include <cstdlib>
 #include <cpu/iss_v2/include/cores/vector_unit/vector_unit.hpp>
@@ -75,7 +87,20 @@ event_label(*this, "label", 0, gv::Vcd_event_type_string)
         iss.new_master_port("vlsu_" + std::to_string(i), &this->ports[i], this);
     }
 
+    // PER-PORT ROB depth. The RTL sizes port 0 and ports 1-3 SEPARATELY
+    // (spatz_vlsu.sv: "NrOutstandingLoads sizes two different things at once:
+    // ROB0's burst window ... and ports 1-3's non-burst window (which need not
+    // match)"). The campaign image is ROB0=128 / ROBN=16. This model sized every
+    // port from one knob, so ports 1-3 -- which carry the non-burst path
+    // (strided, indexed, unaligned, and the sub-burst TAIL) -- were 8 deep
+    // against the reference's 16, and port 0 was 8 against 128.
     int nb_outstanding_reqs = iss.get_js_config()->get_child_int("vu/nb_outstanding_reqs");
+    int nb_outstanding_reqs_n = nb_outstanding_reqs;
+    if (iss.get_js_config()->get("vu/nb_outstanding_reqs_n") != NULL)
+    {
+        nb_outstanding_reqs_n = iss.get_js_config()->get_child_int("vu/nb_outstanding_reqs_n");
+        if (nb_outstanding_reqs_n <= 0) nb_outstanding_reqs_n = nb_outstanding_reqs;
+    }
 
     this->rob.resize(nb_ports);
     this->rob_next.resize(nb_ports);
@@ -86,7 +111,7 @@ event_label(*this, "label", 0, gv::Vcd_event_type_string)
     this->denied_reqs.resize(nb_ports);
     for (int i=0; i<nb_ports; i++)
     {
-        this->rob[i].resize(nb_outstanding_reqs);
+        this->rob[i].resize(i == 0 ? nb_outstanding_reqs : nb_outstanding_reqs_n);
     }
 
     // Spatz port-0 burst loads. All default-off/zero when the properties are
@@ -182,7 +207,11 @@ void VuLsu::reset(bool active)
             this->port_stalled[i] = false;
             this->denied_reqs[i] = nullptr;
 
-            for (int j=0; j<nb_outstanding_reqs; j++)
+            // Per-port depth: rob[0] and rob[1..] differ now, so iterate the
+            // ACTUAL size. Using the port-0 depth here wrote 128 entries into a
+            // 16-entry vector on ports 1-3 -- an out-of-bounds write on every
+            // reset, which is what segfaulted the first ROB0=128/ROBN=16 run.
+            for (size_t j=0; j<this->rob[i].size(); j++)
             {
                 this->rob[i][j] = VlsuRobEntry();
             }
@@ -450,12 +479,15 @@ void VuLsu::port_retry_muxed(vp::Block *__this, int id, vp::IoRetryChannel)
     if (err == vp::IO_REQ_DENIED)
     {
         // Lost the election again; keep holding for the next retry.
+        vlsu_retry_rx[{(const void *)_this, id}]++;
+        vlsu_retry_redeny[{(const void *)_this, id}]++;
         return;
     }
 
     // Accepted: release the port. The sequencing state advanced at submission
     // and may already belong to the next instruction.
     _this->denied_reqs[id] = nullptr;
+    vlsu_retry_rx[{(const void *)_this, id}]++;
     _this->port_stalled[id] = false;
 
     if (err == vp::IO_REQ_DONE)
@@ -648,6 +680,46 @@ void VuLsu::burst_done(vp::IoReq *req)
 
             if (nb_ready != group_size)
             {
+                // WEDGE DIAGNOSTIC (TERANOC_VLSU_STALL_PATH). Retirement is
+                // in-order AND cross-port synchronised: every active port's head
+                // must belong to the SAME instruction slot. If the ports' heads
+                // ever misalign to different slots, this break fires forever and
+                // the core stops issuing -- which presents downstream as an
+                // indefinite spin with no memory traffic and no FP retirement,
+                // and with zero MSHR timeouts because nothing is waiting on a
+                // cohort. Report the head state ONCE per core after a long stall.
+                {
+                    static const char *sp = nullptr; static bool ck = false;
+                    if (!ck) { ck = true; sp = getenv("TERANOC_VLSU_STALL_PATH"); }
+                    if (sp)
+                    {
+                        long &st = vlsu_stall_streak[(const void *)_this];
+                        st++;
+                        if (st == 200000 && !vlsu_stall_reported.count((const void *)_this))
+                        {
+                            vlsu_stall_reported.insert((const void *)_this);
+                            static FILE *sf = nullptr;
+                            if (!sf) sf = fopen(sp, "a");
+                            if (sf)
+                            {
+                                fprintf(sf, "[VSTALL] %s cyc=%ld group_size=%d nb_ready=%d"
+                                    " remaining=%d",
+                                    _this->vu.iss.get_path().c_str(),
+                                    (long)_this->vu.iss.clock.get_cycles(),
+                                    group_size, nb_ready, slot.nb_remaining_bursts);
+                                for (int q = _this->load_port_base; q < _this->nb_ports; q++)
+                                {
+                                    VlsuRobEntry &e2 = _this->rob[q][_this->rob_first[q]];
+                                    fprintf(sf, " | p%d cnt=%d first=%d alloc=%d valid=%d"
+                                        " same_slot=%d", q, _this->rob_count[q],
+                                        _this->rob_first[q], (int)e2.allocated, (int)e2.valid,
+                                        (e2.allocated && e2.req) ? (int)(e2.req->slot == &slot) : -1);
+                                }
+                                fprintf(sf, "\n"); fflush(sf);
+                            }
+                        }
+                    }
+                }
                 break;
             }
 
@@ -672,6 +744,8 @@ void VuLsu::burst_done(vp::IoReq *req)
                 _this->rob_first[port] = (_this->rob_first[port] + 1) % _this->rob[port].size();
             }
 
+            vlsu_stall_streak[(const void *)_this] = 0;   // real retirement clears it
+            vlsu_last_retire[(const void *)_this] = (long)_this->vu.iss.clock.get_cycles();
             slot.nb_remaining_bursts -= group_size;
 
             // Notify the committed elements, which may start a chained instruction.
@@ -899,6 +973,49 @@ void VuLsu::burst_issue_step(int64_t cycles)
 
 void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 {
+    {
+        // WEDGE DETECTOR. The FSM only disables when nb_pending_insn == 0, so while
+        // the core is wedged with work outstanding this handler runs every cycle --
+        // which the retirement-break probe does not, because that path is only
+        // reached when a response arrives. Fires once per core.
+        static const char *sp = nullptr; static bool ck = false;
+        if (!ck) { ck = true; sp = getenv("TERANOC_VLSU_STALL_PATH"); }
+        auto *_t = static_cast<VuLsu *>(__this);
+        if (sp && _t->nb_pending_insn.get() > 0)
+        {
+            long now = (long)_t->vu.iss.clock.get_cycles();
+            auto it = vlsu_last_retire.find((const void *)_t);
+            if (it == vlsu_last_retire.end()) vlsu_last_retire[(const void *)_t] = now;
+            else if (now - it->second > 300000 &&
+                     !vlsu_stall_reported.count((const void *)_t))
+            {
+                vlsu_stall_reported.insert((const void *)_t);
+                static FILE *sf = nullptr;
+                if (!sf) sf = fopen(sp, "a");
+                if (sf)
+                {
+                    fprintf(sf, "[VWEDGE] %s cyc=%ld idle_for=%ld pending_insn=%d"
+                        " waiting=%d remaining_size=%ld nb_pending_stores=%d",
+                        _t->vu.iss.get_path().c_str(), now, now - it->second,
+                        (int)_t->nb_pending_insn.get(), (int)_t->nb_waiting_insn,
+                        (long)_t->remaining_size, (int)_t->nb_pending_stores);
+                    for (int q = 0; q < _t->nb_ports; q++)
+                    {
+                        VlsuRobEntry &e2 = _t->rob[q][_t->rob_first[q]];
+                        fprintf(sf, " | p%d cnt=%d/%d first=%d alloc=%d valid=%d stalled=%d"
+                            " retries=%ld redeny=%ld parked=%d",
+                            q, _t->rob_count[q], (int)_t->rob[q].size(), _t->rob_first[q],
+                            (int)e2.allocated, (int)e2.valid, (int)_t->port_stalled[q],
+                            vlsu_retry_rx[{(const void *)_t, q}],
+                            vlsu_retry_redeny[{(const void *)_t, q}],
+                            (int)(_t->denied_reqs[q] != nullptr));
+                    }
+                    fprintf(sf, "\n"); fflush(sf);
+                }
+            }
+        }
+    }
+
     VuLsu *_this = (VuLsu *)__this;
 
     // Requester-side latency instrumentation: sample in-flight instructions
