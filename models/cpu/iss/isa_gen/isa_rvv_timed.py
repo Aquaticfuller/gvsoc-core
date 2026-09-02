@@ -263,6 +263,25 @@ Format_OPIVI = [ OutVReg     (0, Range(7 , 5)),
                  SignedImm  (0, Range(15, 5)),
                  UnsignedImm(0, Range(25, 1)),
 ]
+# vmv.v.x / vmv.v.i splat a scalar (or an immediate) into every element. They have NO vector source
+# operand: the vs2 field (bits 24:20) is reserved-zero in their encoding. Format_OPV / Format_OPIVI
+# declare that field as InVReg, so the model believed every vmv.v.x and vmv.v.i READS v0 — and the
+# dependency tracker then waits for v0 to drain, stalling forever whenever v0 is legitimately used as
+# an ordinary data register (which is architecturally fine). Upstream pulp-platform/ManyRVData#43.
+#
+# These formats are Format_OPV / Format_OPIVI with the vs2 entry removed and nothing else changed.
+# Verified safe against the handlers: vmv_v_x_exec reads REG_GET(0)/REG_OUT(0)/UIM_GET(0) and
+# vmv_v_i_exec reads SIM_GET(0)/REG_OUT(0)/UIM_GET(0) — neither touches in_regs[1].
+Format_VMV_X = [ OutVReg     (0, Range(7 , 5)),
+                 InVReg      (0, Range(15, 5)),#rs1 (scalar source; index 0 is what the handler reads)
+                 UnsignedImm(0, Range(25, 1)),
+]
+
+Format_VMV_I = [ OutVReg     (0, Range(7 , 5)),
+                 SignedImm  (0, Range(15, 5)),
+                 UnsignedImm(0, Range(25, 1)),
+]
+
 Format_OPVLS = [ OutVReg     (0, Range(7 , 5)),
                  InVReg      (0, Range(15, 5)),
                  UnsignedImm(0, Range(25, 0)),
@@ -353,8 +372,8 @@ class Rv32v(IsaSubset):
             Instr('vmerge.vvm'    ,   Format_OPV  ,    '010111 0 ----- ----- 000 ----- 1010111'),
 
             Instr('vmv.v.v'       ,   Format_OPV1  ,    '010111 1 ----- ----- 000 ----- 1010111'),
-            Instr('vmv.v.i'       ,   Format_OPIVI,    '010111 - ----- ----- 011 ----- 1010111'),
-            Instr('vmv.v.x'       ,   Format_OPV  ,    '010111 - ----- ----- 100 ----- 1010111'),
+            Instr('vmv.v.i'       ,   Format_VMV_I,    '010111 - ----- ----- 011 ----- 1010111'),
+            Instr('vmv.v.x'       ,   Format_VMV_X,    '010111 - ----- ----- 100 ----- 1010111'),
             Instr('vmv.s.x'       ,   Format_OPV_0  ,    '010000 - 00000 ----- 110 ----- 1010111'),
             Instr('vmv.x.s'       ,   Format_OPV  ,    '010000 - ----- 00000 010 ----- 1010111'),
 

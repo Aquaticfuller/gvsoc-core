@@ -260,6 +260,13 @@ vp::IoReqStatus InsituCacheAmo::handle(InsituCacheAmo *_this, vp::IoReq *req, bo
     // --- LR: set reservation, present as a plain READ (the load value returns to the core) ---
     if (op == vp::LR) {
         _this->res_.on_lr(core, addr);
+        // The downstream READ writes its result into get_data(). For an LR the loaded value must land
+        // in rd, which the ISS aliases to get_second_data() — the SAME convention the AMO write-back
+        // below already follows (see the comment at the result_dst assignment). Without this redirect
+        // the value lands in the rs2 buffer and rd is left stale, so LR.W returns whatever was in that
+        // register: lock and CAS retry loops then succeed or fail on garbage.
+        // Upstream pulp-platform/ManyRVData#38. The AMO path was fixed for this; LR was missed.
+        if (req->get_second_data() != nullptr) req->set_data(req->get_second_data());
         req->set_opcode(vp::READ);
         return _this->output_.req_forward(req);
     }
