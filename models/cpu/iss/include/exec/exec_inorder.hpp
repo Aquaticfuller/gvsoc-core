@@ -140,7 +140,12 @@ public:
     // This is used by HW loop to know that we interrupted and replayed
     // a ELW instructin so that it is not accounted twice in the loop.
     int elw_interrupted;
-    bool cache_sync;
+    // MUST be initialised at construction, not only in reset(). The shared icache fires its
+    // flush-ack at every core, and it can do so BEFORE some cores have been reset -- at 128+ cores
+    // this reliably happens. An indeterminate cache_sync then reads true in the instruction handler
+    // and decrements a stall counter that was never incremented, aborting with
+    // "Trying to decrease zero stalled counter". Upstream pulp-platform/ManyRVData#39.
+    bool cache_sync = false;
 
     bool debug_mode;
     iss_reg_t elw_insn;

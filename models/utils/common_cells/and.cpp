@@ -19,6 +19,7 @@
  * Authors: Germain Haugou, GreenWaves Technologies (germain.haugou@greenwaves-technologies.com)
  */
 
+#include <cstdint>
 #include <vp/vp.hpp>
 #include <vp/itf/wire.hpp>
 
@@ -64,7 +65,18 @@ And::And(vp::ComponentConf &config)
 
     this->nb_values = (nb_input + 63) / 64;
 
-    this->last_value_mask = ~((1 << (nb_input % 64)) - 1);
+    // Padding mask for the final word: bits [nb_input%64 .. 63] represent inputs that do not exist
+    // and must read as permanently true, so the all-true test can compare whole words.
+    //
+    // Two bugs fixed here (upstream pulp-platform/ManyRVData#39):
+    //  - `1 <<` is an INT shift. At nb_input%64 == 31 it is UB, and for a `1 << bit` used below it
+    //    sign-extends into bits 31..63 of the uint64_t, so any gate with >= 32 inputs spuriously
+    //    reads all-true.
+    //  - when nb_input is an exact multiple of 64 the remainder is 0, giving ~((1<<0)-1) == ~0, i.e.
+    //    the ENTIRE last word marked as padding — so the last 64 real inputs were treated as always
+    //    true. That is exactly the 64-core case.
+    const int last_word_bits = nb_input % 64;
+    this->last_value_mask = (last_word_bits == 0) ? 0ULL : ~((1ULL << last_word_bits) - 1);
 
     this->values.resize(this->nb_values);
 }
@@ -95,18 +107,18 @@ void And::sync(vp::Block *__this, bool value, int id)
 
     if (value)
     {
-        _this->values[value_byte] |= 1 << value_bit;
+        _this->values[value_byte] |= 1ULL << value_bit;
     }
     else
     {
-        _this->values[value_byte] &= ~(1 << value_bit);
+        _this->values[value_byte] &= ~(1ULL << value_bit);
     }
 
-    if (_this->values[value_byte] == -1)
+    if (_this->values[value_byte] == UINT64_MAX)
     {
         for (int i=0; i<_this->nb_values; i++)
         {
-            if (_this->values[i] != -1)
+            if (_this->values[i] != UINT64_MAX)
             {
                 _this->output_itf.sync(false);
                 return;
