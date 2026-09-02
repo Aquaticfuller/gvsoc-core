@@ -156,6 +156,17 @@ void AraVlsu::enqueue_insn(PendingInsn *pending_insn)
 
 void AraVlsu::isa_init()
 {
+    // TEMP diagnostic (issue #42 verification): how many instructions actually carry each tag.
+    if (getenv("VLSU_TAG_DEBUG"))
+    {
+        const char *tags[] = {"vload","vstore","vload_strided","vstore_strided",
+                              "vload_indexed","vstore_indexed"};
+        for (const char *t : tags)
+        {
+            auto *v = this->ara.iss.decode.get_insns_from_tag(t);
+            fprintf(stderr, "[VLSU-TAG] %-16s -> %d insns\n", t, v ? (int)v->size() : -1);
+        }
+    }
     // Attach handlers to instructions so that we can quickly handle load and stores differently
     for (iss_decoder_item_t *insn: *this->ara.iss.decode.get_insns_from_tag("vload"))
     {
