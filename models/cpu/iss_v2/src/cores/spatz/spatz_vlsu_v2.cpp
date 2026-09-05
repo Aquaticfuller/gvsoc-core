@@ -979,14 +979,23 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         // which the retirement-break probe does not, because that path is only
         // reached when a response arrives. Fires once per core.
         static const char *sp = nullptr; static bool ck = false;
-        if (!ck) { ck = true; sp = getenv("TERANOC_VLSU_STALL_PATH"); }
+        static long stall_after = 300000;
+        if (!ck)
+        {
+            ck = true;
+            sp = getenv("TERANOC_VLSU_STALL_PATH");
+            // On a collapsing arm 300k cycles of no retirement is a long wall
+            // wait; let the caller shorten it to get the parked-port census.
+            const char *ap = getenv("TERANOC_VLSU_STALL_AFTER");
+            if (ap) stall_after = strtol(ap, nullptr, 0);
+        }
         auto *_t = static_cast<VuLsu *>(__this);
         if (sp && _t->nb_pending_insn.get() > 0)
         {
             long now = (long)_t->vu.iss.clock.get_cycles();
             auto it = vlsu_last_retire.find((const void *)_t);
             if (it == vlsu_last_retire.end()) vlsu_last_retire[(const void *)_t] = now;
-            else if (now - it->second > 300000 &&
+            else if (now - it->second > stall_after &&
                      !vlsu_stall_reported.count((const void *)_t))
             {
                 vlsu_stall_reported.insert((const void *)_t);

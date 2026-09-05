@@ -18,6 +18,7 @@
  * Authors: Germain Haugou (germain.haugou@gmail.com)
  */
 
+#include <map>
 #include <vp/vp.hpp>
 #include <cpu/iss_v2/include/iss.hpp>
 
@@ -172,6 +173,45 @@ void ExecInOrder::exec_instr(vp::Block *__this, vp::ClockEvent *event)
     if (unlikely(iss->exec.handle_tasks())) return;
 
     iss_reg_t pc = iss->exec.current_insn;
+
+    // PARKED-CORE PC CENSUS (diagnostic; off unless TERANOC_PC_CENSUS_PATH is set).
+    // When a run stalls with the memory system quiescent, the question is not what
+    // the MSHR is doing but where the harts are parked -- a spin loop or a wfi
+    // shows up at once as a tight PC cluster. Bounded samples per core past a
+    // cycle threshold, so the log stays small.
+    //   TERANOC_PC_CENSUS_PATH=<path>  TERANOC_PC_CENSUS_AFTER=<cycle, default 40000>
+    {
+        static bool pc_ck = false;
+        static const char *pc_path = nullptr;
+        static int64_t pc_after = 40000;
+        static FILE *pc_f = nullptr;
+        if (unlikely(!pc_ck))
+        {
+            pc_ck = true;
+            pc_path = getenv("TERANOC_PC_CENSUS_PATH");
+            const char *ap = getenv("TERANOC_PC_CENSUS_AFTER");
+            if (ap) pc_after = strtoll(ap, nullptr, 0);
+            if (pc_path) pc_f = fopen(pc_path, "w");
+        }
+        if (unlikely(pc_f != nullptr))
+        {
+            int64_t cyc = iss->clock.get_cycles();
+            if (cyc > pc_after)
+            {
+                static std::map<const void *, std::pair<int, int64_t>> pc_seen;
+                auto &pe = pc_seen[(const void *)iss];
+                if (pe.first < 6 && cyc - pe.second > 5000)
+                {
+                    pe.first++;
+                    pe.second = cyc;
+                    fprintf(pc_f, "[PC] %s cyc=%ld pc=0x%lx\n",
+                        iss->get_path().c_str(), (long)cyc, (unsigned long)pc);
+                    fflush(pc_f);
+                }
+            }
+        }
+    }
+
 
 #if defined(CONFIG_GVSOC_ISS_TIMED)
     if (iss->prefetch.fetch(pc))
