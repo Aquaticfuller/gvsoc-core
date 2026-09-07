@@ -462,6 +462,23 @@ void Htif::reset(bool active)
     }
 }
 
+// Instrumentation for the HTIF fabric traffic that motivated the event-driven rewrite
+// (upstream pulp-platform/ManyRVData#37). GVSOC_HTIF_STATS=1 reports the tohost address, the bytes
+// read per handler run, and the running req/cyc rate. Syscalls::user_access issues ONE-BYTE
+// requests in a loop on the real, timed data port, so each handler run costs sizeof(iss_reg_t)
+// interconnect transactions -- 4 on rv32, not the 8 the issue assumed.
+//
+// Before the rewrite this counted the 1000-cycle poller and measured 0.253 req/cyc at 64 cores and
+// 1.023 at 256 (past a bank's 1 op/cycle). It now counts store-triggered wake-ups, which in steady
+// state is zero -- which is the point. Env-gated, so it costs nothing when off.
+static unsigned long long htif_polls = 0;
+static unsigned long long htif_bytes = 0;
+static inline bool htif_stats()
+{
+    static const bool v = [](){ const char *e = getenv("GVSOC_HTIF_STATS"); return e && e[0] != '0'; }();
+    return v;
+}
+
 void Htif::htif_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     Iss *iss = (Iss *)__this;
@@ -469,6 +486,24 @@ void Htif::htif_handler(vp::Block *__this, vp::ClockEvent *event)
     if (iss->exec.fetch_enable_reg.get())
     {
         iss_reg_t cmd;
+        if (htif_stats())
+        {
+            if (htif_polls == 0)
+            {
+                fprintf(stderr, "[HTIF-STATS] tohost_addr=0x%lx bytes_per_poll=%d (each byte is a "
+                                "SEPARATE 1-byte req on the timed data port)\n",
+                        (unsigned long)iss->syscalls.htif.tohost_addr, (int)sizeof(cmd));
+            }
+            htif_polls++;
+            htif_bytes += sizeof(cmd);
+            if ((htif_polls % 20000ULL) == 0)
+            {
+                const long cyc = (long)iss->top.clock.get_cycles();
+                fprintf(stderr, "[HTIF-STATS] cyc=%ld polls=%llu byte_reqs=%llu -> %.3f req/cyc\n",
+                        cyc, htif_polls, htif_bytes,
+                        cyc > 0 ? (double)htif_bytes / (double)cyc : 0.0);
+            }
+        }
         iss->syscalls.htif.target_access(iss->syscalls.htif.tohost_addr, sizeof(cmd), false, (uint8_t *)&cmd);
 
         if (cmd != 0)
@@ -479,5 +514,28 @@ void Htif::htif_handler(vp::Block *__this, vp::ClockEvent *event)
         }
     }
 
-    iss->syscalls.htif.htif_event.enqueue(1000);
+    // NO periodic re-arm (upstream pulp-platform/ManyRVData#37). The old code re-enqueued every
+    // 1000 cycles, and each poll read tohost through Syscalls::user_access -- which issues ONE-BYTE
+    // requests in a loop on the real, timed data port. With N cores all polling the same tohost
+    // word that is sizeof(iss_reg_t)*N/1000 transactions per cycle converging on ONE cache bank.
+    // Measured on cachepool at 4 B/poll: 0.253 req/cyc at 64 cores, 1.023 req/cyc at 256 -- past
+    // the bank's 1 op/cycle capacity, so its backlog diverges and cores sharing that bank starve.
+    // The same kernel took 2,250,001 cycles at 64 cores and 23,919,001 at 256 (10.6x for 4x the
+    // cores) purely from host-interface traffic that does not exist in the modelled hardware.
+    //
+    // Now the handler runs only when something actually writes tohost: Lsu::data_req notifies us.
+    // reset() still arms it once, so a tohost already set at startup is still seen.
+}
+
+// Called by the LSU when a store overlaps tohost. Enqueue one cycle LATER so the store has landed
+// in memory before the handler reads it back, and guard on is_enqueued() so a burst of stores in
+// the same window collapses into a single wake-up.
+void Htif::notify_tohost_store()
+{
+#ifdef CONFIG_GVSOC_ISS_HTIF
+    if (this->tohost_addr != 0 && !this->htif_event.is_enqueued())
+    {
+        this->htif_event.enqueue(1);
+    }
+#endif
 }

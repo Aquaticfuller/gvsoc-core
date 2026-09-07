@@ -299,6 +299,25 @@ bool Lsu::lsu_is_empty()
 
 int Lsu::data_req(iss_addr_t addr, uint8_t *data_ptr, uint8_t *memcheck_data, int size, bool is_write, int64_t &latency, int &req_id)
 {
+#ifdef CONFIG_GVSOC_ISS_HTIF
+    // Event-driven HTIF (upstream pulp-platform/ManyRVData#37): wake the tohost handler when a store
+    // touches it, so the handler no longer has to poll every 1000 cycles through the timed fabric.
+    // One comparison per data request; compiled out entirely when HTIF is disabled (e.g. cachepool_v3).
+    // NOTE: the CONFIG_GVSOC_ISS_MEMORY fast path in Lsu::store writes mem_array directly and never
+    // reaches here -- a tohost living in that array would not be seen, but neither would it reach the
+    // fabric, so the handshake would have to be revisited for such a configuration anyway.
+    if (unlikely(is_write))
+    {
+        const iss_reg_t tohost = this->iss.syscalls.htif.get_tohost_addr();
+        if (unlikely(tohost != 0 &&
+                     addr < tohost + (iss_addr_t)sizeof(iss_reg_t) &&
+                     tohost < addr + (iss_addr_t)size))
+        {
+            this->iss.syscalls.htif.notify_tohost_store();
+        }
+    }
+#endif
+
 #if !defined(CONFIG_GVSOC_ISS_HANDLE_MISALIGNED)
 
     return this->data_req_aligned(addr, data_ptr, memcheck_data, size, is_write, latency, req_id);

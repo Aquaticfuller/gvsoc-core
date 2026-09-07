@@ -109,6 +109,11 @@ public:
     void build();
     void reset(bool active);
 
+    // Event-driven tohost handshake (upstream pulp-platform/ManyRVData#37).
+    // The LSU calls this when a store overlaps tohost, replacing the 1000-cycle poll.
+    void notify_tohost_store();
+    inline iss_reg_t get_tohost_addr() { return this->tohost_addr; }
+
 private:
     void handle_syscall(uint64_t cmd);
     void dispatch(uint64_t cmd);
