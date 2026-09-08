@@ -148,9 +148,35 @@ failure is silent by construction, so look for the `[EOC]` line, not for plausib
 | `CACHEPOOL_V3_SYNC_CACHE` | 0 | 1 = the calibrated synchronous cache path instead of the async per-cycle FSM |
 | `CACHEPOOL_V3_L2_NOC` | 1 | 0 = flat router tree instead of the refill mesh |
 | `CACHEPOOL_V3_CELL_COALESCER` | 0 | per-cell part-coalescer (see limitations) |
+| `CACHEPOOL_V3_DRAMSYS` | 0 | 1 = one DRAMSys DRAM per memory channel of the refill mesh, instead of a flat backing store |
+| `CACHEPOOL_V3_DRAM_TYPE` | `hbm2-example.json` | DRAM config, from `core/models/memory/dramsys_configs/` |
 | `SPATZ_VLSU_LINE_SPLIT` | 0 | 1 = stop a unit-stride vector access being coalesced across a cache line (see limitations) |
 | `SPATZ_LOCK_NO_LSU_GATE` | 0 | 1 = disable the Free-mode load/store gate, for A/B |
 | `CACHEPOOL_BARRIER_COUNTING` | 0 | 1 = restore the old global counting barrier, for A/B |
+
+### Running with real DRAM timing
+
+By default the memory behind the refill mesh is a flat store with a fixed latency. With
+`CACHEPOOL_V3_DRAMSYS=1` each **memory channel of the mesh gets its own DRAMSys DRAM**,
+which is what the RTL testbench has. The two DRAM windows are contiguous, so they become one
+address space striped across the channels; a refill routed to mesh channel *n* lands in DRAM
+*n*, because the mesh and the interleaver select on the same address bits.
+
+It needs SystemC preloaded and the SystemC-enabled launcher — `dramsys.so` does not link
+SystemC itself, so without the preload the `sc_api_version` symbol is unresolved:
+
+```bash
+# once
+make dramsys_preparation
+
+# then: generate the config, and run it under the SystemC launcher
+CACHEPOOL_V3_DRAMSYS=1 gvsoc --target=cachepool_v3 --binary <elf> image flash run   # writes gvsoc_config.json
+LD_PRELOAD="$PWD/third_party/systemc_install/lib64/libsystemc.so.3.0.1 \
+  $PWD/add_dramsyslib_patches/build_dynlib_from_github_dramsys5/DRAMSys/build/lib/libDRAMSys_Simulator.so" \
+  install/bin/gvsoc_launcher_sc --config=gvsoc_config.json
+```
+
+Expect **10-100× the wall-clock** of the flat store. Use small kernels.
 
 ### Diagnostics
 
@@ -533,10 +559,10 @@ tile_cfg = InsituCacheTileConfig(
 )
 ```
 
-Then pass `tile_cfg` into an `InsituCacheTile(...)`, or into the spatz cluster's
-`ClusterArch(... insitu_cache_cfg=tile_cfg)`. The `cachepool_v3` target builds its own
-configuration in `pulp/pulp/cachepool_v3/cachepool_v3_system.py` — edit there, or use the
-environment knobs in §2, rather than constructing one by hand.
+Then pass `tile_cfg` into an `InsituCacheTile(...)`. Note that `cachepool_v3` builds its
+own configuration in `pulp/pulp/cachepool_v3/cachepool_v3_system.py` and stamps each tile
+with its id and topology — for that target, edit there or use the environment knobs in §2
+rather than constructing a config by hand.
 
 ### Parameter reference
 
@@ -587,17 +613,14 @@ environment knobs in §2, rather than constructing one by hand.
 | `coalescer` | RTL defaults | Passed to every coalescer. |
 | `interco` | RTL defaults | Auto-has `num_inputs`/`num_outputs` synced by the tile. |
 
-### Overriding via CLI
+### Overriding at run time
 
-The spatz target surfaces one user property today:
+Topology, fidelity and backing store are environment variables — see §2. They are read
+at elaboration, so a change needs `rm -f gvsoc_config.json` before the next run.
 
-```bash
-gvsoc --target=spatz --target-property use_insitu_cache=True ...
-```
-
-Any other knob (line size, ways, FIFO depths, …) currently requires constructing a
-custom `InsituCacheTileConfig` in Python and routing it through a modified cluster
-target. Most `cachepool_v3` knobs are environment variables instead — see §2.
+Cache *geometry* (line size, ways, sets, FIFO depths) is not exposed that way: it comes
+from `make_cachepool_fpu_512_config()` in `insitu_cache_config.py`, which
+`cachepool_v3_system.py` then stamps with the topology. Change it there.
 
 ---
 
@@ -665,9 +688,10 @@ the evidence the error is localised rather than global.
 
 **Known limitations, in rough order of how much they cost you:**
 
-1. **Refill path** — one outstanding miss per controller, and the memory channels share a
-   single backing store. This is the dominant modelling gap and the reason throughput-bound
-   kernels are slow.
+1. **Refill path** — one outstanding miss per controller. This is the dominant modelling gap
+   and the reason throughput-bound kernels are slow. The other half of it — every mesh channel
+   sharing one flat backing store — is addressed by `CACHEPOOL_V3_DRAMSYS=1` (§2), which gives
+   each channel its own DRAM; whether real DRAM timing closes the gap has not yet been measured.
 2. **Cross-line truncation** — a vector access that straddles a cache line has its tail bytes
    dropped, silently, with `IO_REQ_OK` still returned. The straddle is generated inside the
    model, not requested by software: unit-stride vector accesses are sized at the lane width
@@ -701,9 +725,9 @@ the verdict.
 |---|---|
 | `ModuleNotFoundError: typing_extensions` / `override` | Host Python < 3.10. Use the shim (see §2 Prerequisites). |
 | `ModuleNotFoundError: pkg_resources` | `setuptools ≥ 81`. Downgrade: `python3.12 -m pip install --user 'setuptools<81'`. |
-| `gen_cache_insitu_... not found at runtime` | The target didn't actually instantiate the tile. Check `use_insitu_cache=True` is set on the target property. Look for `insitu_cache` in `gvsoc --trace=insitu_cache` output during instantiation. |
+| `gen_cache_insitu_... not found at runtime` | The component was never instantiated, so it was never compiled. Rebuild with the configuration that uses it — the build compiles only what the elaborated target asks for. |
 | Infinite loop / hang on first miss | Refill response path: the downstream memory isn't calling back via `resp_meth`. Check `o_L2` is bound to something that actually completes the request (a `memory.Memory` or a proper router chain). |
-| Address decomposition wrong — low hit rate on expected streaming pattern | `rm_base` mismatch. The tile is wired with `rm_base=False` in the spatz cluster so the cache sees absolute addresses; if you override with `rm_base=True`, adjust expectations. |
+| Address decomposition wrong — low hit rate on an expected streaming pattern | `rm_base` mismatch: the cache is wired to see absolute addresses. If a router in the path removes the offset, the set index shifts and the access pattern scatters. |
 | `Signature mismatch` at Python bind time | The Python port signatures are declared in each component's `o_XX`/`i_XX` factories. Make sure the bound interface uses `signature='io'` for IO ports and a matching tag elsewhere. |
 
 ---
