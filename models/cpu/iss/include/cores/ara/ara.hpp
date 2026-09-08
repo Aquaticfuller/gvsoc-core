@@ -77,6 +77,9 @@ private:
     // can finished, based on operation duration.
     int64_t end_cyclestamp;
     int width;
+    // Cache-line size in bytes, used only by the SPATZ_VLSU_LINE_SPLIT guard to stop a unit-stride
+    // access from being coalesced across a line boundary. 0 disables the clamp.
+    int line_bytes = 0;
 public:
     // Issue-side diagnostics: instruction count + summed busy cycles, dumped at sim stop.
     uint64_t dbg_insns = 0, dbg_busy = 0;
@@ -192,6 +195,9 @@ private:
     int pending_elem;
     int inst_elem_size;
     int width;
+    // Cache-line size in bytes, used only by the SPATZ_VLSU_LINE_SPLIT guard to stop a unit-stride
+    // access from being coalesced across a line boundary. 0 disables the clamp.
+    int line_bytes = 0;
 public:
     // Issue-side diagnostics (fft/etc): instruction and burst counts, dumped at sim stop.
     uint64_t dbg_loads = 0, dbg_stores = 0, dbg_bursts = 0;

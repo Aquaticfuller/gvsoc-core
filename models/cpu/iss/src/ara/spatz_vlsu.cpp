@@ -18,6 +18,7 @@
  * Authors: Germain Haugou (germain.haugou@gmail.com)
  */
 
+#include <cstdlib>
 #include "cpu/iss/include/iss.hpp"
 #include "cpu/iss/include/cores/ara/ara.hpp"
 #include <cstdio>
@@ -61,6 +62,10 @@ fsm_event(this, &AraVlsu::fsm_handler)
     }
 
     this->width = top.get_js_config()->get_child_int("vu/lsu_width");
+    // Optional, used only by the SPATZ_VLSU_LINE_SPLIT guard below; absent on targets that do not
+    // set it, in which case the clamp stays disabled.
+    js::Config *lb = top.get_js_config()->get("vu/line_bytes");
+    this->line_bytes = lb != NULL ? lb->get_int() : 0;
 
     int nb_outstanding_reqs = top.get_js_config()->get_child_int("vu/nb_outstanding_reqs");
     this->req_queues.resize(nb_ports);
@@ -320,6 +325,35 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 else
                 {
                     size = std::min((iss_addr_t)_this->width, _this->pending_size);
+
+                    // SPATZ_VLSU_LINE_SPLIT=1: never emit a request that crosses a cache line.
+                    //
+                    // A unit-stride access is coalesced to the lane width REGARDLESS of element
+                    // size, so a byte-element vse8.v/vle8.v on a base that is not lane-aligned
+                    // becomes 4-byte chunks at arbitrary offsets -- and those can straddle a line
+                    // boundary that no element of the original instruction ever crossed. The cache
+                    // core then silently TRUNCATES the straddling part (see the KNOWN DEFECT note in
+                    // insitu_cache_core.cpp): the tail bytes are dropped and IO_REQ_OK is still
+                    // returned, so a payload copy loses data with no error anywhere.
+                    //
+                    // Found because the RTL-side session noticed the truncated accesses were
+                    // 4 bytes at line offset 63 -- misaligned, which a compiler-emitted sw never is,
+                    // and which their kernel (vle8/vse8 payload, sb headers) cannot ask for. The
+                    // straddle was manufactured here, not requested.
+                    //
+                    // Clamping to the line remainder only changes requests that would otherwise be
+                    // corrupted, so the blast radius is exactly the buggy cases -- unlike splitting
+                    // straddling accesses inside the cache core, which touches the calibrated FSM.
+                    // Default OFF so no calibrated number moves until this is measured and reviewed.
+                    static const bool line_split = [](){
+                        const char *e = getenv("SPATZ_VLSU_LINE_SPLIT");
+                        return e && e[0] != '0'; }();
+                    if (line_split && _this->line_bytes > 0)
+                    {
+                        const uint64_t line_rem = _this->line_bytes -
+                            (_this->pending_addr & (_this->line_bytes - 1));
+                        if (size > line_rem) size = line_rem;
+                    }
                 }
 
                 _this->trace.msg(vp::Trace::LEVEL_TRACE,
