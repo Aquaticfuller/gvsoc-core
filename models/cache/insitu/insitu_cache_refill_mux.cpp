@@ -33,6 +33,17 @@
 #include <vp/vp.hpp>
 #include <vp/itf/io.hpp>
 
+// Funnel diagnostics (INSITU_MUX_STATS=1). A mux is a many-to-one point forwarding ONE request per
+// cycle, so it is exactly the shape that collapses at scale. Reported at power-of-two milestones
+// DURING the run, because most of our kernels never reach stop(). Two counters, deliberately:
+// queue depth alone is ambiguous -- a silent report could mean "no pressure" or "no traffic", which
+// are opposite conclusions. The forward counter disambiguates.
+static inline bool mux_stats()
+{
+    static const bool v = [](){ const char *e = getenv("INSITU_MUX_STATS"); return e && e[0] != '0'; }();
+    return v;
+}
+
 class InsituCacheRefillMux : public vp::Component
 {
 public:
@@ -113,7 +124,20 @@ vp::IoReqStatus InsituCacheRefillMux::req_handler(vp::Block *__this, vp::IoReq *
 {
     InsituCacheRefillMux *_this = static_cast<InsituCacheRefillMux *>(__this);
     _this->queues_[input_id].push_back(req);
-    if (_this->queues_[input_id].size() > _this->max_q_) _this->max_q_ = _this->queues_[input_id].size();
+    if (_this->queues_[input_id].size() > _this->max_q_)
+    {
+        _this->max_q_ = _this->queues_[input_id].size();
+        // A mux is a many-to-one funnel forwarding ONE request per cycle. If the arrival rate exceeds
+        // that, these queues diverge and the depth is the signature. stop() is not reached by most of
+        // our kernels, so report at power-of-two milestones during the run instead -- bounded (~30
+        // lines) but never silent about scale. Same technique as the XLINE truncation counters.
+        if (mux_stats() && _this->max_q_ >= 2 && (_this->max_q_ & (_this->max_q_ - 1)) == 0)
+        {
+            fprintf(stderr, "[MUX-Q] %s: max_q=%lu at cyc=%ld (fwd=%lu)\n",
+                    _this->get_path().c_str(), (unsigned long)_this->max_q_,
+                    (long)_this->clock.get_cycles(), (unsigned long)_this->n_fwd_);
+        }
+    }
     if (!_this->fsm_event_.is_enqueued()) _this->fsm_event_.enqueue();
     return vp::IO_REQ_PENDING;
 }
@@ -171,6 +195,14 @@ void InsituCacheRefillMux::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
         _this->n_fwd_++;
         if (is_prio) _this->n_fwd_prio_++;
+        // Traffic milestone. Without this, a silent MUX-Q report is ambiguous between "the funnel is
+        // not under pressure" and "nothing ever reached this mux" -- two very different conclusions.
+        if (mux_stats() && _this->n_fwd_ >= 1024 && (_this->n_fwd_ & (_this->n_fwd_ - 1)) == 0)
+        {
+            fprintf(stderr, "[MUX-FWD] %s: fwd=%lu at cyc=%ld (max_q=%lu)\n",
+                    _this->get_path().c_str(), (unsigned long)_this->n_fwd_,
+                    (long)_this->clock.get_cycles(), (unsigned long)_this->max_q_);
+        }
 
         // req_forward keeps the upstream resp port, so a PENDING downstream completes straight to the
         // original master. A synchronous OK is ours to answer, since we already returned PENDING —
