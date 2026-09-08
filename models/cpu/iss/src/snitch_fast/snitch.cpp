@@ -269,6 +269,16 @@ void IssWrapper::insn_commit(PendingInsn *pending_insn)
 
 iss_reg_t IssWrapper::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 {
+    // On a dual-Snitch core complex the two harts share one Spatz: stall until this hart owns it.
+    // Unbound arbiter (every single-scalar target) => always granted, so nothing changes there.
+    if (!iss->vu.shared_granted())
+    {
+        iss->vu.shared_status_update(true);
+        iss->exec.trace.msg(vp::Trace::LEVEL_TRACE,
+            "Shared Spatz not granted to this hart (pc: 0x%lx)\n", pc);
+        return pc;
+    }
+
     // We stall the instruction if ara queue is full
     if (iss->vu.queue_is_full())
     {

@@ -42,6 +42,37 @@ Ara::Ara(IssWrapper &top, Iss &iss)
     this->blocks[Ara::vlsu_id] = new AraVlsu(*this, top);
     this->blocks[Ara::vfpu_id] = new AraVcompute(*this, "vfpu");
     this->blocks[Ara::vslide_id] = new AraVcompute(*this, "vslide");
+
+    // Shared-accelerator arbitration ports (CachePool dual-Snitch CC). Left unbound on every
+    // single-scalar target, in which case shared_granted() is unconditionally true.
+    this->shared_grant_itf.set_sync_meth(&Ara::shared_grant_sync);
+    top.new_slave_port("vector_grant", &this->shared_grant_itf, this);
+    top.new_master_port("vector_status", &this->shared_status_itf, this);
+}
+
+void Ara::shared_grant_sync(vp::Block *__this, int value)
+{
+    Ara *_this = (Ara *)__this;
+    _this->shared_grant = value != 0;
+}
+
+void Ara::shared_status_update(bool want)
+{
+    if (!this->shared_status_itf.is_bound())
+    {
+        return;
+    }
+    int status = (this->nb_pending_insn.get() != 0 ? 1 : 0)
+               | (want ? 2 : 0)
+#if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
+               | (this->nb_inflight_vlsu != 0 ? 4 : 0)
+#endif
+               ;
+    if (status != this->shared_status)
+    {
+        this->shared_status = status;
+        this->shared_status_itf.sync(status);
+    }
 }
 
 void Ara::reset(bool active)
@@ -61,6 +92,7 @@ void Ara::reset(bool active)
 #if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
         this->nb_pending_vaccess = 0;
         this->nb_pending_vstore = 0;
+        this->nb_inflight_vlsu = 0;
 #endif
     }
 }
@@ -79,6 +111,9 @@ PendingInsn *Ara::pending_insn_alloc(PendingInsn *cva6_pending_insn)
     {
         this->queue_full.set(true);
     }
+    // The shared-Spatz arbiter tracks in-flight work here: this 0->1 transition is what makes a
+    // hand-over wait (RTL AcqWait/RelWait) and what holds a free-mode grant.
+    this->shared_status_update(false);
     int insn_id = this->insn_last;
     this->insn_last = (this->insn_last + 1) % this->queue_size;
 
@@ -100,6 +135,15 @@ PendingInsn *Ara::pending_insn_alloc(PendingInsn *cva6_pending_insn)
 void Ara::insn_enqueue(PendingInsn *cva6_pending_insn)
 {
     this->trace.msg(vp::Trace::LEVEL_TRACE, "Enqueue instruction (pc: 0x%lx)\n", cva6_pending_insn->pc);
+#if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
+    // Acceptance is final here, so this is the one place a vector load/store can be counted exactly
+    // once (see nb_inflight_vlsu). acc_mux's lsu_busy_q is armed by the same event.
+    if (cva6_pending_insn->insn->decoder_item->u.insn.tags[ISA_TAG_VLOAD_ID] ||
+        cva6_pending_insn->insn->decoder_item->u.insn.tags[ISA_TAG_VSTORE_ID])
+    {
+        this->nb_inflight_vlsu++;
+    }
+#endif
     PendingInsn *pending_insn = this->pending_insn_alloc(cva6_pending_insn);
 
 	iss_insn_t *insn = pending_insn->insn;
@@ -178,6 +222,16 @@ void Ara::insn_end(PendingInsn *pending_insn)
         this->nb_pending_vaccess--;
         this->nb_pending_vstore--;
     }
+
+    if (insn->decoder_item->u.insn.tags[ISA_TAG_VLOAD_ID] ||
+        insn->decoder_item->u.insn.tags[ISA_TAG_VSTORE_ID])
+    {
+        this->nb_inflight_vlsu--;
+    }
+
+    // acc_mux's lsu_busy_q clears on spatz_mem_finished, which is asserted when the op has fully
+    // drained -- that is here, not one FSM tick later when the queue slot is reclaimed.
+    this->shared_status_update(false);
 #endif
 
     // Mark the instruction as done. THe FSM will remove it when it is at the head of the queue
@@ -265,6 +319,9 @@ void Ara::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 _this->event_active.event(&zero);
                 _this->event_label.event_string((char *)1, false);
             }
+            // Drained one more instruction — tell the shared-Spatz arbiter (its AcqWait/RelWait
+            // resolve on the in-flight count reaching zero).
+            _this->shared_status_update(false);
             _this->queue_full.set(false);
 
             _this->insn_first = (_this->insn_first + 1) % _this->queue_size;

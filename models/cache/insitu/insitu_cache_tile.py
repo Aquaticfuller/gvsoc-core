@@ -215,7 +215,13 @@ class InsituCacheTile(Component):
                 private_start_addr=_priv_start))
 
         use_coal = getattr(config, 'cell_coalescer', False)
-        n_vlsu = n_ppc - 1   # lanes 0..n_ppc-2 = Spatz VLSU; the last lane (n_ppc-1) = Snitch/FPU scalar
+        # Port-class layout per CC (cachepool_cc_dual.sv: tcdm_req_o[p] = Spatz lane p for
+        # p < NrMemPortsPerSpatz, then tcdm_req_o[NrMemPortsPerSpatz + h] = scalar hart h). So the
+        # LAST n_scalar classes are the scalar ones and every one of them gets its own AMO unit
+        # ("only the last NumScalarPerCC planes are ever driven", cachepool_tile.sv). n_scalar == 1
+        # is the single-Snitch CC and reproduces the previous wiring exactly.
+        n_scalar = max(1, int(getattr(config, 'num_scalar_per_core', 1)))
+        n_vlsu = n_ppc - n_scalar   # lanes 0..n_vlsu-1 = the SHARED Spatz VLSU
 
         # Per-core cache cells. A2 (cell_coalescer): the cell = par_coalescer(4 VLSU lanes) + the scalar
         # bypass → core's 2 inputs (matches cachepool_cache_ctrl). A1: the core takes all n_ppc lanes
@@ -225,7 +231,7 @@ class InsituCacheTile(Component):
         for cb in range(n_ctrl):
             self._ctrls.append(InsituCacheCore(
                 self, f'ctrl_{cb}', config=config.controller,
-                num_input_ports=(2 if use_coal else n_ppc),
+                num_input_ports=((1 + n_scalar) if use_coal else n_ppc),
                 rotate_bits=_rot_bits(cb), rotate_dyn_offset=dyn_off,
                 rotate_addr_width=config.addr_width,
                 # E3: this bank's identity for runtime repartition (default matches the xbar).
@@ -246,33 +252,42 @@ class InsituCacheTile(Component):
 
         # Optional AMO/LR-SC shim on the scalar lane (j=n_ppc-1), one per cell (cachepool_tile.sv:658).
         use_amo = getattr(config, 'amo_lane', False)
+        # One AMO unit per (bank, scalar lane): self._amos[cb][h].
         self._amos = []
         if use_amo:
             for cb in range(n_ctrl):
-                self._amos.append(InsituCacheAmo(
-                    self, f'amo_{cb}', word_bytes=4,
-                    # async cache -> hold the lane for real; sync cache -> keep the calibrated stamp
-                    structural_occupancy=not bool(getattr(config.controller, 'inline_sync_miss', True))))
+                bank_amos = []
+                for h in range(n_scalar):
+                    suffix = '' if n_scalar == 1 else f'_{h}'
+                    bank_amos.append(InsituCacheAmo(
+                        self, f'amo_{cb}{suffix}', word_bytes=4,
+                        # async cache -> hold the lane for real; sync cache -> keep the calibrated stamp
+                        structural_occupancy=not bool(getattr(config.controller, 'inline_sync_miss', True))))
+                self._amos.append(bank_amos)
 
         # xbar outputs → cells. The scalar lane (last) is the core's input 1 (with coalescer) or
         # input n_ppc-1 (A1), routed through the AMO shim when amo_lane is set.
         for cb in range(n_ctrl):
-            scalar_core_in = 1 if use_coal else (n_ppc - 1)
             if use_coal:
                 # VLSU lanes (xbar 0..n_vlsu-1) → coalescer[cb] → core input 0 (VLSU-aggregate).
                 for j in range(n_vlsu):
                     self._xbars[j].o_OUTPUT(cb, self._cellcoals[cb].i_INPUT(j))
                 self._cellcoals[cb].o_OUTPUT(self._ctrls[cb].i_INPUT(0))
             else:
-                # A1: VLSU lanes → core inputs 0..n_ppc-2 directly (no merge).
-                for j in range(n_ppc - 1):
+                # A1: VLSU lanes → core inputs 0..n_vlsu-1 directly (no merge).
+                for j in range(n_vlsu):
                     self._xbars[j].o_OUTPUT(cb, self._ctrls[cb].i_INPUT(j))
-            # scalar lane → (AMO shim →) core scalar input.
-            if use_amo:
-                self._xbars[n_ppc - 1].o_OUTPUT(cb, self._amos[cb].i_INPUT())
-                self._amos[cb].o_OUTPUT(self._ctrls[cb].i_INPUT(scalar_core_in))
-            else:
-                self._xbars[n_ppc - 1].o_OUTPUT(cb, self._ctrls[cb].i_INPUT(scalar_core_in))
+            # Scalar lanes (the last n_scalar port classes) → (AMO shim →) the core's scalar inputs.
+            # With the coalescer the VLSU lanes collapse onto input 0, so the scalar inputs start
+            # at 1; without it they follow the VLSU lanes.
+            for h in range(n_scalar):
+                lane = n_vlsu + h
+                scalar_core_in = (1 + h) if use_coal else lane
+                if use_amo:
+                    self._xbars[lane].o_OUTPUT(cb, self._amos[cb][h].i_INPUT())
+                    self._amos[cb][h].o_OUTPUT(self._ctrls[cb].i_INPUT(scalar_core_in))
+                else:
+                    self._xbars[lane].o_OUTPUT(cb, self._ctrls[cb].i_INPUT(scalar_core_in))
 
         # Refill + eviction (eviction rides the refill path). By default every bank fans into the
         # tile's single o_L2 master. With per_bank_l2_ports the banks instead leave on SEPARATE ports

@@ -475,6 +475,11 @@ class InsituCacheTileConfig:
     # the lane crossbar and the core (cachepool_tile.sv:658). READ/WRITE pass through; LR/SC/AMO handled.
     # Default False. Only meaningful with structural_tile.
     amo_lane: bool = False
+    # Scalar harts sharing one core complex (RTL NumScalarPerCC, cachepool_cc_dual). Each one owns
+    # its OWN scalar TCDM port class and its own AMO unit -- cachepool_tile.sv drives the last
+    # NumScalarPerCC planes of cache_amo_req -- while the Spatz VLSU lanes stay shared, so
+    # tcdm_ports_per_core = NrMemPortsPerSpatz + num_scalar_per_core. 1 = today's single-scalar CC.
+    num_scalar_per_core: int = 1
     num_remote_port_core: int = 0   # remote-out/-in slots per port-class (0 = single-tile, no remote)
     num_tiles: int = 1              # NumTiles (for route.hpp partition-mode selection)
     tile_id: int = 0                # this tile's id (stamped for remote routing)

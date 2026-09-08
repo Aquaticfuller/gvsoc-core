@@ -24,6 +24,7 @@
 #include "cpu/iss/include/types.hpp"
 #include "vp/clock/clock_event.hpp"
 #include "vp/register.hpp"
+#include "vp/itf/wire.hpp"
 
 class Ara;
 class IssWrapper;
@@ -342,6 +343,22 @@ public:
     void insn_commit(int reg, int size);
     // Return true when queue if full and ara can not accept new instructions
     bool queue_is_full() { return this->queue_full.get(); }
+
+    // ---- Shared-accelerator arbitration (CachePool dual-Snitch core complex) ----
+    // On cachepool_cc_dual two scalar Snitch harts share ONE Spatz. The RTL enforces that with
+    // cachepool_spatz_lock (ownership FSM) + acc_mux (only the owner's acc interface is forwarded).
+    // Modelled here as an external grant: while the grant is low this core's vector issue stalls,
+    // exactly like a Snitch whose acc_qready never fires. Unbound port => always granted, so a
+    // single-scalar CC keeps today's behaviour bit for bit.
+    bool shared_granted() { return this->shared_grant || !this->shared_grant_itf.is_bound(); }
+    // Publish this core's demand on the shared unit:
+    //   bit0 = vector instructions in flight   (RTL outstanding/lsu_outstanding != 0 -> drain gate)
+    //   bit1 = stalled wanting to issue        (so the arbiter can round-robin without starving)
+    //   bit2 = a vector LOAD/STORE is in flight (RTL acc_mux lsu_busy_q)
+    // The arbiter needs all three: bit0 to know when a hand-over has drained, bit1 to hand over
+    // fairly, bit2 because in Free mode acc_mux refuses EVERY new grant until the outstanding
+    // load/store has fully drained (spatz_vlsu's mem_finished is per drained op, not per issue).
+    void shared_status_update(bool want);
     // Return the CVA6 register value associated to the instruction being executed
     inline uint64_t current_insn_reg_get() { return current_insn_reg; }
     inline uint64_t current_insn_reg_2_get() { return current_insn_reg_2; }
@@ -381,6 +398,22 @@ private:
     vp::Trace event_label;
     // Clock event used for scheduling FSM handler when at least one instruction has to be processed
     vp::ClockEvent fsm_event;
+    // Shared-accelerator arbitration state (see shared_granted()).
+    static void shared_grant_sync(vp::Block *__this, int value);
+    bool shared_grant = false;
+    int shared_status = 0;
+    // Vector load/store instructions actually accepted into the queue and not yet finished.
+    // Deliberately NOT nb_pending_vaccess: that counter is incremented in the ISS's vector stub
+    // handler BEFORE a register-dependency check that can re-execute the same instruction, so it
+    // over-counts once per retry and never returns to zero for an instruction that ever stalled on a
+    // dependency. Harmless for its own purpose (fpu_sequencer only uses it to be conservative about
+    // scalar/vector memory ordering), but fatal as an "LSU busy" level: the Free-mode grant would
+    // latch off permanently and the CC would deadlock. This one is incremented and decremented
+    // exactly once per instruction, at enqueue and at insn_end.
+    int nb_inflight_vlsu = 0;
+    vp::WireMaster<int> shared_status_itf;
+    vp::WireSlave<int> shared_grant_itf;
+
     // Number of instructions currently being processed by Ara. This is increased when an
     // instruction is enqueued, and decreased when it ends
     vp::Register<uint8_t> nb_pending_insn;
