@@ -733,7 +733,7 @@ the verdict.
 ---
 | Run produces no output at all and never ends | Wrong peripheral map. Check `CACHEPOOL_V3_PERIPH_MAP` against the binary; look for the `[EOC]` line as the signal, not for plausible output. |
 | `gvsoc_config.json` ignores a topology change | It is not regenerated if it already exists. `rm -f gvsoc_config.json` after any Python-side change. |
-| Simulator crashes in an unrelated constructor after editing an ISS header | Generated model targets do not track header dependencies. `rm -rf build/engine/CMakeFiles/gen_isa_<target>_*` and rebuild. |
+| Simulator crashes in an unrelated constructor after editing an ISS header | Generated model targets do not track header dependencies, so objects compiled against the old layout get linked against newly compiled ones. `rm -rf build/engine/CMakeFiles/gen_isa_*` — **all** of them, not just the target you are building: each ISA variant has its own object directory, and a stale one only bites when you next build the target that uses it. A fresh clone is unaffected. |
 | A run looks suspiciously silent | The `gvsoc` wrapper can swallow stdout/stderr. Generate the config, then invoke `install/bin/gvsoc_launcher --config=gvsoc_config.json` directly. |
 | Kernel passes but the log shows `XLINE` events | Cross-line truncation has dropped data. The pass is self-consistent and wrong. See §8. |
 
