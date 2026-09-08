@@ -1,188 +1,196 @@
-# InSitu Cache — GVSoC Performance Model
+# CachePool — GVSoC Performance Model
 
-A cycle-approximate GVSoC model of the CachePool InSitu L1 data cache. Targets
-<5% cycle error vs. RTL on typical streaming + random-access workloads.
+A cycle-approximate GVSoC model of the CachePool cluster: many Snitch+Spatz cores over a
+**shared** InSitu L1 data cache, in a multi-group mesh. Targets <5% cycle error against RTL.
 
-- **Architecture spec (latest, v2 — read first):** `prompt/insitu_cache_architecture_v2.md`
-- **Architecture spec (legacy, v1):** `prompt/insitu_cache_architecture.md` (older RTL revision)
-- **Implementation plan** (design decisions, phases, fidelity knobs): `prompt/insitu_cache_gvsoc_plan.md`
+The deployed target is **`cachepool_v3`**. It runs the unmodified CachePool CI binaries.
 
-**Status (2026-06-02).** Config knobs track the latest RTL — `write_through_mode`
-(default `False`, pure write-back), `enable_multi_read_pend`, `enable_spm` +
-`bank_depth_for_spm`, `enable_flush` (reserved), `use_forwarding_buffer`. The
-shipping `cachepool_512` default is the **production** cache (folded + hash-way +
-forwarding-buffer; `make_cachepool_512_config`); the unfolded + LRU + no-fwd
-"conventional" cache is `make_cachepool_512_conventional_config`. The model is
-calibrated against the RTL standalone testbench — warm hit 10, cold miss
-MemLatency+17, miss-throughput serialization, write latency 8 / throughput ~0.49,
-read-after-write forwarding 7 — via the `insitu_cache_calib` target (trace replay
-+ a fixed-latency serializing refill memory `insitu_calib_mem`). See
-`prompt/insitu_cache_calib_report.md`. Phase B (single wide cache + N→1
-coalescer + scalar bypass) is documented in
-`prompt/insitu_cache_architecture_v2.md` §11 and is not yet implemented.
+- Architecture spec: `prompt/insitu_cache_architecture_v2.md`
+- Structure map (dated, badged by model status): `prompt/insitu_cache_structure_map_*.md` — read the newest
+- Development log: `prompt/WORKLOG.md`
 
 ---
 
-## 1. What's in the Box
+## 1. CachePool, and what the model reproduces
 
-Four components, three C++ / four Python files under `core/models/cache/insitu/`:
+### The hierarchy
 
-| Component | Files | Role |
+```
+CLUSTER
+└── GROUP  × (nb_x × nb_y)                     mesh; two NoC levels cross it
+    └── TILE × tiles_per_group
+        ├── CORE COMPLEX × cc_per_tile         ← the unit that owns a Spatz + one cache bank
+        │   ├── scalar hart × NumScalarPerCC   ← 1 today, 2 on the dual-scalar config
+        │   └── Spatz vector unit              ← ONE per complex, shared by its harts
+        ├── L1 instruction cache               one per tile
+        ├── per-port-class crossbars           any core → any bank, by address
+        └── L1 data cache slice                one bank per core complex
+```
+
+**The core complex, not the core, is the unit of ownership.** A complex owns one Spatz and
+one L1 cache controller; its harts own neither. So `NumCores = NumCC × NumScalarPerCC` while
+`NumL1CacheCtrl = NumCC`. Anything counted by the peripheral or the barrier is per hart;
+anything provided by the cache or the vector unit is per complex.
+
+### The L1 is shared, not private
+
+This is the defining property and the easiest thing to get wrong. A tile's crossbars route
+**any** core to **any** bank by address; remote crossbars extend that across tiles, and the L1
+NoC across groups. A core's "own" bank is not privileged — the address decides. Each port
+class (the Spatz VLSU lanes, and one scalar port per hart) gets its own crossbar plane, so
+vector and scalar traffic never contend for the same arbiter.
+
+### Two NoC levels
+
+| Level | Carries | Topology |
 |---|---|---|
-| **Controller** | `insitu_cache_controller.{cpp,py}` | One cache controller. Tag array, hit/miss, MSHR merge, hash-or-LRU victim select, eviction, refill, write-through hook. Serves a subset of lines (interleaved). |
-| **Interco** | `insitu_cache_interco.{cpp,py}` | Hashed N-to-M crossbar. Routes upstream TCDM ports to cache controllers by address bits `[dynamic_offset +: log2(num_outputs)]`, with per-output round-robin arbitration. |
-| **Coalescer** | `insitu_cache_coalescer.{cpp,py}` | Write-through merger. 3-state FSM (`IDLE` / `WRITE_COAL` / `FLUSH`) with a watchdog timeout, tag-change flush, and read-snoop flush. |
-| **Tile** (composite) | `insitu_cache_tile.py` | Composes the three above into one tile: interco → N controllers → N coalescers → L2 fan-in router. Exposes `i_INPUT(port)` per TCDM port and a single `o_L2` master. |
-| **Config** | `insitu_cache_config.py` | `Config` subclasses for each atomic component plus a plain `InsituCacheTileConfig` Python dataclass bundling them. Includes `make_cachepool_512_config()` for the canonical RTL defaults. |
-| **Standalone TB** | `pulp/insitu_cache_tb.py` | Minimal single-host testbench for microbenchmarking the tile in isolation (no Spatz cluster). Target name: `insitu_cache_tb`. |
+| **L1 NoC** | core → L1, one mesh per port class | groups on a mesh, XY routing, cross-group by tunnel |
+| **L2 refill mesh** | L1 → memory (refill, eviction, write-through) | group per node; memory channels hang off the unused edge directions |
 
-### Topology (canonical `cachepool_512`)
+### Inside a cache bank
 
-```
-TCDM request ports (20 = 4 cores × 5 ports per core)
-     │
-     ▼
-┌───────────────────────────────┐
-│ InsituCacheInterco (20 → 4)   │   hash bits [3:2] → controller id
-└───┬───────┬───────┬───────┬───┘
-    │       │       │       │
-  ┌─▼─┐   ┌─▼─┐   ┌─▼─┐   ┌─▼─┐
-  │C0 │   │C1 │   │C2 │   │C3 │     4-way, 128 sets, 512b line, 256 KB total
-  └─┬─┘   └─┬─┘   └─┬─┘   └─┬─┘     hash victim-way by default
-    │       │       │       │
-    │ WRITE_THROUGH paths (per controller)
-    │  ▼       ▼       ▼       ▼
-    │ Coal0  Coal1  Coal2  Coal3   4-cycle watchdog coalescers
-    │  │       │       │       │
-    │  └───────┴───┬───┴───────┘
-    │              │
-    │ REFILL, EVICT (direct, bypass coalescer)
-    ▼              ▼
-┌────────────────────────┐
-│ l2_router (fan-in)     │
-└────────┬───────────────┘
-         ▼
-      o_L2 (bound by caller to SPM, DRAM, wide_axi, …)
-```
+Per-port-class crossbar → optional part-coalescer → AMO/LR-SC shim on each scalar lane →
+the cache core (tag array, MSHR, hash-or-LRU victim selection, refill, eviction). Refill and
+eviction leave on a wide egress that the group arbitrates.
 
-### What's modeled
+### The multi-scalar core complex
 
-Latency, throughput, hit/miss classification, MSHR coalescing, write coalescing,
-FIFO backpressure, per-set bank serialization, eviction + refill cost, and the
-pipeline-depth hit latency.
+When `NumScalarPerCC > 1`, several scalar harts share one Spatz. Hardware arbitrates:
 
-### What's **not** modeled (on purpose — see plan §1.2)
+- **Locked** — one hart owns the vector unit; its requests pass through fully pipelined. The
+  other hart stalls on its next vector instruction. This is the fast path.
+- **Free** — nobody holds the lock; both harts get round-robin access, but only **one request
+  outstanding at a time**, and a vector load/store blocks the next grant from *either* hart
+  until it has fully drained. Vector arithmetic still pipelines.
 
-- Folded SRAM column skewing (`PartSplit`) — folded-eviction cost captured as a single
-  `folded_evict_penalty_cycles` knob
-- Pseudo-dual-port per-word conflicts — folded into aggregate per-set busy timestamps
-- Forwarding-buffer internal FSM — optional fidelity refinement for Phase 7
-- Exact RTL hash polynomial — any deterministic hash on `(tag, set)` is used
+Software takes the lock through two peripheral addresses (acquire / release) that always
+complete immediately and return an outcome code. Note the consequence: **Free mode is not the
+fast path.** A kernel that uses the vector unit alone still pays Free-mode serialisation if it
+never acquires the lock.
+
+### The cluster peripheral
+
+Hardware barrier, boot control, end-of-computation, and the L1D configuration block. The
+barrier is **two-level and masked**, not a global counter: a barrier *read* means "all cores of
+my tile", a barrier *write* carries a per-core participant mask as its data, and a
+cluster-level register selects which tiles participate. Partial barriers are real, and a
+partial barrier is only safe when nothing outside the participating set is waiting at a
+barrier anywhere in the cluster.
 
 ---
 
-## 2. Build
+## 2. Running the model
 
-### Prerequisites
+### Build
 
-Python ≥ 3.10 is required by the GVSoC Python code. On hosts where `python3` points at
-Python 3.9, shim a 3.12:
-
-```bash
-ln -sf /usr/bin/python3.12 /tmp/py312_shims/python3
-export PATH=/tmp/py312_shims:$PATH
-```
-
-Make sure the 3.12 site-packages contain the GVSoC deps. On a fresh host:
+All commands run from the inner `gvsoc/` folder.
 
 ```bash
-python3.12 -m pip install --user \
-    typing_extensions prettytable rich pexpect pycryptodome ppk2_api pyelftools \
-    psutil lz4 numpy pandas matplotlib mako hjson jsonref 'setuptools<81'
+eval "$(scripts/setup_elfutils_headers.sh --env)"
+CXX=g++-14.2.0 CC=gcc-14.2.0 CMAKE=cmake-3.18.1 make build TARGETS="cachepool_v3"
 ```
 
-(The `setuptools<81` pin is needed because GVSoC's `reggen` imports the deprecated
-`pkg_resources` API.)
+`cachepool_v3` is **not** in the default target list — name it explicitly.
 
-### Build the code
-
-The model is compiled on demand — it's triggered by any target that instantiates the
-`InsituCacheTile`. Two canonical invocations:
-
-```bash
-# Standalone testbench (recommended for first build — smallest surface):
-CXX=g++-14.2.0 CC=gcc-14.2.0 CMAKE=cmake-3.18.1 make all TARGETS=insitu_cache_tb
-
-# Spatz cluster with the cache enabled:
-CXX=g++-14.2.0 CC=gcc-14.2.0 CMAKE=cmake-3.18.1 \
-    make all TARGETS="spatz:use_insitu_cache=True"
-```
-
-Three shared libraries are installed to `install/models/`:
-
-```
-gen_cache_insitu_insitu_cache_controller_cpp_*.so
-gen_cache_insitu_insitu_cache_interco_cpp_*.so
-gen_cache_insitu_insitu_cache_coalescer_cpp_*.so
-```
-
----
-
-## 3. Running
-
-After building, source the install directory:
+### Run
 
 ```bash
 source sourceme.sh
+gvsoc --target=cachepool_v3 --binary <elf> image flash run
 ```
 
-### Spatz cluster with the cache
+Test binaries live in the ManyRVData tree under `software/build/CachePoolTests/`.
+
+### Topology
+
+Set by environment variable at elaboration time. Defaults give 16 cores.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `CACHEPOOL_V3_NB_X_GROUPS` / `_NB_Y_GROUPS` | 1 / 1 | mesh dimensions — `2×2` = 64 cores, `4×4` = 256 |
+| `CACHEPOOL_V3_TILES_PER_GROUP` | 4 | tiles per group |
+| `CACHEPOOL_V3_CORES_PER_TILE` | 4 | **core complexes** per tile, not harts |
+| `CACHEPOOL_V3_SCALAR_PER_CC` | 1 | scalar harts per complex; `2` = the dual-scalar config |
+| `CACHEPOOL_V3_BANKS_PER_TILE` | = cores | cache banks per tile |
+| `CACHEPOOL_V3_MEM_LATENCY` | 50 | backing-store latency in cycles |
+| `CACHEPOOL_V3_PERIPH_MAP` | `auto` | peripheral register generation — see below |
 
 ```bash
-gvsoc --target=spatz --target-property use_insitu_cache=True \
-      --binary path/to/your/spatz_rv32.elf run
+# 64 cores, single scalar
+CACHEPOOL_V3_NB_X_GROUPS=2 CACHEPOOL_V3_NB_Y_GROUPS=2 \
+  gvsoc --target=cachepool_v3 --binary <elf> image flash run
+
+# 32 core complexes × 2 harts = 64 harts, dual scalar
+CACHEPOOL_V3_NB_X_GROUPS=2 CACHEPOOL_V3_SCALAR_PER_CC=2 \
+  gvsoc --target=cachepool_v3 --binary <elf> image flash run
 ```
 
-When `use_insitu_cache=False` (or omitted) the cluster falls back to the legacy direct
-core↔TCDM path — **no behavior change vs. the pre-cache build**.
+### The peripheral map — get this right first
 
-### Standalone testbench
+Three register-map generations are in circulation and **choosing the wrong one fails
+silently**: the barrier read lands on scratch and stops blocking, the end-of-computation write
+goes nowhere, and the run simply never terminates with no error.
 
-```bash
-gvsoc --target=insitu_cache_tb --binary path/to/rv32im_test.elf run
-```
+| Map | HW_BARRIER | BOOT_CONTROL | EOC | Used by |
+|---|---|---|---|---|
+| `legacy` | 0x10 | 0x20 | 0x24 | the `CachePoolTests` binaries |
+| `rlc_next` | 0x00 | 0x10 | 0x14 | current RTL working tree |
+| `multi_scalar` | 0x00 | 0x18 | 0x1c | the dual-scalar RTL branch |
 
-This target brings up one RV32 scalar host, a single `InsituCacheTile`, a latency-20
-backing memory, and a stdout at 0x8000_0004. Address map:
+`auto` picks `legacy` for single-scalar and `multi_scalar` for dual. Override when the
+binaries disagree. **The reliable check is whether the program terminates** — every wrong-map
+failure is silent by construction, so look for the `[EOC]` line, not for plausible output.
 
-- `0x0000_0000 – 0x0003_FFFF` : scratch (uncached, for stack)
-- `0x1000_0000 – 0x1003_FFFF` : cached region (goes through the tile)
-- `0x8000_0004` : stdout
+### Model-fidelity switches
 
-Use it to drive focused microbenchmarks (random reads, streaming writes, blocked
-GEMM) against the cache without bringing up a full Spatz cluster.
+| Variable | Default | Effect |
+|---|---|---|
+| `CACHEPOOL_V3_SYNC_CACHE` | 0 | 1 = the calibrated synchronous cache path instead of the async per-cycle FSM |
+| `CACHEPOOL_V3_L2_NOC` | 1 | 0 = flat router tree instead of the refill mesh |
+| `CACHEPOOL_V3_CELL_COALESCER` | 0 | per-cell part-coalescer (see limitations) |
+| `SPATZ_VLSU_LINE_SPLIT` | 0 | 1 = stop a unit-stride vector access being coalesced across a cache line (see limitations) |
+| `SPATZ_LOCK_NO_LSU_GATE` | 0 | 1 = disable the Free-mode load/store gate, for A/B |
+| `CACHEPOOL_BARRIER_COUNTING` | 0 | 1 = restore the old global counting barrier, for A/B |
 
-### Tracing
+### Diagnostics
 
-The model registers standard `vp::Trace` channels. Useful filters:
+All are environment-gated and off by default.
 
-```bash
-# Per-controller transaction log (addr, hit/miss, way, latency)
-gvsoc --target=spatz --target-property use_insitu_cache=True \
-      --trace=insitu_cache/ctrl_.*/trace \
-      --binary <elf> run
+| Variable | Reports |
+|---|---|
+| `CACHEPOOL_BARRIER_STATS` | per barrier completion: who was released, who stayed parked, the tile mask |
+| `CACHEPOOL_PERIPH_SELFTEST` | what a pre-write read of the map-critical registers returns |
+| `SPATZ_LOCK_STATS` | per core complex: grant handovers, denials, load/store-gate blocks, concurrent in-flight |
+| `INSITU_MUX_STATS` | refill-mux queue depth and forward counts |
+| `INSITU_SHADOW` | per-bank last-written vs served comparison |
+| `INSITU_AMO_DEBUG=N` | AMO events — **the value is the line budget**, so `=1` yields one line and looks like silence |
 
-# Full interco routing log (which input → which controller)
-gvsoc ... --trace=insitu_cache/interco/trace ...
+Cache counters print unconditionally at end of simulation, and cross-line truncation events
+print at power-of-two milestones during the run, because most kernels never reach `stop()`.
 
-# Coalescer FSM events (writes absorbed, flushes by watchdog/new-tag/snoop)
-gvsoc ... --trace=insitu_cache/coal_.*/trace ...
+---
 
-# Everything
-gvsoc ... --trace=insitu_cache ...
-```
+## 3. Component map
 
-Trace levels: `TRACE` (per-request), `DEBUG` (FSM transitions), `INFO` (instantiation).
+Under `core/models/cache/insitu/`:
+
+| File | Role |
+|---|---|
+| `insitu_cache_core.{cpp,py}` | per-cycle cache FSM — tag array, MSHR, refill, eviction (the deployed path) |
+| `insitu_cache_controller.{cpp,py}` | cycle-approximate controller (the calibrated alternative path) |
+| `insitu_cache_xbar.{cpp,py}` | per-port-class crossbar: any core → any bank by address |
+| `insitu_cache_remote_xbar.{cpp,py}` | cross-tile and cross-group extension of the same |
+| `insitu_cache_amo_shim.{cpp,py}` | AMO / LR-SC on each scalar lane |
+| `insitu_cache_par_coalescer.{cpp,py}`, `insitu_cache_cell_coalescer.{cpp,py}`, `insitu_cache_coalescer.{cpp,py}` | write coalescing, three granularities |
+| `insitu_cache_refill_mux.{cpp,py}` | group-level refill/eviction arbitration |
+| `insitu_cache_config_broadcast.{cpp,py}` | fans a partition-config write to every xbar and bank |
+| `insitu_cache_interco.{cpp,py}` | flat hashed N→M interco (pre-structural path) |
+| `insitu_cache_tile.py`, `insitu_cache_group.py` | composition |
+| `insitu_cache_config.py` | all configuration dataclasses and the canonical factories |
+| `insitu_calib_mem.{cpp,py}` | fixed-latency serializing refill responder for the calibration harness |
+
+Topology for the target itself lives in `pulp/pulp/cachepool_v3/`, and the Spatz ownership
+lock in `cachepool_v3_spatz_lock.{cpp,py}`.
 
 ---
 
@@ -190,7 +198,10 @@ Trace levels: `TRACE` (per-request), `DEBUG` (FSM transitions), `INFO` (instanti
 
 This section describes the latency each transaction class accrues in the model, and
 how that corresponds to the RTL microarchitecture. Numbers in parentheses use the
-canonical `cachepool_512` defaults (§1 of this doc). All cycle counts are added to
+canonical `cachepool_512` defaults.
+**This section describes the cycle-approximate controller path.** The deployed `cachepool_v3`
+target runs the per-cycle cache core instead, where latency emerges from the pipeline rather
+than from these constants; the hop structure and the accounting model below still apply. All cycle counts are added to
 the request's latency via `vp::IoReq::inc_latency()`; the simulator propagates them
 back to the originating core.
 
@@ -522,8 +533,10 @@ tile_cfg = InsituCacheTileConfig(
 )
 ```
 
-Then pass `tile_cfg` into an `InsituCacheTile(...)` or into the spatz cluster's
-`ClusterArch(... insitu_cache_cfg=tile_cfg)`.
+Then pass `tile_cfg` into an `InsituCacheTile(...)`, or into the spatz cluster's
+`ClusterArch(... insitu_cache_cfg=tile_cfg)`. The `cachepool_v3` target builds its own
+configuration in `pulp/pulp/cachepool_v3/cachepool_v3_system.py` — edit there, or use the
+environment knobs in §2, rather than constructing one by hand.
 
 ### Parameter reference
 
@@ -584,85 +597,43 @@ gvsoc --target=spatz --target-property use_insitu_cache=True ...
 
 Any other knob (line size, ways, FIFO depths, …) currently requires constructing a
 custom `InsituCacheTileConfig` in Python and routing it through a modified cluster
-target. Exposing more knobs as CLI properties is a Phase-7 refinement.
+target. Most `cachepool_v3` knobs are environment variables instead — see §2.
 
 ---
 
-## 6. Integration in the Spatz Cluster
+## 6. Telemetry
 
-**File touched:** `pulp/pulp/snitch/snitch_cluster/snitch_cluster.py`
+Each component keeps per-instance counters. The cache core reports unconditionally at end of
+simulation; anything that can be silently wrong reports during the run instead, at power-of-two
+milestones, because most CachePool kernels never reach `stop()`.
 
-`ClusterArch.__init__` gained two new arguments:
-
-```python
-ClusterArch(..., use_insitu_cache=False, insitu_cache_cfg=None)
-```
-
-When `use_insitu_cache=True`:
-
-- An `InsituCacheTile` is created inside the cluster.
-- Each core's scalar `o_DATA` → `cores_ico[core_id]` → `cache_tile.i_INPUT(port)` for
-  TCDM-range addresses (`rm_base=False` so the cache sees absolute addresses).
-- Each Spatz vector lane's `o_VLSU(lane)` → `cache_tile.i_INPUT(port)`.
-- Cache's `o_L2` → `wide_axi.i_INPUT()`. `wide_axi`'s existing map routes TCDM-range
-  requests to `tcdm.i_DMA_INPUT()`, so misses land in the SPM.
-- DMA (`idma.o_TCDM`) continues to bind directly to `tcdm.i_DMA_INPUT()`, **bypassing
-  the cache** (matches the RTL: DMA does not go through the L1).
-
-When `use_insitu_cache=False` (default), the cluster is wired exactly as before — no
-performance change on existing runs.
-
-The user property is plumbed through `SnitchArchProperties.declare_target_properties()`
-in `pulp/pulp/chips/snitch/snitch.py`.
-
-### Pointing L2 at DDR instead of SPM
-
-The cache's `o_L2` goes into `wide_axi`. Whatever memory-map entry on `wide_axi` covers
-the cached region determines where the refills land. To back the cache with DRAM
-instead of the cluster SPM, extend the SoC-level `wide_axi` mapping so TCDM-range
-addresses route to a `dramsys` / `memory.Memory` component outside the cluster, or
-change the cluster's cached region to an address range that the SoC already maps to
-DRAM. The cache model itself doesn't care about the backing memory type.
-
----
-
-## 7. Telemetry
-
-Each component keeps per-instance counters that are accessible via
-`vp::Trace::msg(LEVEL_INFO, ...)` prints and will be (Phase 7) exposed as stat signals
-mirroring the RTL's end-of-sim `$display` format.
-
-### Controller
+### Cache core
 
 ```
-cnt_rd_hit, cnt_rd_miss, cnt_wr_hit, cnt_wr_miss,
-cnt_mshr_merge,                            # read hit on a PEND line
-cnt_evict, cnt_wb_dirty,                   # eviction events, dirty writebacks
-cnt_stall_miss_fifo,                       # miss FIFO full → DENIED
-cnt_stall_evic_fifo,                       # evict FIFO full → DENIED
-cnt_stall_mshr_full,                       # MSHR full → DENIED
-cnt_refills_issued, cnt_writes_through     # outbound requests
+rd_hit, rd_miss, wr_hit, wr_miss            # classification
+refill, evict, flush                        # line movement
+served_lat_avg, HIT avg/min, MISS avg/min   # measured service latency
+XLINE                                       # cross-line truncation events + bytes dropped
 ```
+
+`served_lat_avg` split by hit and miss is the number to compare against RTL; the aggregate
+average moves with hit rate and is not a latency measurement.
 
 ### Coalescer
 
 ```
-cnt_writes_absorbed                        # incoming writes
-cnt_flushes_new_tag                        # flush due to line change
-cnt_flushes_watchdog                       # flush due to 4-cycle timeout
-cnt_flushes_snoop                          # flush due to read-snoop match
-cnt_merged_bursts                          # emitted wide bursts
+cnt_writes_absorbed, cnt_merged_bursts      # ratio = effective coalescing
+cnt_flushes_new_tag / _watchdog / _snoop    # why each flush happened
 ```
 
-Effective coalescing ratio = `cnt_writes_absorbed / cnt_merged_bursts`.
+### Arbiters
 
-### Interco
-
-Per-output round-robin and busy-until are internal state; no counters exposed yet.
+`SPATZ_LOCK_STATS` and `INSITU_MUX_STATS` (§2) cover the Spatz ownership arbiter and the
+group refill mux respectively.
 
 ---
 
-## 8. Standalone Testbench
+## 7. Standalone Testbench
 
 Minimal SoC for driving scripted traffic:
 
@@ -680,36 +651,51 @@ gvsoc --target=insitu_cache_tb --binary path/to/rv32im_test.elf run
 gvsoc --target=insitu_cache_tb --binary <elf> --trace=insitu_cache run
 ```
 
-This is the recommended harness for Phase-6 microbenchmarks (random reads, streaming
+This is the recommended harness for focused microbenchmarks (random reads, streaming
 writes, blocked GEMM) when comparing cycle counts against RTL.
 
 ---
 
-## 9. Known Limitations & Phase-7 Refinements
+## 8. Current status and limitations
 
-From `prompt/insitu_cache_gvsoc_plan.md` §7:
+**Calibrated.** 64-core RLC anchor against RTL, held stable across the model's development.
+The residual error is **confined to the refill path**, and its sign flips with workload class:
+throughput-bound kernels run slow, latency-bound kernels run slightly fast. That sign flip is
+the evidence the error is localised rather than global.
 
-1. **Per-way bank-busy tracking** — currently aggregate per-set. Promote to per-way if
-   Phase-6 validation shows bank-conflict workloads drifting >5%.
-2. **Forwarding buffer modeling** — meta-bank write absorption is disabled by default.
-   Turn on via `enable_meta_fwd_buffer` (future controller field) if LRU-churn
-   workloads show the model stalling where RTL doesn't.
-3. **Async preread arbitration** — current model is synchronous; RTL's priority
-   ordering (refill > request) may differ in corner cases.
-4. **Hash polynomial match** — Phase-1 uses a Knuth-style hash; RTL uses a specific
-   polynomial. Only matters if set-index aliasing is workload-visible.
-5. **PartSplit folded-SRAM modeling** — captured as a flat penalty today. Replace with
-   per-way folding if eviction-heavy traces show 3–4% residual error.
+**Known limitations, in rough order of how much they cost you:**
 
-### Phase 6 (validation) — not yet done
+1. **Refill path** — one outstanding miss per controller, and the memory channels share a
+   single backing store. This is the dominant modelling gap and the reason throughput-bound
+   kernels are slow.
+2. **Cross-line truncation** — a vector access that straddles a cache line has its tail bytes
+   dropped, silently, with `IO_REQ_OK` still returned. The straddle is generated inside the
+   model, not requested by software: unit-stride vector accesses are sized at the lane width
+   regardless of element size. `SPATZ_VLSU_LINE_SPLIT=1` prevents it and costs nothing on the
+   calibration anchor, but is **default off** pending review, so the default build still
+   truncates. Any run that reports `XLINE` events has lost data.
+3. **Cross-core shared-data visibility** — cross-core write/barrier/read patterns show
+   mismatches that scale with core count. Root cause open. Per-core-private data is unaffected.
+4. **Cell coalescer** — `CACHEPOOL_V3_CELL_COALESCER=1` crashes in the multi-tile response
+   path. Default off.
+5. **Address scrambling** — the RTL's exact hash-way polynomial is approximated by a
+   Knuth-style hash. Only observable if set-index aliasing becomes workload-visible.
+6. **Cache partitioning** — `l1d_part` / `l1d_xbar_config` / `l1d_flush` are accepted as
+   scratch and are no-ops.
+7. **Shared Spatz fidelity** — each hart carries its own vector register file, mutually
+   excluded in time rather than physically shared, so a program that illegally relies on
+   retaining vector state across a lock handover passes here and fails on RTL. Scalar FP is
+   not gated by the lock. `acc_mux`'s writeback FIFO is not modelled, so a writeback-heavy
+   Free-mode stream is optimistic.
 
-Curated workloads: `cache-line-rw-smoke`, random reads, streaming writes, blocked
-GEMM, vector AXPY. Method: same binary on RTL and GVSoC, diff cycle counts and stat
-counters. Target: <5% cycle error, <1% counter error. See plan §6.
+**A note on how to read a passing run.** Several of the defects above are silent in the result
+and loud only in the log — truncation is the clearest case. A run that prints `XLINE` lines and
+still reports PASS has produced a self-consistent wrong answer. Grep the log before trusting
+the verdict.
 
 ---
 
-## 10. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
@@ -721,17 +707,20 @@ counters. Target: <5% cycle error, <1% counter error. See plan §6.
 | `Signature mismatch` at Python bind time | The Python port signatures are declared in each component's `o_XX`/`i_XX` factories. Make sure the bound interface uses `signature='io'` for IO ports and a matching tag elsewhere. |
 
 ---
+| Run produces no output at all and never ends | Wrong peripheral map. Check `CACHEPOOL_V3_PERIPH_MAP` against the binary; look for the `[EOC]` line as the signal, not for plausible output. |
+| `gvsoc_config.json` ignores a topology change | It is not regenerated if it already exists. `rm -f gvsoc_config.json` after any Python-side change. |
+| Simulator crashes in an unrelated constructor after editing an ISS header | Generated model targets do not track header dependencies. `rm -rf build/engine/CMakeFiles/gen_isa_<target>_*` and rebuild. |
+| A run looks suspiciously silent | The `gvsoc` wrapper can swallow stdout/stderr. Generate the config, then invoke `install/bin/gvsoc_launcher --config=gvsoc_config.json` directly. |
+| Kernel passes but the log shows `XLINE` events | Cross-line truncation has dropped data. The pass is self-consistent and wrong. See §8. |
 
-## 11. Where to Dig Next
+---
 
-- **Architecture**: `prompt/insitu_cache_architecture.md` — RTL microarchitecture (SOT).
-- **Plan**: `prompt/insitu_cache_gvsoc_plan.md` — modeling philosophy, phases, validation
-  plan.
-- **Existing cache reference**: `core/models/cache/cache_v3.{cpp,py}` — LFSR-based
-  set-associative cache, similar patterns for save/restore and refill queuing.
-- **Interleaver reference**: `pulp/pulp/cluster/l1_interleaver_impl.cpp` — the pattern
-  the hashed interco follows.
-- **Memory model reference**: `core/models/memory/memory_v2.cpp` — bandwidth/latency
-  modeling idioms.
-- **Spatz target**: `pulp/spatz.py` → `SpatzBoard` → `SnitchCluster` in
-  `pulp/pulp/snitch/snitch_cluster/snitch_cluster.py`.
+## 10. Where to Dig Next
+
+- **Architecture spec**: `prompt/insitu_cache_architecture_v2.md` — current RTL microarchitecture.
+- **Structure map**: `prompt/insitu_cache_structure_map_*.md` — the hierarchy with every node
+  badged by model status (implemented / approximated / not modelled). Read the newest.
+- **Development log**: `prompt/WORKLOG.md` — why each change was made, and what was measured.
+- **Calibration harness**: `pulp/insitu_cache_calib/` plus `insitu_calib_mem` — replays the same
+  trace through the same memory model as the RTL testbench so the two can be diffed per access.
+- **Target topology**: `pulp/pulp/cachepool_v3/` — cluster, group, tile, and the Spatz lock.
