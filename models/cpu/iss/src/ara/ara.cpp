@@ -68,7 +68,14 @@ void Ara::shared_status_update(bool want)
                | (this->nb_inflight_vlsu != 0 ? 4 : 0)
 #endif
                ;
-    if (status != this->shared_status)
+    // `want` is republished on EVERY stalled retry, not only on a change. It is the model of the
+    // RTL's acc_qvalid, which is a level a hart holds high for as long as it has an offload pending
+    // -- and an arbiter fed by edges instead of a level goes wrong in ways that took three attempts
+    // to stop rediscovering: a hart that stalls, is granted and then branches away leaves the bit
+    // latched and pins the unit forever; clearing the bit on grant instead makes the two harts hand
+    // it back and forth without either ever issuing. Refreshing the level costs one wire sync per
+    // stalled cycle, which is what the hardware signal costs too.
+    if (status != this->shared_status || want)
     {
         this->shared_status = status;
         this->shared_status_itf.sync(status);
