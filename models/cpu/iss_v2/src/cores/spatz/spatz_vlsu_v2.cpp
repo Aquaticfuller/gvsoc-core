@@ -46,7 +46,39 @@ namespace { std::map<const void *, long> vlsu_stall_streak;
             std::set<const void *> vlsu_stall_reported; }
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cpu/iss_v2/include/cores/vector_unit/vector_unit.hpp>
+
+namespace {
+// Current RTL uses distributed lane ROBs. Explicit zero preserves the older
+// TwinROB0 law for historical calibration campaigns.
+bool distributed_burst_rob()
+{
+    static const bool enabled = []() {
+        const char *value = getenv("TERANOC_VLSU_DISTRIBUTED_ROB");
+        return value == nullptr || atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+int lane_rob_depth()
+{
+    static const int depth = []() {
+        const char *value = getenv("TERANOC_VLSU_LANE_ROB_DEPTH");
+        return value == nullptr ? 32 : atoi(value);
+    }();
+    return depth;
+}
+
+int burst_allocation_cycles(uint64_t bytes, int full_bytes, int ports, int legacy_cycles)
+{
+    if (!distributed_burst_rob() || bytes >= (uint64_t)full_bytes) return legacy_cycles;
+    // Single-word remainder uses one request slot; shorter multiword bursts
+    // reserve one row per cycle between the decide and send stages.
+    if (bytes <= 4) return 1;
+    return 2 + (bytes / 4 + ports - 1) / ports;
+}
+}
 
 VuLsu::VuLsu(Vu &vu, Iss &iss)
 : VuBlock(&vu, "vlsu"), vu(vu),
@@ -118,6 +150,12 @@ event_label(*this, "label", 0, gv::Vcd_event_type_string)
     // absent (targets without burst support keep the legacy behavior exactly).
     js::Config *cfg = iss.get_js_config();
     this->burst_enable = cfg->get_int("vu/burst_enable");
+    if (this->burst_enable && distributed_burst_rob())
+    {
+        if (lane_rob_depth() < 4 || (lane_rob_depth() & (lane_rob_depth() - 1)))
+            this->trace.fatal("VLSU lane ROB depth must be a power of two >= 4\n");
+        for (int i = 0; i < nb_ports; ++i) this->rob[i].resize(lane_rob_depth());
+    }
     this->burst_sub_word = cfg->get_int("vu/burst_sub_word");
     this->burst_max_words = cfg->get_int("vu/burst_max_words");
     if (this->burst_max_words <= 0) this->burst_max_words = 16;
@@ -125,18 +163,22 @@ event_label(*this, "label", 0, gv::Vcd_event_type_string)
     this->burst_rob_words = cfg->get_int("vu/burst_rob_depth");
     if (this->burst_rob_words < this->burst_max_words)
         this->burst_rob_words = 2 * this->burst_max_words;
+    if (this->burst_enable && distributed_burst_rob())
+        this->burst_rob_words = lane_rob_depth() * nb_ports;
     this->burst_block_alloc = cfg->get_int("vu/burst_block_alloc");
     this->burst_dual_load = cfg->get_int("vu/burst_dual_load");
     if (this->burst_dual_load <= 0) this->burst_dual_load = 1;
     this->burst_recv_ports = cfg->get_int("vu/burst_recv_ports");
     if (this->burst_recv_ports <= 0) this->burst_recv_ports = 1;
+    if (this->burst_enable && distributed_burst_rob()) this->burst_recv_ports = nb_ports;
     this->burst_issue_latency = cfg->get_int("vu/burst_issue_latency");
     if (this->burst_issue_latency <= 0)
         this->burst_issue_latency = this->burst_block_alloc ? 3 : 18;
 
     // One entry per in-flight burst plus one spare; the word-granular
     // occupancy check is the real capacity limit.
-    this->brob.resize(this->burst_rob_words / this->burst_max_words + 1);
+    this->brob.resize(this->burst_rob_words / this->burst_max_words +
+        (distributed_burst_rob() ? 2 : 1));
 
     if (this->burst_enable)
     {
@@ -144,8 +186,8 @@ event_label(*this, "label", 0, gv::Vcd_event_type_string)
         // Size-0 pool: req->data is caller-managed (re)set on every send; the
         // write-ack recycling in the beat adapters repoints it.
         this->beat_allocator = vp::IoReqAllocator::get(0);
-        // Port 0 is reserved for bursts; other loads stripe over the rest.
-        this->load_port_base = 1;
+        // Current word loads stripe across all lanes; legacy reserves port 0.
+        this->load_port_base = distributed_burst_rob() ? 0 : 1;
     }
 }
 
@@ -332,36 +374,25 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
         this->port_burst[p] = 0;
     }
 
-    // Spatz port-0 burst mode (RTL spatz_vlsu.sv use_port0_burst_req, :223-234):
-    // a unit-stride VLE load, e32, vl covering [one burst, one ROB batch], 64B
-    // aligned base. Only full bursts are formed; a sub-burst remainder runs as
-    // a legacy multi-port tail phase once the burst region has fully committed
-    // (RTL tail phase waits for mem_pending == 0).
-    //
-    // vstart is deliberately NOT a conjunct here. The RTL's burst gate is a
-    // 5-way AND that does not test it; `mem_is_vstart_zero` exists but feeds
-    // the H1 RUNAHEAD gate instead (:899, :922), which is a different
-    // mechanism. next_insn_burst_safe() below carries it, matching that
-    // placement. Untestable on the current kernels (vstart is 0 throughout),
-    // so this is latent-mismatch removal, not a behaviour change: the issue
-    // path already offsets by vstart (see burst_issue_step).
+    // Current RTL: aligned unit-stride loads of 8..512 bytes use distributed
+    // lane reservations, including short final bursts. Historical mode keeps
+    // the old full-burst region followed by a drained word-path tail.
+    // Byte-partial tails currently fall back to ordinary accesses.
     this->burst_mode = this->burst_enable && !is_write && !do_stride && reg_indexed == -1
-        // RTL spatz_vlsu.sv:227 -- BurstSubWord ? (vsew != EW_8) : (vsew == EW_32).
-        // Everything else in this gate is already in BYTES and needs no change
-        // for e16: a 64 B burst is 16 four-byte MEMORY words whatever the
-        // element width, so pending_size, the rob-word ceiling, the alignment
-        // test and the beat indexing (/4, beat*4) all stay correct.
-        && (this->burst_sub_word ? (elem_size == 4 || elem_size == 2)
+        && (distributed_burst_rob() ? (elem_size <= 4) :
+            this->burst_sub_word ? (elem_size == 4 || elem_size == 2)
                                  : (elem_size == 4))
-        && this->pending_size >= (iss_addr_t)this->burst_bytes
+        && this->pending_size >= (iss_addr_t)(distributed_burst_rob() ? 8 : this->burst_bytes)
         && this->pending_size <= (iss_addr_t)(this->burst_rob_words * 4)
+        && (!distributed_burst_rob() || (this->vstart == 0 && this->pending_size % 4 == 0))
         && ((this->pending_addr & (iss_addr_t)(this->burst_bytes - 1)) == 0);
     if (!is_write)
     {
         if (this->burst_mode) this->vp_load_burst++; else this->vp_load_nonburst++;
     }
     this->burst_full_bytes = this->burst_mode ?
-        (this->pending_size / this->burst_bytes) * this->burst_bytes : 0;
+        (distributed_burst_rob() ? this->pending_size :
+         (this->pending_size / this->burst_bytes) * this->burst_bytes) : 0;
     this->tail_phase = false;
     this->tail_base = 0;
     if (this->burst_mode)
@@ -370,7 +401,8 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
         // First burst send: decide -> reserve -> send cadence from the start
         // of the issue phase (the timestamp gate below adds the rest).
         this->port0_next_issue = this->vu.iss.clock.get_cycles() +
-            (this->burst_issue_latency - 1);
+            (burst_allocation_cycles(this->pending_size, this->burst_bytes,
+                this->nb_ports, this->burst_issue_latency) - 1);
     }
 
     VuLsuPendingInsn &slot = this->insns[this->insn_first_waiting];
@@ -379,7 +411,9 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
     if (this->burst_mode)
     {
         // Commit units: one per full burst plus one per tail word.
-        slot.nb_remaining_bursts = this->burst_full_bytes / this->burst_bytes +
+        slot.nb_remaining_bursts = distributed_burst_rob()
+            ? (this->pending_size + this->burst_bytes - 1) / this->burst_bytes
+            : this->burst_full_bytes / this->burst_bytes +
             (this->pending_size - this->burst_full_bytes) / this->vu.lane_width;
     }
     else
@@ -387,7 +421,7 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
         slot.nb_remaining_bursts = is_write ?
             0 : (this->pending_size + this->burst_size - 1) / this->burst_size;
     }
-    // H1 runahead safety (RTL dual_safe): burst-mode load without a tail.
+    // Runahead: current short tails remain burst-safe; legacy word tails do not.
     slot.burst_safe = this->burst_mode && (this->pending_size == this->burst_full_bytes);
     slot.is_load = !is_write;
     slot.t_last_req = -1;
@@ -778,7 +812,16 @@ bool VuLsu::next_insn_burst_safe(VuLsuPendingInsn &slot)
         return false;
     }
     int elem_size = insn->uim[1] >= 5 ? 1 << (insn->uim[1] - 4) : 1 << 0;
-    if (elem_size != 4)
+    // Runahead uses the same element-width eligibility as burst issue. The
+    // old e32-only test serialized every e16 pair despite admitting its loads
+    // to the burst path. Keep the old predicate only for calibration A/Bs.
+    static const bool legacy_fp32_runahead = []() {
+        const char *value = getenv("TERANOC_VLSU_LEGACY_FP32_RUNAHEAD");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    if (distributed_burst_rob() && elem_size > 4) return false;
+    if (!distributed_burst_rob() && elem_size != 4 &&
+        (legacy_fp32_runahead || !this->burst_sub_word || elem_size != 2))
     {
         return false;
     }
@@ -793,12 +836,12 @@ bool VuLsu::next_insn_burst_safe(VuLsuPendingInsn &slot)
     }
     iss_addr_t bytes =
         (this->vu.iss.csr.vl.value - this->vu.iss.csr.vstart.value) * elem_size;
-    if (bytes < (iss_addr_t)this->burst_bytes ||
+    if (bytes < (iss_addr_t)(distributed_burst_rob() ? 8 : this->burst_bytes) ||
         bytes > (iss_addr_t)(this->burst_rob_words * 4))
     {
         return false;
     }
-    if (bytes % this->burst_bytes)
+    if (bytes % (distributed_burst_rob() ? 4 : this->burst_bytes))
     {
         return false;
     }
@@ -828,8 +871,20 @@ void VuLsu::burst_commit_drain()
             break;
         }
         int n = 1;
+        if (distributed_burst_rob())
+        {
+            // Ordinary lane law: commit one row of up to NrMemPorts words
+            // together. Missing tail lanes are dummy entries, not VRF writes.
+            n = std::min(this->nb_ports, entry.nb_words - entry.words_committed);
+            uint32_t mask = ((1u << n) - 1) << entry.words_committed;
+            if ((entry.word_mask & mask) != mask)
+            {
+                if (committed_this_cycle == 0) this->vp_wait_beats++;
+                break;
+            }
+        }
         // Pair commit (TwinROB0): two words per cycle when both are present.
-        if (budget >= 2 && entry.words_committed + 1 < entry.nb_words &&
+        if (!distributed_burst_rob() && budget >= 2 && entry.words_committed + 1 < entry.nb_words &&
             (entry.word_mask & (1u << (entry.words_committed + 1))))
         {
             n = 2;
@@ -837,7 +892,8 @@ void VuLsu::burst_commit_drain()
         entry.words_committed += n;
         budget -= n;
         committed_this_cycle += n;
-        if (n == 2) this->vp_pair_commit++; else this->vp_single_commit++;
+        if (distributed_burst_rob()) this->brob_words_used -= this->nb_ports;
+        if (n >= 2) this->vp_pair_commit++; else this->vp_single_commit++;
         this->vu.insn_commit(entry.slot->insn, n * 4);
         if (entry.words_committed == entry.nb_words)
         {
@@ -851,7 +907,7 @@ void VuLsu::burst_commit_drain()
             slot->nb_remaining_bursts--;
             this->reqs_free.push_back(load_req);
 
-            this->brob_words_used -= entry.nb_words;
+            if (!distributed_burst_rob()) this->brob_words_used -= entry.nb_words;
             entry.allocated = false;
             entry.req = nullptr;
             entry.slot = nullptr;
@@ -862,6 +918,8 @@ void VuLsu::burst_commit_drain()
             this->brob_first = (this->brob_first + 1) % this->brob.size();
             this->brob_count--;
         }
+        // A partial final row still consumes the lane group's one write slot.
+        if (distributed_burst_rob()) break;
     }
 }
 
@@ -885,12 +943,6 @@ void VuLsu::burst_issue_step(int64_t cycles)
         this->vp_blk_stall++;   // RTL c_blkstall: eligible but not fired yet
         return;
     }
-    if (this->brob_words_used > this->burst_rob_words - this->burst_max_words)
-    {
-        this->vp_blk_stall++;   // no ROB room: the other half of blk_stall
-        return;
-    }
-
     uint64_t req_offset = (uint64_t)this->port_burst[0] * this->burst_bytes;
     if (req_offset >= this->burst_full_bytes)
     {
@@ -899,7 +951,21 @@ void VuLsu::burst_issue_step(int64_t cycles)
         return;
     }
 
-    uint64_t size = this->burst_bytes;
+    uint64_t size = distributed_burst_rob()
+        ? std::min((uint64_t)this->burst_bytes, (uint64_t)this->burst_full_bytes - req_offset)
+        : this->burst_bytes;
+    int reserved_words = distributed_burst_rob()
+        ? ((size / 4 + this->nb_ports - 1) / this->nb_ports) * this->nb_ports
+        : this->burst_max_words;
+    int other_words = 0;
+    if (distributed_burst_rob())
+        other_words = *std::max_element(this->rob_count.begin(), this->rob_count.end()) * this->nb_ports;
+    if (this->brob_words_used + other_words > this->burst_rob_words - reserved_words ||
+        this->brob_count >= (int)this->brob.size())
+    {
+        this->vp_blk_stall++;
+        return;
+    }
     uint8_t *velem = this->pending_velem + req_offset;
     iss_reg_t addr = this->pending_addr + req_offset;
     int elem_idx = this->vstart + req_offset / this->elem_size;
@@ -940,7 +1006,7 @@ void VuLsu::burst_issue_step(int64_t cycles)
     entry.words_arrived = 0;
     entry.words_committed = 0;
     this->brob_count++;
-    this->brob_words_used += entry.nb_words;
+    this->brob_words_used += reserved_words;
 
     req->initiator = (void *)&entry;
     req->set_addr(addr);
@@ -957,7 +1023,9 @@ void VuLsu::burst_issue_step(int64_t cycles)
     // The burst leaves the instruction as soon as it is sent, even when the
     // downstream denies it (the output spill holds it, like RTL).
     this->burst_issued(req, 0);
-    this->port0_next_issue = cycles + this->burst_issue_latency;
+    uint64_t next_bytes = this->burst_full_bytes - req_offset - size;
+    this->port0_next_issue = cycles + burst_allocation_cycles(next_bytes,
+        this->burst_bytes, this->nb_ports, this->burst_issue_latency);
 
     if (err == vp::IO_REQ_DENIED)
     {
@@ -1155,8 +1223,8 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         // against the RTL's 1.23 on the same kernel.
         VuLsuPendingInsn &elder = _this->insns[_this->insn_first];
         start_ok = elder.is_load &&
+            (!distributed_burst_rob() || elder.burst_safe) &&
             _this->next_insn_burst_safe(_this->insns[_this->insn_first_waiting]);
-        if (start_ok) _this->vp_dual_adv++;   // RTL c_dual
     }
     else
     {
@@ -1171,6 +1239,12 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
         if (pending_insn->timestamp <= _this->vu.iss.clock.get_cycles() && _this->vu.insn_ready(pending_insn))
         {
+            // Count a younger load actually starting, not repeated eligible
+            // cycles while its timestamp or register dependencies still block it.
+            if (_this->burst_enable && started_unretired > 0)
+            {
+                _this->vp_dual_adv++;
+            }
             
 #ifdef CONFIG_GVSOC_STATS_ACTIVE
         // Instruction leaves the waiting queue and its memory op is set up:
@@ -1287,7 +1361,9 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                     // last entry is never allocated. A store needs no entry, and is
                     // thus not limited.
                     if (!_this->pending_is_write &&
-                        _this->rob_count[i] >= (int)_this->rob[i].size() - 1)
+                        _this->rob_count[i] + (distributed_burst_rob()
+                            ? _this->brob_words_used / _this->nb_ports : 0)
+                            >= (int)_this->rob[i].size() - 1)
                     {
                         continue;
                     }
