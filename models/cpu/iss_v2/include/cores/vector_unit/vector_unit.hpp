@@ -461,6 +461,7 @@ private:
     // ------------------------------------------------------------------
     int burst_enable;         // vu/burst_enable master switch
     int burst_max_words;      // words per full burst (RTL MaxBurstWords = 16)
+    int burst_tile_banks;     // SRAM stripe geometry, independent of transport maximum
     int burst_bytes;          // burst_max_words * 4
     int burst_rob_words;      // port-0 ROB depth in words (RTL spatz_vlsu_rob_depth)
     int burst_sub_word;       // BurstSubWord: e16 may burst (SPATZ_VLSU_BURST_EW16)

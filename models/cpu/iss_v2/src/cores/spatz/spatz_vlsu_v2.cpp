@@ -48,6 +48,7 @@ namespace { std::map<const void *, long> vlsu_stall_streak;
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <cpu/iss_v2/include/cores/spatz/tile_burst.hpp>
 #include <cpu/iss_v2/include/cores/vector_unit/vector_unit.hpp>
 
 namespace {
@@ -161,6 +162,9 @@ event_label(*this, "label", 0, gv::Vcd_event_type_string)
     this->burst_max_words = cfg->get_int("vu/burst_max_words");
     if (this->burst_max_words <= 0) this->burst_max_words = 16;
     this->burst_bytes = this->burst_max_words * 4;
+    this->burst_tile_banks = cfg->get_int("vu/burst_tile_banks");
+    if (this->burst_enable && this->burst_tile_banks <= 0)
+        this->trace.fatal("Burst tile bank count must be configured\n");
     this->burst_rob_words = cfg->get_int("vu/burst_rob_depth");
     if (this->burst_rob_words < this->burst_max_words)
         this->burst_rob_words = 2 * this->burst_max_words;
@@ -375,7 +379,7 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
         this->port_burst[p] = 0;
     }
 
-    // Current RTL: aligned unit-stride loads of 8..512 bytes use distributed
+    // Current RTL: tile-contained word-aligned unit-stride loads use distributed
     // lane reservations, including short final bursts. Historical mode keeps
     // the old full-burst region followed by a drained word-path tail.
     // Byte-partial tails currently fall back to ordinary accesses.
@@ -386,7 +390,10 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
         && this->pending_size >= (iss_addr_t)(distributed_burst_rob() ? 8 : this->burst_bytes)
         && this->pending_size <= (iss_addr_t)(this->burst_rob_words * 4)
         && (!distributed_burst_rob() || (this->vstart == 0 && this->pending_size % 4 == 0))
-        && ((this->pending_addr & (iss_addr_t)(this->burst_bytes - 1)) == 0);
+        && (distributed_burst_rob()
+            ? spatz_burst::eligible(this->pending_addr, this->pending_size,
+                this->burst_tile_banks, this->burst_max_words, this->nb_ports, this->burst_rob_words)
+            : ((this->pending_addr & (iss_addr_t)(this->burst_bytes - 1)) == 0));
     if (!is_write)
     {
         teranoc_telemetry::emit(this->vu.iss, this->vu.iss.clock.get_cycles(), 14, this->pending_addr, this->pending_size, this->burst_mode);
@@ -403,7 +410,7 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
         // First burst send: decide -> reserve -> send cadence from the start
         // of the issue phase (the timestamp gate below adds the rest).
         this->port0_next_issue = this->vu.iss.clock.get_cycles() +
-            (burst_allocation_cycles(this->pending_size, this->burst_bytes,
+            (burst_allocation_cycles(distributed_burst_rob() ? spatz_burst::segment(this->pending_addr, this->pending_size, this->burst_tile_banks, this->burst_max_words) : this->pending_size, this->burst_bytes,
                 this->nb_ports, this->burst_issue_latency) - 1);
     }
 
@@ -414,7 +421,7 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
     {
         // Commit units: one per full burst plus one per tail word.
         slot.nb_remaining_bursts = distributed_burst_rob()
-            ? (this->pending_size + this->burst_bytes - 1) / this->burst_bytes
+            ? spatz_burst::count(this->pending_addr, this->pending_size, this->burst_tile_banks, this->burst_max_words)
             : this->burst_full_bytes / this->burst_bytes +
             (this->pending_size - this->burst_full_bytes) / this->vu.lane_width;
     }
@@ -474,6 +481,9 @@ void VuLsu::burst_issued(vp::IoReq *req, int port)
     }
     VuLsuPendingInsn *slot = vlsu_req->slot;
 
+    // Submission to the modeled output spill, once only (retries are not new requests).
+    teranoc_telemetry::emit(this->vu.iss, this->vu.iss.clock.get_cycles(), 26,
+        req->get_addr(), size, req->get_is_write() ? -1 : port);
     this->port_burst[port]++;
     this->remaining_size -= size;
 
@@ -832,7 +842,7 @@ bool VuLsu::next_insn_burst_safe(VuLsuPendingInsn &slot)
         return false;
     }
     iss_addr_t addr = slot.insn->reg;
-    if (addr & (iss_addr_t)(this->burst_bytes - 1))
+    if (!distributed_burst_rob() && (addr & (iss_addr_t)(this->burst_bytes - 1)))
     {
         return false;
     }
@@ -847,7 +857,8 @@ bool VuLsu::next_insn_burst_safe(VuLsuPendingInsn &slot)
     {
         return false;
     }
-    return true;
+    return !distributed_burst_rob() || spatz_burst::eligible(addr, bytes,
+        this->burst_tile_banks, this->burst_max_words, this->nb_ports, this->burst_rob_words);
 }
 
 // Per-cycle burst commit drain: the RTL ROB->VRF path retires one word per
@@ -945,7 +956,8 @@ void VuLsu::burst_issue_step(int64_t cycles)
         this->vp_blk_stall++;   // RTL c_blkstall: eligible but not fired yet
         return;
     }
-    uint64_t req_offset = (uint64_t)this->port_burst[0] * this->burst_bytes;
+    uint64_t req_offset = distributed_burst_rob() ? this->pending_size - this->remaining_size
+        : (uint64_t)this->port_burst[0] * this->burst_bytes;
     if (req_offset >= this->burst_full_bytes)
     {
         // Burst region fully issued; the tail phase (if any) starts once the
@@ -954,7 +966,8 @@ void VuLsu::burst_issue_step(int64_t cycles)
     }
 
     uint64_t size = distributed_burst_rob()
-        ? std::min((uint64_t)this->burst_bytes, (uint64_t)this->burst_full_bytes - req_offset)
+        ? spatz_burst::segment(this->pending_addr + req_offset, this->burst_full_bytes - req_offset,
+            this->burst_tile_banks, this->burst_max_words)
         : this->burst_bytes;
     int reserved_words = distributed_burst_rob()
         ? ((size / 4 + this->nb_ports - 1) / this->nb_ports) * this->nb_ports
@@ -1026,7 +1039,8 @@ void VuLsu::burst_issue_step(int64_t cycles)
     // downstream denies it (the output spill holds it, like RTL).
     this->burst_issued(req, 0);
     uint64_t next_bytes = this->burst_full_bytes - req_offset - size;
-    this->port0_next_issue = cycles + burst_allocation_cycles(next_bytes,
+    this->port0_next_issue = cycles + burst_allocation_cycles(distributed_burst_rob() && next_bytes
+        ? spatz_burst::segment(addr + size, next_bytes, this->burst_tile_banks, this->burst_max_words) : next_bytes,
         this->burst_bytes, this->nb_ports, this->burst_issue_latency);
 
     if (err == vp::IO_REQ_DENIED)
