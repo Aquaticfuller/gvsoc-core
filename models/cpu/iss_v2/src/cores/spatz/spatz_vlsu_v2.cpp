@@ -1,3 +1,4 @@
+#include <vp/teranoc_telemetry.hpp>
 /*
  * Copyright (C) 2020 SAS, ETH Zurich and University of Bologna
  *
@@ -388,6 +389,7 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
         && ((this->pending_addr & (iss_addr_t)(this->burst_bytes - 1)) == 0);
     if (!is_write)
     {
+        teranoc_telemetry::emit(this->vu.iss, this->vu.iss.clock.get_cycles(), 14, this->pending_addr, this->pending_size, this->burst_mode);
         if (this->burst_mode) this->vp_load_burst++; else this->vp_load_nonburst++;
     }
     this->burst_full_bytes = this->burst_mode ?

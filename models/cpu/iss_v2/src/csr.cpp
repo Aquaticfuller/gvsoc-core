@@ -1,3 +1,4 @@
+#include <vp/teranoc_telemetry.hpp>
 /*
  * Copyright (C) 2020 GreenWaves Technologies, SAS, ETH Zurich and
  *                    University of Bologna
@@ -1172,6 +1173,8 @@ bool iss_csr_read(Iss *iss, iss_insn_t *insn, iss_reg_t reg, iss_reg_t *value)
 
 bool iss_csr_write(Iss *iss, iss_insn_t *insn, iss_reg_t reg, iss_reg_t value)
 {
+    // Registered Snitch CSRs return before the legacy fallback switch.
+    if (reg == 0x7d0) teranoc_telemetry::emit(*iss, iss->clock.get_cycles(), 1, value);
     iss->csr.trace.msg("Writing CSR (reg: 0x%x, name: %s, value: 0x%x)\n",
         reg, iss_csr_name(iss, reg), value);
 

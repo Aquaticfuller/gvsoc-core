@@ -1,3 +1,4 @@
+#include <vp/teranoc_telemetry.hpp>
 // SPDX-FileCopyrightText: 2026 ETH Zurich, University of Bologna and EssilorLuxottica SAS
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -630,6 +631,7 @@ vp::IoReqStatus Memory::handle_atomic(uint64_t addr, uint64_t size, uint8_t *in_
 
 void Memory::stop()
 {
+    teranoc_telemetry::dump(*this, this->mem_data, this->cfg.size);
     if (this->free_mem)
     {
         free(this->mem_data);

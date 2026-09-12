@@ -1,3 +1,4 @@
+#include <vp/teranoc_telemetry.hpp>
 /*
  * Copyright (C) 2020 SAS, ETH Zurich and University of Bologna
  *
@@ -98,6 +99,7 @@ iss_reg_t Vu::load_store_handler(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
 
 void Vu::reset(bool active)
 {
+    if(active) teranoc_telemetry::emit(this->iss,0,16,2,this->nb_lanes,this->lane_width);
     if (active)
     {
         this->nb_pending_vaccess = 0;
@@ -322,6 +324,7 @@ void Vu::insn_commit(PendingInsn *pending_insn, int size)
 
 void Vu::insn_end(PendingInsn *pending_insn)
 {
+    teranoc_telemetry::emit(this->iss, this->iss.clock.get_cycles(), 4, pending_insn->id);
     iss_insn_t *insn = this->iss.exec.get_insn(pending_insn->entry);
 
     this->trace.msg(vp::Trace::LEVEL_TRACE, "End of instruction (pc: 0x%lx, id: %d)\n",

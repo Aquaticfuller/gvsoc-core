@@ -1,3 +1,4 @@
+#include <vp/teranoc_telemetry.hpp>
 /*
  * Copyright (C) 2020 SAS, ETH Zurich and University of Bologna
  *
@@ -102,6 +103,14 @@ void VuCompute::enqueue_insn(PendingInsn *pending_insn)
     uint8_t one = 1;
     this->event_active.event(&one);
 
+    if (teranoc_telemetry::sink()) {
+        const std::string label=insn->desc->label;
+        if (label.rfind("vf",0)==0 && (label.find("macc")!=std::string::npos ||
+            label.find("madd")!=std::string::npos || label.find("msac")!=std::string::npos ||
+            label.find("msub")!=std::string::npos))
+            teranoc_telemetry::emit(this->vu.iss, this->vu.iss.clock.get_cycles(), 3,
+                pending_insn->id, this->vu.iss.csr.vl.value-this->vu.iss.csr.vstart.value);
+    }
     // Just push the instruction and let the FSM handle it if needed.
     // It is marked for execution in the next cycle so that the FSM does not handle it in this
     // cycle in case the FSM is already active
@@ -202,6 +211,10 @@ void VuCompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 
             _this->vu.insn_latency = 0;
             _this->vu.exec_insn_chunk(insn, pending_insn, _this->vstart, _this->vend, nb_elem_per_cycle);
+            if (insn->desc->label[0]=='v' && insn->desc->label[1]=='f')
+                teranoc_telemetry::emit(_this->vu.iss, _this->vu.iss.clock.get_cycles(), 2,
+                    _this->vend-_this->vstart, _this->vu.iss.vector.sewb,
+                    pending_insn->pipeline_latency);
             fpu_probe(_this->vu.iss, insn->desc->label, _this->vend - _this->vstart,
                       _this->vu.iss.clock.get_cycles());
             // Each reduction step is an FPU round trip, so the accumulator
