@@ -167,7 +167,7 @@ void Vu::insn_enqueue(InsnEntry *entry)
 
     // Derive the FPU pipeline depth from the instruction class and the
     // effective element width (the fpnew per-format register stages of the
-    // spatz timing configuration: fp64: 2, fp32: 1, fp16/fp8: 0,
+    // MemPoolFPUImpl configuration: fp64: 2, fp32/fp16/fp8: 1,
     // non-computational: 1, conversions: 2). Widening instructions compute
     // at the destination width (elem_rate_shift doubles it).
     pending_insn->pipeline_latency = 0;
@@ -176,7 +176,7 @@ void Vu::insn_enqueue(InsnEntry *entry)
         case 1:
         {
             int sewb_eff = this->iss.vector.sewb << insn->desc->elem_rate_shift;
-            pending_insn->pipeline_latency = sewb_eff >= 8 ? 2 : sewb_eff == 4 ? 1 : 0;
+            pending_insn->pipeline_latency = sewb_eff >= 8 ? 2 : 1;
             break;
         }
         case 2:
