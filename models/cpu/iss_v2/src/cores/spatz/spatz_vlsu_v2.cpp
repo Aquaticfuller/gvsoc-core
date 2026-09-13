@@ -97,6 +97,15 @@ event_label(*this, "label", 0, gv::Vcd_event_type_string)
 
     int nb_ports = iss.get_js_config()->get_child_int("vu/nb_ports");
     this->nb_ports = nb_ports;
+    this->clocked_narrow = getenv("TERANOC_VLSU_CLOCKED_NARROW") &&
+        atoi(getenv("TERANOC_VLSU_CLOCKED_NARROW")) != 0;
+    this->narrow_spills = getenv("TERANOC_VLSU_NARROW_SPILLS") &&
+        atoi(getenv("TERANOC_VLSU_NARROW_SPILLS")) != 0;
+    this->narrow_requests.resize(nb_ports);
+    this->narrow_service_cycle.assign(nb_ports, -1);
+    this->narrow_full_cycle.assign(nb_ports, -1);
+    this->narrow_rob_available.resize(nb_ports);
+
 
     this->event_addr.resize(nb_ports);
     this->event_size.resize(nb_ports);
@@ -211,6 +220,12 @@ void VuLsu::reset(bool active)
             this->event_addr[i].event(&zero);
             this->event_size[i].event(&zero);
             this->event_is_write[i].event(&zero);
+        }
+        this->narrow_commits.clear();
+        this->narrow_commit_cycle = -1;
+        for (int p = 0; p < nb_ports; ++p) {
+            this->narrow_requests[p].clear();
+            this->narrow_service_cycle[p] = this->narrow_full_cycle[p] = -1;
         }
         this->insn_first = 0;
         this->insn_first_waiting = 0;
@@ -532,6 +547,13 @@ void VuLsu::port_retry_muxed(vp::Block *__this, int id, vp::IoRetryChannel)
 
     // Accepted: release the port. The sequencing state advanced at submission
     // and may already belong to the next instruction.
+    if (_this->narrow_spills && !_this->narrow_requests[id].empty() &&
+        _this->narrow_requests[id].front().req == req) {
+        if (_this->narrow_requests[id].size() == 2)
+            _this->narrow_full_cycle[id] = _this->vu.iss.clock.get_cycles();
+        _this->narrow_requests[id].pop_front();
+        _this->narrow_service_cycle[id] = _this->vu.iss.clock.get_cycles();
+    }
     _this->denied_reqs[id] = nullptr;
     vlsu_retry_rx[{(const void *)_this, id}]++;
     _this->port_stalled[id] = false;
@@ -696,6 +718,17 @@ void VuLsu::burst_done(vp::IoReq *req)
 
     _this->trace.msg("Received data response (req: %p)\n", req);
 
+    _this->rob[rob_entry->port][rob_entry->rob_id].ready_cycle =
+        _this->vu.iss.clock.get_cycles() + 1;
+    if (!_this->clocked_narrow) _this->commit_narrow_loads();
+}
+
+void VuLsu::commit_narrow_loads()
+{
+    auto *_this = this;
+    auto cycle = this->vu.iss.clock.get_cycles();
+    // The current RTL has a two-entry VRF spill, not the colleague's additional coalescer.
+    if (clocked_narrow && (narrow_commit_cycle == cycle || narrow_commits.size() >= 2)) return;
     // This response may have completed a group the register file is waiting for, on
     // this instruction or on a younger one. An instruction reaches the ROB heads only
     // once the older ones committed everything, so walk from the oldest.
@@ -717,7 +750,8 @@ void VuLsu::burst_done(vp::IoReq *req)
             {
                 int port = _this->load_port_base + nb_ready;
                 VlsuRobEntry &entry = _this->rob[port][_this->rob_first[port]];
-                if (!entry.allocated || !entry.valid || entry.req->slot != &slot)
+                if (!entry.allocated || !entry.valid || entry.req->slot != &slot ||
+                    (_this->clocked_narrow && entry.ready_cycle > cycle))
                 {
                     break;
                 }
@@ -772,6 +806,7 @@ void VuLsu::burst_done(vp::IoReq *req)
             PendingInsn *pending_insn = slot.insn;
             iss_insn_t *insn = _this->vu.iss.exec.get_insn(pending_insn->entry);
             int committed_size = 0;
+            NarrowCommit commit{cycle + 1, {}};
 
             for (int j = 0; j < group_size; j++)
             {
@@ -779,13 +814,16 @@ void VuLsu::burst_done(vp::IoReq *req)
                 VlsuRobEntry &entry = _this->rob[port][_this->rob_first[port]];
                 VlsuReq *load_req = entry.req;
 
-                _this->vu.exec_insn_chunk(insn, pending_insn, load_req->vstart,
-                    load_req->vstart + load_req->nb_elem, load_req->nb_elem);
+                if (_this->clocked_narrow) commit.words.push_back(load_req);
+                else {
+                    _this->vu.exec_insn_chunk(insn, pending_insn, load_req->vstart,
+                        load_req->vstart + load_req->nb_elem, load_req->nb_elem);
+                    slot.nb_pending_bursts--;
+                    _this->reqs_free.push_back(load_req);
+                }
                 committed_size += load_req->req.get_size();
 
                 entry.allocated = false;
-                slot.nb_pending_bursts--;
-                _this->reqs_free.push_back(load_req);
                 _this->rob_count[port]--;
                 _this->rob_first[port] = (_this->rob_first[port] + 1) % _this->rob[port].size();
             }
@@ -797,6 +835,11 @@ void VuLsu::burst_done(vp::IoReq *req)
             // Notify the committed elements, which may start a chained instruction.
             // Only the group's own elements are reported, so a consumer never reads
             // elements still in flight on another port.
+            if (_this->clocked_narrow) {
+                _this->narrow_commits.push_back(std::move(commit));
+                _this->narrow_commit_cycle = cycle;
+                return;
+            }
             _this->vu.insn_commit(pending_insn, committed_size);
 
             _this->trace.msg("Committing load bursts (id: %d, nb_bursts: %d, pending insn bursts: %d)\n",
@@ -1181,6 +1224,32 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         _this->burst_done(req);
     }
 
+    // Admission sees pre-pop ROB occupancy, independently of response callback order.
+    for (int p = 0; p < _this->nb_ports; ++p)
+        _this->narrow_rob_available[p] = _this->rob[p].size() - 1 - _this->rob_count[p];
+    if (_this->clocked_narrow) {
+        bool full = _this->narrow_commits.size() == 2;
+        if (!_this->narrow_commits.empty() &&
+            _this->narrow_commits.front().cycle <= _this->vu.iss.clock.get_cycles()) {
+            auto commit = std::move(_this->narrow_commits.front());
+            _this->narrow_commits.pop_front();
+            auto *pending = commit.words.front()->slot->insn;
+            auto *insn = _this->vu.iss.exec.get_insn(pending->entry);
+            int bytes = 0;
+            for (auto *word : commit.words) {
+                memcpy(word->velem, word->data.data(), word->req.get_size());
+                _this->vu.exec_insn_chunk(insn, pending, word->vstart,
+                    word->vstart + word->nb_elem, word->nb_elem);
+                bytes += word->req.get_size();
+                word->slot->nb_pending_bursts--;
+                _this->reqs_free.push_back(word);
+            }
+            _this->vu.insn_commit(pending, bytes);
+        }
+        if (!full) _this->commit_narrow_loads();
+    }
+    if (_this->narrow_spills) _this->drain_narrow_spills();
+
     // Burst ROB->VRF commit drain (1 or 2 words per cycle, in order)
     if (_this->burst_enable)
     {
@@ -1369,13 +1438,15 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 if (_this->remaining_size == 0) break;
 
                 // A denied burst holds its port until it is granted
-                if (!_this->port_stalled[i])
+                if (_this->narrow_spills ? (_this->narrow_requests[i].size() < 2 &&
+                    _this->narrow_full_cycle[i] != _this->vu.iss.clock.get_cycles()) : !_this->port_stalled[i])
                 {
                     // A load also needs a free ROB entry of the port, which is what
                     // limits the number of outstanding loads. Like the RTL reorder
                     // buffer, which reports itself full one entry before the end, the
                     // last entry is never allocated. A store needs no entry, and is
                     // thus not limited.
+                    if (!_this->pending_is_write && _this->clocked_narrow && _this->narrow_rob_available[i] <= 0) continue;
                     if (!_this->pending_is_write &&
                         _this->rob_count[i] + (distributed_burst_rob()
                             ? _this->brob_words_used / _this->nb_ports : 0)
@@ -1503,9 +1574,20 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                     // Size-0-pool write beats carry a caller-managed data
                     // pointer (the store data copy in the VlsuReq); pooled
                     // requests point at it directly as before.
+                    if (_this->clocked_narrow && !_this->pending_is_write) {
+                        vlsu_req->velem = velem;
+                        vlsu_req->data.resize(size);
+                        req_data = vlsu_req->data.data();
+                        _this->narrow_rob_available[i]--;
+                    }
                     req->set_data(req_data);
                     slot.nb_pending_bursts++;
 
+                    if (_this->narrow_spills) {
+                        _this->narrow_requests[i].push_back({req, _this->vu.iss.clock.get_cycles() + 1});
+                        _this->burst_issued(req, i);
+                        continue;
+                    }
                     vp::IoReqStatus err = _this->ports[i].req(req);
 
                     // The burst has left the instruction as soon as it is sent,
@@ -1566,5 +1648,26 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             }
             _this->vu.insn_end(pending_insn);
         }
+    }
+}
+
+void VuLsu::drain_narrow_spills()
+{
+    auto cycle = vu.iss.clock.get_cycles();
+    for (int p = 0; p < nb_ports; ++p) {
+        auto &queue = narrow_requests[p];
+        if (port_stalled[p] || queue.empty() || queue.front().cycle > cycle ||
+            narrow_service_cycle[p] == cycle) continue;
+        auto *req = queue.front().req;
+        auto status = ports[p].req(req);
+        if (status == vp::IO_REQ_DENIED) {
+            port_stalled[p] = true;
+            denied_reqs[p] = req;
+            continue;
+        }
+        if (queue.size() == 2) narrow_full_cycle[p] = cycle;
+        queue.pop_front();
+        narrow_service_cycle[p] = cycle;
+        if (status == vp::IO_REQ_DONE) handle_done(req);
     }
 }

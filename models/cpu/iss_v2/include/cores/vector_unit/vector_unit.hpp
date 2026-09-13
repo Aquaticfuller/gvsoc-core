@@ -250,6 +250,8 @@ private:
     void handle_done(vp::IoReq *req);
     // Terminate one burst: commit its elements to the VRF and retire it.
     void burst_done(vp::IoReq *req);
+    void commit_narrow_loads();
+    void drain_narrow_spills();
 
     // Number of instruction that can be enqueued at the same time
     static constexpr int queue_size = 4;
@@ -424,10 +426,23 @@ private:
 
         // If the response is valid
         bool valid = false;
+        int64_t ready_cycle = 0;
 
         // Request itself
         VlsuReq *req = nullptr;
     };
+
+    // Optional registered timing experiment; default preserves the sweep baseline.
+    bool clocked_narrow = false;
+    bool narrow_spills = false;
+    struct NarrowCommit { int64_t cycle; std::vector<VlsuReq *> words; };
+    std::deque<NarrowCommit> narrow_commits;
+    struct NarrowSpill { vp::IoReq *req; int64_t cycle; };
+    std::vector<std::deque<NarrowSpill>> narrow_requests;
+    std::vector<int64_t> narrow_service_cycle;
+    std::vector<int64_t> narrow_full_cycle;
+    std::vector<int> narrow_rob_available;
+    int64_t narrow_commit_cycle = -1;
 
     // Reorder buffer
     std::vector<std::vector<VlsuRobEntry>> rob;
