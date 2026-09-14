@@ -97,10 +97,10 @@ event_label(*this, "label", 0, gv::Vcd_event_type_string)
 
     int nb_ports = iss.get_js_config()->get_child_int("vu/nb_ports");
     this->nb_ports = nb_ports;
-    this->clocked_narrow = getenv("TERANOC_VLSU_CLOCKED_NARROW") &&
-        atoi(getenv("TERANOC_VLSU_CLOCKED_NARROW")) != 0;
-    this->narrow_spills = getenv("TERANOC_VLSU_NARROW_SPILLS") &&
-        atoi(getenv("TERANOC_VLSU_NARROW_SPILLS")) != 0;
+    const char *clocked_narrow = getenv("TERANOC_VLSU_CLOCKED_NARROW");
+    const char *narrow_spills = getenv("TERANOC_VLSU_NARROW_SPILLS");
+    this->clocked_narrow = !clocked_narrow || atoi(clocked_narrow) != 0;
+    this->narrow_spills = !narrow_spills || atoi(narrow_spills) != 0;
     this->narrow_requests.resize(nb_ports);
     this->narrow_service_cycle.assign(nb_ports, -1);
     this->narrow_full_cycle.assign(nb_ports, -1);

@@ -433,8 +433,8 @@ private:
     };
 
     // Optional registered timing experiment; default preserves the sweep baseline.
-    bool clocked_narrow = false;
-    bool narrow_spills = false;
+    bool clocked_narrow = true;
+    bool narrow_spills = true;
     struct NarrowCommit { int64_t cycle; std::vector<VlsuReq *> words; };
     std::deque<NarrowCommit> narrow_commits;
     struct NarrowSpill { vp::IoReq *req; int64_t cycle; };
