@@ -1178,13 +1178,15 @@ void VuLsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         vlsu_period = pe ? atoi(pe) : 1024;
         if (vlsu_period <= 0) vlsu_period = 1024;
     }
-    if (_this->stat_inflight_n % (uint64_t)vlsu_period == 0)
+    // Opt-in: one line per core per period reaches hundreds of MB on long runs,
+    // so the dump is written only when TERANOC_VLSU_STATS_PATH names a file.
+    static const char *vlsu_path = getenv("TERANOC_VLSU_STATS_PATH");
+    if (vlsu_path && _this->stat_inflight_n % (uint64_t)vlsu_period == 0)
     {
         static FILE *vlsu_f = nullptr;
         if (!vlsu_f)
         {
-            const char *vp = getenv("TERANOC_VLSU_STATS_PATH");
-            vlsu_f = fopen(vp ? vp : "/tmp/vlsu_stats.log", "a");
+            vlsu_f = fopen(vlsu_path, "a");
         }
         if (vlsu_f)
         {
