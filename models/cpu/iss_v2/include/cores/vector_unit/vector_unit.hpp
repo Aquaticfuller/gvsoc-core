@@ -432,7 +432,8 @@ private:
         VlsuReq *req = nullptr;
     };
 
-    // Optional registered timing experiment; default preserves the sweep baseline.
+    // Registered narrow timing, on by default. TERANOC_VLSU_CLOCKED_NARROW=0 and
+    // TERANOC_VLSU_NARROW_SPILLS=0 restore the pre-f07e79a sweep baseline.
     bool clocked_narrow = true;
     bool narrow_spills = true;
     struct NarrowCommit { int64_t cycle; std::vector<VlsuReq *> words; };
