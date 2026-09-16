@@ -387,7 +387,11 @@ void VuLsu::handle_access(iss_insn_t *insn, bool is_write, int reg, bool do_stri
     this->elem_size = elem_size;
     this->inst_elem_size = inst_elem_size;
     this->reg_indexed = reg_indexed;
-    this->burst_size = do_stride || reg_indexed != -1 ? elem_size : this->vu.lane_width;
+    // A base that is not word-aligned makes the access single-element, as in the RTL
+    // (spatz_vlsu.sv, unaligned rs1): a lane-wide request would straddle two L1 words,
+    // which live in different bank rows.
+    bool addr_unaligned = (this->pending_addr & (iss_addr_t)(this->vu.lane_width - 1)) != 0;
+    this->burst_size = do_stride || reg_indexed != -1 || addr_unaligned ? elem_size : this->vu.lane_width;
     this->remaining_size = this->pending_size;
     for (int p = 0; p < this->nb_ports; p++)
     {
