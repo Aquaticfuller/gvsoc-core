@@ -163,7 +163,8 @@ public:
     vp::reg_1 irq_enter;
     vp::reg_1 irq_exit;
 
-    bool cache_sync;
+    // The cache can emit its reset acknowledgement before this ISS resets.
+    bool cache_sync = false;
 
     bool debug_mode = false;
 

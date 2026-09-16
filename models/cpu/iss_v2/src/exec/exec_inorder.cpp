@@ -706,7 +706,7 @@ void ExecInOrder::pc_set(iss_addr_t value)
 void ExecInOrder::flush_cache_ack_sync(vp::Block *__this, bool active)
 {
     ExecInOrder *_this = (ExecInOrder *)__this;
-    if (_this->cache_sync)
+    if (active && _this->cache_sync)
     {
         _this->cache_sync = false;
         _this->retain_dec();
