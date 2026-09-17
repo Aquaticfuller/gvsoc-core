@@ -213,7 +213,10 @@ void VuCompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             _this->vu.exec_insn_chunk(insn, pending_insn, _this->vstart, _this->vend, nb_elem_per_cycle);
             if (insn->desc->label[0]=='v' && insn->desc->label[1]=='f')
                 teranoc_telemetry::emit(_this->vu.iss, _this->vu.iss.clock.get_cycles(), 2,
-                    _this->vend-_this->vstart, _this->vu.iss.vector.sewb,
+                    _this->vend-_this->vstart,
+                    // Widening/narrowing consume the wider arithmetic lanes.
+                    // SEW alone undercounts FP16->FP32 lane activity by two.
+                    _this->vu.iss.vector.sewb << insn->desc->elem_rate_shift,
                     pending_insn->pipeline_latency);
             fpu_probe(_this->vu.iss, insn->desc->label, _this->vend - _this->vstart,
                       _this->vu.iss.clock.get_cycles());
