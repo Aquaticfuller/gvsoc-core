@@ -110,7 +110,8 @@ public:
         PROBE_STALL_VQFULL,     // retry cycles because the Spatz queue is full
         PROBE_STALL_BARRIER,    // parked in the hardware barrier
         PROBE_STALL_WFI,        // wfi
-        PROBE_STALL_OTHER,      // fetch-enable low, misaligned, jumps, ...
+        PROBE_STALL_OTHER,      // misaligned, jumps, ...
+        PROBE_STALL_OFF,        // not started: held in reset / fetch-enable low (ELF load, boot)
         PROBE_STALL_NB,
     };
     uint64_t probe_invocations = 0;   // instruction handler invocations (one per insn_account())

@@ -70,6 +70,9 @@ public:
     // `name` is appended to the owner's path in meta.json; empty = the path alone.
     virtual void attach(vp::Block *owner, Source *src, const std::string &name) = 0;
     virtual int64_t slice_cycles() const = 0;
+    // One software probe store (offset into the probe window, 32-bit value). Called by a core's
+    // LSU directly so the store costs the core nothing beyond its issue slot.
+    virtual void sw_store(uint64_t off, uint32_t value) = 0;
 };
 
 static const char *const SERVICE_NAME = "perf_probe";

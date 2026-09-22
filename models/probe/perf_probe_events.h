@@ -60,7 +60,9 @@ enum perf_probe_evt {
     PROBE_EVT_UL_DELIVER   = 17, /* entity | sdus              UL: SDUs delivered in order         */
     PROBE_EVT_UL_STATUS    = 18, /* entity | bytes             UL: STATUS PDU built                */
     PROBE_EVT_MARK         = 19, /* free-form                                                     */
-    PROBE_EVT_NB_DEFINED   = 20,
+    PROBE_EVT_PKT_IN       = 20, /* tag (e.g. node address)   SDU entered the entity; opens latency */
+    PROBE_EVT_PKT_OUT      = 21, /* same tag                  SDU fully sent; closes latency        */
+    PROBE_EVT_NB_DEFINED   = 22,
 };
 
 /* Events whose value packs an entity id in the upper 16 bits. */
@@ -78,7 +80,7 @@ enum perf_probe_evt {
 #define PERF_PROBE_EVENT_NAMES { \
     "kernel_start", "kernel_end", "role", "sdu_rx", "pdu_tx", "grant", "segment", "poll", \
     "status_ack", "qdepth", "ackdepth", "tti_begin", "tti_end", "phase", "lock_spin", "mm_live", \
-    "ul_tb", "ul_deliver", "ul_status", "mark" }
+    "ul_tb", "ul_deliver", "ul_status", "mark", "pkt_in", "pkt_out" }
 
 #define PERF_PROBE_ROLE_IDLE      0
 #define PERF_PROBE_ROLE_PRODUCER  1
@@ -86,10 +88,15 @@ enum perf_probe_evt {
 #define PERF_PROBE_ROLE_STATUS    3
 #define PERF_PROBE_ROLE_HELPER    4
 
-#define PERF_PROBE_PHASE_PLAN     0
-#define PERF_PROBE_PHASE_EXECUTE  1
-#define PERF_PROBE_PHASE_COMMIT   2
-#define PERF_PROBE_PHASE_BARRIER  3
-#define PERF_PROBE_PHASE_IDLE     4
+/* PHASE values. The collector integrates time spent in each (sw_state.csv), so a hart's phase is
+   a state: emit on transitions only, never once per loop iteration. */
+#define PERF_PROBE_PHASE_PLAN     0   /* AM: grant planning                               */
+#define PERF_PROBE_PHASE_EXECUTE  1   /* assembling / copying a PDU                       */
+#define PERF_PROBE_PHASE_COMMIT   2   /* AM: grant commit                                 */
+#define PERF_PROBE_PHASE_BARRIER  3   /* waiting at a (partial) barrier                   */
+#define PERF_PROBE_PHASE_IDLE     4   /* polling, nothing to do                           */
+#define PERF_PROBE_PHASE_RECEIVE  5   /* producer: taking a PDCP packet, enqueueing an SDU */
+#define PERF_PROBE_PHASE_STATUS   6   /* STATUS PDU processing (ACK release)              */
+#define PERF_PROBE_PHASE_DONE     7   /* role finished, waiting for the others            */
 
 #endif /* PERF_PROBE_EVENTS_H */

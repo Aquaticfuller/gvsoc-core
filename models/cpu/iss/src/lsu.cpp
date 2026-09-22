@@ -19,6 +19,8 @@
  * Authors: Germain Haugou, GreenWaves Technologies (germain.haugou@greenwaves-technologies.com)
  */
 
+#include <cstring>
+#include "probe/perf_probe_events.h"
 #include <vp/vp.hpp>
 #include "cpu/iss/include/iss.hpp"
 #include "vp/signal.hpp"
@@ -303,6 +305,22 @@ bool Lsu::lsu_is_empty()
 
 int Lsu::data_req(iss_addr_t addr, uint8_t *data_ptr, uint8_t *memcheck_data, int size, bool is_write, int64_t &latency, int &req_id)
 {
+    // perf-probe software port (core/models/probe/perf_probe_events.h). The store is handed to the
+    // collector here: zero latency, no interconnect traffic. In hardware it is a posted store, so
+    // its cost to the core is the issue slot, which is what this models. Routed through the
+    // uncached peripheral path instead, the ISS waited for the write response on every probe and
+    // the RLC K100 kernel ran 11% slower with probes on than off.
+    if (unlikely(this->probe_collector != nullptr && is_write &&
+                 (uint64_t)(addr - PERF_PROBE_BASE) < PERF_PROBE_WINDOW_SIZE))
+    {
+        uint32_t v = 0;
+        memcpy(&v, data_ptr, size < 4 ? size : 4);
+        this->probe_collector->sw_store((uint64_t)(addr - PERF_PROBE_BASE), v);
+        latency = 0;
+        req_id = -1;
+        return vp::IO_REQ_OK;
+    }
+
 #ifdef CONFIG_GVSOC_ISS_HTIF
     // Event-driven HTIF (upstream pulp-platform/ManyRVData#37): wake the tohost handler when a store
     // touches it, so the handler no longer has to poll every 1000 cycles through the timed fabric.
@@ -398,6 +416,7 @@ void Lsu::build()
 
 void Lsu::start()
 {
+    this->probe_collector = probe::get(&this->iss.top);
 #ifdef CONFIG_GVSOC_ISS_MEMORY
     this->meminfo.sync_back((void **)&this->mem_array);
 #endif

@@ -23,6 +23,7 @@
 
 #include <cpu/iss/include/types.hpp>
 #include <vp/signal.hpp>
+#include "probe/perf_probe.hpp"
 
 #ifndef CONFIG_GVSOC_ISS_SNITCH
 #define ADDR_MASK (~(ISS_REG_WIDTH / 8 - 1))
@@ -158,6 +159,8 @@ private:
     // True if the last request has been denied. The core must not send another request until
     // the last request has been granted
     vp::Signal<bool> io_req_denied;
+    // perf-probe collector, when the system has one: probe-window stores go straight to it.
+    probe::Collector *probe_collector = nullptr;
 
     vp::Signal<bool> stalled;
     vp::Signal<iss_reg_t> log_addr;

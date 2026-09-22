@@ -163,7 +163,8 @@ void IssWrapper::probe_columns(std::vector<probe::Column> &c) const
          {"stall_fetch", probe::COUNTER}, {"stall_dep", probe::COUNTER},
          {"stall_fpu", probe::COUNTER}, {"stall_vgrant", probe::COUNTER},
          {"stall_vqfull", probe::COUNTER}, {"stall_barrier", probe::COUNTER},
-         {"wfi", probe::COUNTER}, {"stall_other", probe::COUNTER}, {"lsu_occ", probe::COUNTER}};
+         {"wfi", probe::COUNTER}, {"stall_other", probe::COUNTER}, {"lsu_occ", probe::COUNTER},
+         {"stall_off", probe::COUNTER}, {"hartid", probe::GAUGE}};
 }
 
 void IssWrapper::probe_sample(int64_t now, std::vector<uint64_t> &v)
@@ -180,7 +181,8 @@ void IssWrapper::probe_sample(int64_t now, std::vector<uint64_t> &v)
          t.probe_vec_issue, st[Timing::PROBE_STALL_MEM], st[Timing::PROBE_STALL_FETCH],
          st[Timing::PROBE_STALL_DEP], st[Timing::PROBE_STALL_FPU], st[Timing::PROBE_STALL_VGRANT],
          st[Timing::PROBE_STALL_VQFULL], st[Timing::PROBE_STALL_BARRIER], st[Timing::PROBE_STALL_WFI],
-         st[Timing::PROBE_STALL_OTHER], t.probe_lsu_occ.read(now)};
+         st[Timing::PROBE_STALL_OTHER], t.probe_lsu_occ.read(now), st[Timing::PROBE_STALL_OFF],
+         (uint64_t)this->iss.csr.mhartid};
 }
 
 void IssWrapper::stop()

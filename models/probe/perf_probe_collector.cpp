@@ -29,6 +29,9 @@
  *   <kind>.csv    slice,cycle,cycles,src,<columns...>   deltas for COUNTER, values for GAUGE
  *   sw.csv        slice,cycle,hart,event,count,sum
  *   sw_entity.csv slice,cycle,entity,event,count,sum,last
+ *   sw_state.csv  slice,cycle,hart,event,value,cycles   time per ROLE / PHASE value, exact
+ *   sw_marks.csv  cycle,hart,event,value                kernel window, TTI boundaries, exact
+ *   pkt_latency.csv in_cycle,out_cycle,latency,hart_in,hart_out   one row per timed packet
  *   summary.json  cumulative totals per source at the end of the run
  */
 
@@ -39,6 +42,8 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <tuple>
+#include <unordered_map>
 #include <string>
 #include <vector>
 #include <sys/stat.h>
@@ -58,6 +63,7 @@ public:
     // probe::Collector
     void attach(vp::Block *owner, probe::Source *src, const std::string &name) override;
     int64_t slice_cycles() const override { return this->slice_; }
+    void sw_store(uint64_t off, uint32_t value) override;
 
 private:
     struct Entry
@@ -108,6 +114,26 @@ private:
     std::map<std::pair<int, int>, SwEnt> sw_ent_;    // (entity, event)
     FILE *sw_f_ = nullptr;
     FILE *sw_ent_f_ = nullptr;
+
+    // Hart-level states (ROLE, PHASE): time in each value is integrated exactly, including across
+    // slice boundaries, and written per slice to sw_state.csv.
+    struct HartState { int value = -1; int64_t since = 0; };
+    std::map<std::pair<int, int>, HartState> state_;           // (hart, event) -> current
+    std::map<std::tuple<int, int, int>, uint64_t> state_bin_;  // (hart, event, value) -> cycles
+    FILE *state_f_ = nullptr;
+    void state_set(int hart, int evt, int value, int64_t now);
+    void state_flush(int64_t now);
+
+    // Per-packet latency: PKT_IN stamps a tag, PKT_OUT with the same tag closes it. The collector
+    // stamps both ends itself, so the kernel needs no timestamps and no extra fields in its structs.
+    struct PktIn { int64_t cycle; int hart; };
+    std::unordered_map<uint32_t, PktIn> pkt_in_;
+    FILE *pkt_f_ = nullptr;
+    uint64_t pkt_closed_ = 0, pkt_unmatched_ = 0;
+    uint64_t sw_via_port_ = 0;   // stores that came through the interconnect instead of the LSU
+
+    // Markers (kernel window, TTI boundaries, MARK) are rare and need exact cycles, not slice bins.
+    FILE *marks_f_ = nullptr;
     uint64_t sw_stores_ = 0;
     uint64_t sw_dropped_ = 0;
     int max_hart_seen_ = -1;
@@ -258,6 +284,7 @@ void PerfProbeCollector::sample(int64_t now)
     }
 
     this->flush_sw(now);
+    this->state_flush(now);
 
     this->slice_start_ = now;
     this->slice_idx_++;
@@ -312,35 +339,83 @@ vp::IoReqStatus PerfProbeCollector::sw_req(vp::Block *__this, vp::IoReq *req)
         if (req->get_data() != nullptr) memset(req->get_data(), 0, req->get_size());
         return vp::IO_REQ_OK;
     }
-
-    const uint64_t off = req->get_addr();
-    const int hart = (int)(off >> PERF_PROBE_HART_SHIFT);
-    const int evt  = (int)((off >> 2) & (PERF_PROBE_NB_EVENTS - 1));
     uint32_t value = 0;
     if (req->get_data() != nullptr)
     {
         memcpy(&value, req->get_data(), req->get_size() < 4 ? req->get_size() : 4);
     }
+    _this->sw_via_port_++;
+    _this->sw_store(req->get_addr(), value);
+    return vp::IO_REQ_OK;
+}
+
+
+// One software probe store: `off` is the offset into the probe window, `value` the data. Reached
+// either through the io port above or directly from a core's LSU (see Lsu::data_req).
+void PerfProbeCollector::sw_store(uint64_t off, uint32_t value)
+{
+    const int hart = (int)(off >> PERF_PROBE_HART_SHIFT);
+    const int evt  = (int)((off >> 2) & (PERF_PROBE_NB_EVENTS - 1));
     if (evt >= PROBE_EVT_NB_DEFINED)
     {
-        _this->sw_dropped_++;
-        return vp::IO_REQ_OK;
+        this->sw_dropped_++;
+        return;
     }
-    _this->sw_stores_++;
-    if (hart > _this->max_hart_seen_) _this->max_hart_seen_ = hart;
+    this->sw_stores_++;
+    if (hart > this->max_hart_seen_) this->max_hart_seen_ = hart;
+
+    const int64_t now = this->clock.get_cycles();
+    if (evt == PROBE_EVT_KERNEL_START || evt == PROBE_EVT_KERNEL_END || evt == PROBE_EVT_TTI_BEGIN ||
+        evt == PROBE_EVT_TTI_END || evt == PROBE_EVT_MARK)
+    {
+        if (this->marks_f_ == nullptr)
+        {
+            this->marks_f_ = this->open_csv("sw_marks", {}, true);
+            fprintf(this->marks_f_, "cycle,hart,event,value\n");
+        }
+        fprintf(this->marks_f_, "%lld,%d,%d,%u\n", (long long)now, hart, evt, value);
+    }
+    if (evt == PROBE_EVT_ROLE || evt == PROBE_EVT_PHASE)
+    {
+        this->state_set(hart, evt, (int)value, now);
+    }
+    else if (evt == PROBE_EVT_PKT_IN)
+    {
+        this->pkt_in_[value] = PktIn{now, hart};
+    }
+    else if (evt == PROBE_EVT_PKT_OUT)
+    {
+        auto it = this->pkt_in_.find(value);
+        if (it == this->pkt_in_.end())
+        {
+            this->pkt_unmatched_++;
+        }
+        else
+        {
+            if (this->pkt_f_ == nullptr)
+            {
+                this->pkt_f_ = this->open_csv("pkt_latency", {}, true);
+                fprintf(this->pkt_f_, "in_cycle,out_cycle,latency,hart_in,hart_out\n");
+            }
+            fprintf(this->pkt_f_, "%lld,%lld,%lld,%d,%d\n", (long long)it->second.cycle,
+                    (long long)now, (long long)(now - it->second.cycle), it->second.hart, hart);
+            this->pkt_in_.erase(it);
+            this->pkt_closed_++;
+        }
+    }
 
     const bool per_entity = (PERF_PROBE_ENTITY_EVENTS >> evt) & 1u;
     const bool gauge      = (PERF_PROBE_GAUGE_EVENTS  >> evt) & 1u;
     const uint32_t v      = per_entity ? (value & PERF_PROBE_VALUE_MASK) : value;
 
-    SwBin &b = _this->sw_hart_[std::make_pair(hart, evt)];
+    SwBin &b = this->sw_hart_[std::make_pair(hart, evt)];
     b.count++;
     b.sum += v;
 
     if (per_entity)
     {
         const int entity = (int)(value >> PERF_PROBE_ENTITY_SHIFT);
-        SwEnt &e = _this->sw_ent_[std::make_pair(entity, evt)];
+        SwEnt &e = this->sw_ent_[std::make_pair(entity, evt)];
         e.count++;
         e.sum += v;
         e.last = v;
@@ -352,7 +427,48 @@ vp::IoReqStatus PerfProbeCollector::sw_req(vp::Block *__this, vp::IoReq *req)
         (void)gauge;
     }
 
-    return vp::IO_REQ_OK;
+    return;
+}
+
+
+void PerfProbeCollector::state_set(int hart, int evt, int value, int64_t now)
+{
+    HartState &st = this->state_[std::make_pair(hart, evt)];
+    if (st.value >= 0 && now > st.since)
+    {
+        this->state_bin_[std::make_tuple(hart, evt, st.value)] += (uint64_t)(now - st.since);
+    }
+    st.value = value;
+    st.since = now;
+}
+
+
+void PerfProbeCollector::state_flush(int64_t now)
+{
+    // Charge every open state up to the end of this slice, then write and clear the bins.
+    for (auto &kv : this->state_)
+    {
+        HartState &st = kv.second;
+        if (st.value >= 0 && now > st.since)
+        {
+            this->state_bin_[std::make_tuple(kv.first.first, kv.first.second, st.value)] +=
+                (uint64_t)(now - st.since);
+            st.since = now;
+        }
+    }
+    if (this->state_bin_.empty()) return;
+    if (this->state_f_ == nullptr)
+    {
+        this->state_f_ = this->open_csv("sw_state", {}, true);
+        fprintf(this->state_f_, "slice,cycle,hart,event,value,cycles\n");
+    }
+    for (auto &kv : this->state_bin_)
+    {
+        fprintf(this->state_f_, "%lld,%lld,%d,%d,%d,%llu\n", (long long)this->slice_idx_,
+                (long long)this->slice_start_, std::get<0>(kv.first), std::get<1>(kv.first),
+                std::get<2>(kv.first), (unsigned long long)kv.second);
+    }
+    this->state_bin_.clear();
 }
 
 
@@ -369,11 +485,15 @@ void PerfProbeCollector::stop()
     }
     if (this->sw_f_) { fclose(this->sw_f_); this->sw_f_ = nullptr; }
     if (this->sw_ent_f_) { fclose(this->sw_ent_f_); this->sw_ent_f_ = nullptr; }
+    if (this->state_f_) { fclose(this->state_f_); this->state_f_ = nullptr; }
+    if (this->pkt_f_) { fclose(this->pkt_f_); this->pkt_f_ = nullptr; }
+    if (this->marks_f_) { fclose(this->marks_f_); this->marks_f_ = nullptr; }
     fprintf(stderr, "[PERF-PROBE] %zu sources, %lld slices of %lld cycles, %llu sw stores "
-                    "(%llu dropped) -> %s/\n",
+                    "(%llu dropped, %llu via interconnect), %llu packets timed (%llu unmatched, %zu still open) -> %s/\n",
             this->entries_.size(), (long long)this->slice_idx_, (long long)this->slice_,
             (unsigned long long)this->sw_stores_, (unsigned long long)this->sw_dropped_,
-            this->out_dir_.c_str());
+            (unsigned long long)this->sw_via_port_, (unsigned long long)this->pkt_closed_, (unsigned long long)this->pkt_unmatched_,
+            this->pkt_in_.size(), this->out_dir_.c_str());
     vp::Component::stop();
 }
 

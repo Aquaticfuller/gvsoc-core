@@ -107,6 +107,7 @@ void Exec::reset(bool active)
 
         // Always increase the stall when reset is asserted since stall count is set to 0
         // and we need to prevent the core from fetching instructions
+        this->iss.timing.probe_stall_reason = Timing::PROBE_STALL_OFF;
         this->stalled_inc();
     }
     else
@@ -439,7 +440,7 @@ void Exec::fetchen_sync(vp::Block *__this, bool active)
     else if (old_val && !active)
     {
         // In case of a falling edge, stall the core to prevent him from executing
-        _this->iss.timing.probe_stall_reason = Timing::PROBE_STALL_OTHER;
+        _this->iss.timing.probe_stall_reason = Timing::PROBE_STALL_OFF;
         _this->stalled_inc();
         _this->busy_exit();
     }
