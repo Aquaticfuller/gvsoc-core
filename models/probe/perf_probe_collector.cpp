@@ -31,7 +31,8 @@
  *   sw_entity.csv slice,cycle,entity,event,count,sum,last
  *   sw_state.csv  slice,cycle,hart,event,value,cycles   time per ROLE / PHASE value, exact
  *   sw_marks.csv  cycle,hart,event,value                kernel window, TTI boundaries, exact
- *   pkt_latency.csv in_cycle,out_cycle,latency,hart_in,hart_out   one row per timed packet
+ *   pkt_latency.csv in_cycle,out_cycle,latency,hart_in,hart_out,wait   one row per timed packet
+ *                   (in_cycle = arrival when the kernel paces arrivals; wait = arrival -> PKT_IN)
  *   summary.json  cumulative totals per source at the end of the run
  */
 
@@ -126,8 +127,9 @@ private:
 
     // Per-packet latency: PKT_IN stamps a tag, PKT_OUT with the same tag closes it. The collector
     // stamps both ends itself, so the kernel needs no timestamps and no extra fields in its structs.
-    struct PktIn { int64_t cycle; int hart; };
+    struct PktIn { int64_t cycle; int hart; int64_t wait; };
     std::unordered_map<uint32_t, PktIn> pkt_in_;
+    std::unordered_map<int, int64_t> pkt_arrival_;   // hart -> arrival cycle announced by PKT_LATE
     FILE *pkt_f_ = nullptr;
     uint64_t pkt_closed_ = 0, pkt_unmatched_ = 0;
     uint64_t sw_via_port_ = 0;   // stores that came through the interconnect instead of the LSU
@@ -379,9 +381,20 @@ void PerfProbeCollector::sw_store(uint64_t off, uint32_t value)
     {
         this->state_set(hart, evt, (int)value, now);
     }
+    else if (evt == PROBE_EVT_PKT_LATE)
+    {
+        this->pkt_arrival_[hart] = now - (int64_t)value;
+    }
     else if (evt == PROBE_EVT_PKT_IN)
     {
-        this->pkt_in_[value] = PktIn{now, hart};
+        int64_t in = now;
+        auto a = this->pkt_arrival_.find(hart);
+        if (a != this->pkt_arrival_.end())
+        {
+            in = a->second;
+            this->pkt_arrival_.erase(a);
+        }
+        this->pkt_in_[value] = PktIn{in, hart, now - in};
     }
     else if (evt == PROBE_EVT_PKT_OUT)
     {
@@ -395,10 +408,11 @@ void PerfProbeCollector::sw_store(uint64_t off, uint32_t value)
             if (this->pkt_f_ == nullptr)
             {
                 this->pkt_f_ = this->open_csv("pkt_latency", {}, true);
-                fprintf(this->pkt_f_, "in_cycle,out_cycle,latency,hart_in,hart_out\n");
+                fprintf(this->pkt_f_, "in_cycle,out_cycle,latency,hart_in,hart_out,wait\n");
             }
-            fprintf(this->pkt_f_, "%lld,%lld,%lld,%d,%d\n", (long long)it->second.cycle,
-                    (long long)now, (long long)(now - it->second.cycle), it->second.hart, hart);
+            fprintf(this->pkt_f_, "%lld,%lld,%lld,%d,%d,%lld\n", (long long)it->second.cycle,
+                    (long long)now, (long long)(now - it->second.cycle), it->second.hart, hart,
+                    (long long)it->second.wait);
             this->pkt_in_.erase(it);
             this->pkt_closed_++;
         }
