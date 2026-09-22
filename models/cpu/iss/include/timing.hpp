@@ -22,6 +22,7 @@
 #pragma once
 
 #include <vp/vp.hpp>
+#include "probe/perf_probe.hpp"
 #include <cpu/iss/include/types.hpp>
 
 class Timing
@@ -94,6 +95,48 @@ public:
     vp::PowerSource power_stall_next;
     vp::PowerSource background_power;
     uint32_t pcer_trace_active_events;
+
+    // ---- perf-probe counters (prompt/perf_probe_design.md §4.1) ----
+    // Always on and cumulative; the perf_probe collector reads them through IssWrapper. Unlike the
+    // pcer counters above they do not depend on software enabling PCMR, and they never touch
+    // timing: every hook is a bare increment.
+    enum probe_stall_e
+    {
+        PROBE_STALL_MEM = 0,    // waiting for a scalar load/store response (or a denied request)
+        PROBE_STALL_FETCH,      // instruction fetch
+        PROBE_STALL_DEP,        // load-use / scoreboard dependency (modelled cycles + retries)
+        PROBE_STALL_FPU,        // FPU sequencer back-pressure
+        PROBE_STALL_VGRANT,     // retry cycles waiting for the shared-Spatz grant (multi-scalar)
+        PROBE_STALL_VQFULL,     // retry cycles because the Spatz queue is full
+        PROBE_STALL_BARRIER,    // parked in the hardware barrier
+        PROBE_STALL_WFI,        // wfi
+        PROBE_STALL_OTHER,      // fetch-enable low, misaligned, jumps, ...
+        PROBE_STALL_NB,
+    };
+    uint64_t probe_invocations = 0;   // instruction handler invocations (one per insn_account())
+    uint64_t probe_retries = 0;       // invocations that returned the same pc to be re-executed
+    uint64_t probe_ld = 0, probe_st = 0, probe_branch = 0, probe_taken = 0, probe_jump = 0;
+    uint64_t probe_amo = 0, probe_fpu_off = 0, probe_vec_issue = 0;
+    uint64_t probe_stall[PROBE_STALL_NB] = {0};
+    // Reason charged when the next stalled_inc() opens an interval; a stall site sets it right
+    // before calling insn_stall()/stalled_inc(), and it resets to MEM when the interval closes.
+    int probe_stall_reason = PROBE_STALL_MEM;
+    int64_t probe_stall_start = -1;
+    probe::Occupancy probe_lsu_occ;   // Σ(outstanding scalar requests · cycles)
+    inline void probe_stall_open(int64_t now)
+    {
+        if (this->probe_stall_start < 0) this->probe_stall_start = now;
+    }
+    inline void probe_stall_close(int64_t now)
+    {
+        if (this->probe_stall_start >= 0)
+        {
+            if (now > this->probe_stall_start)
+                this->probe_stall[this->probe_stall_reason] += (uint64_t)(now - this->probe_stall_start);
+            this->probe_stall_start = -1;
+        }
+        this->probe_stall_reason = PROBE_STALL_MEM;
+    }
 
 private:
 

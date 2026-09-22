@@ -25,6 +25,7 @@
 #include "vp/clock/clock_event.hpp"
 #include "vp/register.hpp"
 #include "vp/itf/wire.hpp"
+#include "probe/perf_probe.hpp"
 
 class Ara;
 class IssWrapper;
@@ -313,11 +314,19 @@ private:
 #endif
 
 // Ara top block
-class Ara : public vp::Block
+class Ara : public vp::Block, public probe::Source
 {
     friend class AraVcompute;
 
 public:
+    // perf-probe "spatz" source (prompt/perf_probe_design.md §4.2); attached by IssWrapper::start().
+    const char *probe_kind() const override { return "spatz"; }
+    void probe_columns(std::vector<probe::Column> &c) const override;
+    void probe_sample(int64_t now, std::vector<uint64_t> &v) override;
+    uint64_t probe_vinsn = 0;             // instructions accepted into the queue
+    probe::Occupancy probe_q_occ;         // Σ(pending instructions · cycles)
+    probe::Occupancy probe_vlsu_occ;      // Σ(vector loads/stores in flight · cycles)
+
     // List of sub-blocks processing instructions
     typedef enum
     {

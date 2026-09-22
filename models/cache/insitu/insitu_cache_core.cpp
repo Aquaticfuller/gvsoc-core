@@ -35,14 +35,38 @@
 #include "insitu_cache_decode.hpp"
 #include "insitu_cache_bank_array.hpp"
 #include "insitu_cache_route.hpp"
+#include "probe/perf_probe.hpp"
 
 using namespace insitu;
 
-class InsituCacheCore : public vp::Component
+class InsituCacheCore : public vp::Component, public probe::Source
 {
 public:
     explicit InsituCacheCore(vp::ComponentConf &conf);
     void reset(bool active) override;
+    void start() override { probe::attach(this, this); }
+
+    // perf-probe source (prompt/perf_probe_design.md §4.3). Cumulative; the collector differences.
+    const char *probe_kind() const override { return "cache"; }
+    void probe_columns(std::vector<probe::Column> &c) const override
+    {
+        c = {{"rd_hit", probe::COUNTER}, {"rd_miss", probe::COUNTER},
+             {"wr_hit", probe::COUNTER}, {"wr_miss", probe::COUNTER},
+             {"mshr_merge", probe::COUNTER}, {"refill", probe::COUNTER},
+             {"evict", probe::COUNTER}, {"flush", probe::COUNTER},
+             {"bank_conflict", probe::COUNTER}, {"adm_stall", probe::COUNTER},
+             {"served_lat_sum", probe::COUNTER}, {"served_n", probe::COUNTER},
+             {"hit_lat_sum", probe::COUNTER}, {"hit_n", probe::COUNTER},
+             {"miss_lat_sum", probe::COUNTER}, {"miss_n", probe::COUNTER},
+             {"in_q_occ", probe::COUNTER}, {"xline", probe::COUNTER}};
+    }
+    void probe_sample(int64_t now, std::vector<uint64_t> &v) override
+    {
+        v = {cnt_rd_hit_, cnt_rd_miss_, cnt_wr_hit_, cnt_wr_miss_, cnt_mshr_merge_, cnt_refill_,
+             cnt_evict_, cnt_flush_, cnt_bank_conflict_, cnt_adm_stall_,
+             served_lat_sum_, served_lat_n_, hit_lat_sum_, hit_lat_n_, miss_lat_sum_, miss_lat_n_,
+             in_q_occ_.read(now), n_xline_};
+    }
     void stop() override {
         // End-of-sim counter dump (diagnostics; one line per cell).
         fprintf(stderr, "[INSITU-CORE %s] rd_hit=%lu rd_miss=%lu wr_hit=%lu wr_miss=%lu refill=%lu evict=%lu flush=%lu/%lu | lat_sum=%lu b1=%lu clamp=%lu/%lu winfo=%lu wcommit=%lu\n",
@@ -369,6 +393,9 @@ private:
     // latency-budget diagnostics: requests, total stamped latency, and the per-mechanism waits
     uint64_t lat_sum_=0, lat_b1_=0, lat_clamp_=0, lat_winfo_=0, lat_wcommit_=0, n_clamp_=0;
     uint64_t cnt_flush_=0, cnt_flush_dirty_=0;
+    // perf-probe: admissions parked because in_q_ was full, and Σ(in_q_ length · cycles).
+    uint64_t cnt_adm_stall_ = 0;
+    probe::Occupancy in_q_occ_;
 };
 
 InsituCacheCore::InsituCacheCore(vp::ComponentConf &conf) : vp::Component(conf)
@@ -524,10 +551,12 @@ vp::IoReqStatus InsituCacheCore::req_handler(vp::Block *__this, vp::IoReq *req)
         // Accept queue full: park the request (PENDING) and re-admit it as space frees (stage0_arbitrate).
         // Never DENY + drop — an async-capable master would wait forever for a resp() that never comes.
         _this->admission_stall_q_.push_back(req);
+        _this->cnt_adm_stall_++;
         _this->schedule_tick();
         return vp::IO_REQ_PENDING;
     }
     _this->in_q_.push_back(req);
+    _this->in_q_occ_.add(_this->clock.get_cycles(), 1);
     _this->schedule_tick();
     return vp::IO_REQ_PENDING;
 }
@@ -1155,6 +1184,7 @@ void InsituCacheCore::stage0_arbitrate()
     }
     if (!in_q_.empty()) {
         vp::IoReq *r = in_q_.front(); in_q_.pop_front();
+        in_q_occ_.add(this->clock.get_cycles(), -1);
         preread_q_.valid = true; preread_q_.is_refill = false; preread_q_.req = r;
         preread_q_.addr = r->get_addr(); preread_q_.is_write = r->get_is_write();
     }

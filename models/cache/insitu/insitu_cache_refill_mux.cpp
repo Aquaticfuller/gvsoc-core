@@ -44,10 +44,25 @@ static inline bool mux_stats()
     return v;
 }
 
-class InsituCacheRefillMux : public vp::Component
+#include "probe/perf_probe.hpp"
+
+class InsituCacheRefillMux : public vp::Component, public probe::Source
 {
 public:
     explicit InsituCacheRefillMux(vp::ComponentConf &conf);
+    void start() override { probe::attach(this, this); }
+
+    // perf-probe source (prompt/perf_probe_design.md §4.5).
+    const char *probe_kind() const override { return "refill_mux"; }
+    void probe_columns(std::vector<probe::Column> &c) const override
+    {
+        c = {{"fwd", probe::COUNTER}, {"fwd_prio", probe::COUNTER}, {"q_occ", probe::COUNTER},
+             {"max_q", probe::GAUGE}};
+    }
+    void probe_sample(int64_t now, std::vector<uint64_t> &v) override
+    {
+        v = {n_fwd_, n_fwd_prio_, q_occ_.read(now), max_q_};
+    }
 
     void reset(bool active) override
     {
@@ -91,6 +106,7 @@ private:
     vp::Trace trace_;
 
     uint64_t n_fwd_ = 0, n_fwd_prio_ = 0, max_q_ = 0;
+    probe::Occupancy q_occ_;    // Σ(queued requests, all inputs · cycles)
 };
 
 InsituCacheRefillMux::InsituCacheRefillMux(vp::ComponentConf &conf)
@@ -124,6 +140,7 @@ vp::IoReqStatus InsituCacheRefillMux::req_handler(vp::Block *__this, vp::IoReq *
 {
     InsituCacheRefillMux *_this = static_cast<InsituCacheRefillMux *>(__this);
     _this->queues_[input_id].push_back(req);
+    _this->q_occ_.add(_this->clock.get_cycles(), 1);
     if (_this->queues_[input_id].size() > _this->max_q_)
     {
         _this->max_q_ = _this->queues_[input_id].size();
@@ -180,6 +197,7 @@ void InsituCacheRefillMux::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     if (sel >= 0) {
         vp::IoReq *req = _this->queues_[sel].front();
         _this->queues_[sel].pop_front();
+        _this->q_occ_.add(_this->clock.get_cycles(), -1);
 
         const uint32_t n_data = _this->num_inputs_ - _this->nb_prio_;
         const bool is_prio = ((uint32_t)sel >= n_data);

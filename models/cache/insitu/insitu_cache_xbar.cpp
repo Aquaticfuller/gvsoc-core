@@ -33,12 +33,29 @@
 
 using namespace insitu;
 
-class InsituCacheXbar : public vp::Component
+#include "probe/perf_probe.hpp"
+
+class InsituCacheXbar : public vp::Component, public probe::Source
 {
 public:
     explicit InsituCacheXbar(vp::ComponentConf &conf);
+    void start() override { probe::attach(this, this); }
+
+    // perf-probe source (prompt/perf_probe_design.md §4.4).
+    const char *probe_kind() const override { return "xbar"; }
+    void probe_columns(std::vector<probe::Column> &c) const override
+    {
+        c = {{"req", probe::COUNTER}, {"local", probe::COUNTER}, {"remote", probe::COUNTER},
+             {"denied", probe::COUNTER}, {"pending", probe::COUNTER}};
+    }
+    void probe_sample(int64_t now, std::vector<uint64_t> &v) override
+    {
+        v = {pr_req_, pr_local_, pr_remote_, pr_denied_, pr_pending_};
+    }
 
 private:
+    uint64_t pr_req_ = 0, pr_local_ = 0, pr_remote_ = 0, pr_denied_ = 0, pr_pending_ = 0;
+
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req, int input_id);
     // E3 runtime partition config (csr-id in addr: 0=num_private, 1=private_start, 2=dyn_offset).
     static vp::IoReqStatus config_handler(vp::Block *__this, vp::IoReq *req);
@@ -168,6 +185,10 @@ vp::IoReqStatus InsituCacheXbar::req_handler(vp::Block *__this, vp::IoReq *req, 
         }
     }
     vp::IoReqStatus st = _this->outputs_[out_id]->req_forward(req);
+    _this->pr_req_++;
+    if (r.local) _this->pr_local_++; else _this->pr_remote_++;
+    if (st == vp::IO_REQ_DENIED) _this->pr_denied_++;
+    else if (st == vp::IO_REQ_PENDING) _this->pr_pending_++;
 
     // Restore the caller's address once the bank has resolved the access. Rotation is an INTERNAL
     // representation: mutating the request in place is invisible in a single group, but with the L1

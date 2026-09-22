@@ -127,6 +127,7 @@ void Irq::wfi_handle()
         this->iss.exec.wfi.set(true);
         this->iss.exec.wfi_start = this->iss.top.clock.get_cycles();
         this->iss.exec.busy_exit();
+        this->iss.timing.probe_stall_reason = Timing::PROBE_STALL_WFI;
         this->iss.exec.insn_stall();
     }
 }

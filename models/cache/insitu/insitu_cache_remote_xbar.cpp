@@ -25,12 +25,29 @@
 
 using namespace insitu;
 
-class InsituCacheRemoteXbar : public vp::Component
+#include "probe/perf_probe.hpp"
+
+class InsituCacheRemoteXbar : public vp::Component, public probe::Source
 {
 public:
     explicit InsituCacheRemoteXbar(vp::ComponentConf &conf);
+    void start() override { probe::attach(this, this); }
+
+    // perf-probe source (prompt/perf_probe_design.md §4.4).
+    const char *probe_kind() const override { return "rxbar"; }
+    void probe_columns(std::vector<probe::Column> &c) const override
+    {
+        c = {{"req", probe::COUNTER}, {"local_group", probe::COUNTER}, {"noc", probe::COUNTER},
+             {"denied", probe::COUNTER}, {"pending", probe::COUNTER}};
+    }
+    void probe_sample(int64_t now, std::vector<uint64_t> &v) override
+    {
+        v = {pr_req_, pr_local_, pr_noc_, pr_denied_, pr_pending_};
+    }
 
 private:
+    uint64_t pr_req_ = 0, pr_local_ = 0, pr_noc_ = 0, pr_denied_ = 0, pr_pending_ = 0;
+
     static vp::IoReqStatus req_handler(vp::Block *__this, vp::IoReq *req, int input_id);
     // E3: dyn_offset only (csr-id 2).
     static vp::IoReqStatus config_handler(vp::Block *__this, vp::IoReq *req);
@@ -162,6 +179,10 @@ vp::IoReqStatus InsituCacheRemoteXbar::req_handler(vp::Block *__this, vp::IoReq 
     _this->trace_.msg(vp::Trace::LEVEL_TRACE, "remote src=%u addr=0x%lx -> tile=%u slot=%u\n",
                       source, (unsigned long)req->get_addr(), target, out);
     vp::IoReqStatus st = _this->outputs_[out]->req_forward(req);
+    _this->pr_req_++;
+    if (out == _this->n_local_slots_ && _this->num_groups_ > 1) _this->pr_noc_++; else _this->pr_local_++;
+    if (st == vp::IO_REQ_DENIED) _this->pr_denied_++;
+    else if (st == vp::IO_REQ_PENDING) _this->pr_pending_++;
     {
         static const int dbg = [](){ const char *e = getenv("INSITU_RXBAR_DEBUG"); return e ? atoi(e) : 0; }();
         static int sbudget = dbg;

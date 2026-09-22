@@ -89,10 +89,14 @@ iss_reg_t Sequencer::non_float_handler(Iss *iss, iss_insn_t *insn, iss_reg_t pc)
         if (iss->regfile.scoreboard_reg_timestamp[insn->in_regs[i]] == -1)
         {
             iss->sequencer.trace.msg(vp::Trace::LEVEL_TRACE, "Stalling due to register dependency (reg: %d)\n", insn->in_regs[i]);
+            iss->timing.probe_retries++;
 #ifndef CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING
             // When outstanding support is active, instructions are retried at every cycle
+            iss->timing.probe_stall_reason = Timing::PROBE_STALL_DEP;
             iss->sequencer.stall_reg = insn->in_regs[i];
             iss->exec.insn_stall();
+#else
+            iss->timing.probe_stall[Timing::PROBE_STALL_DEP]++;
 #endif
             return pc;
         }
@@ -114,12 +118,15 @@ iss_reg_t Sequencer::sequence_buffer_handler(Iss *iss, iss_insn_t *insn, iss_reg
         _this->trace.msg(vp::Trace::LEVEL_TRACE, "Input queue is full, stalling core\n");
 
         _this->stalled_insn = true;
+        iss->timing.probe_retries++;
+        iss->timing.probe_stall_reason = Timing::PROBE_STALL_FPU;
         iss->exec.insn_stall();
         return pc;
     }
     else
     {
         iss->sequencer.trace.msg(vp::Trace::LEVEL_TRACE, "Pushing instruction to sequencer buffer (pc: 0x%lx)\n", pc);
+        iss->timing.probe_fpu_off++;
 
         if (_this->buffer.size() == 16)
         {
@@ -158,12 +165,15 @@ iss_reg_t Sequencer::direct_branch_handler(Iss *iss, iss_insn_t *insn, iss_reg_t
         _this->trace.msg(vp::Trace::LEVEL_TRACE, "Input queue is full, stalling core\n");
 
         _this->stalled_insn = true;
+        iss->timing.probe_retries++;
+        iss->timing.probe_stall_reason = Timing::PROBE_STALL_FPU;
         iss->exec.insn_stall();
         return pc;
     }
     else
     {
         // Input queue is empty, store the input instruction and continue with next one
+        iss->timing.probe_fpu_off++;
         if (_this->buffer.size() > 0)
         {
             _this->trace.msg(vp::Trace::LEVEL_TRACE, "Buffer non empty, stalling direct branch instruction\n");

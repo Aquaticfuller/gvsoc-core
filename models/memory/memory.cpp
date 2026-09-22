@@ -29,7 +29,9 @@
 #include <vp/itf/wire.hpp>
 #include <memory/memory_config/memory_config.hpp>
 
-class Memory : public vp::Component
+#include "probe/perf_probe.hpp"
+
+class Memory : public vp::Component, public probe::Source
 {
 
 public:
@@ -46,6 +48,20 @@ private:
 
     void stop() override;
     void reset(bool active) override;
+    void start() override { probe::attach(this, this); }
+
+    // perf-probe source (prompt/perf_probe_design.md): the access counters below, cumulative.
+    const char *probe_kind() const override { return "mem"; }
+    void probe_columns(std::vector<probe::Column> &c) const override
+    {
+        c = {{"reads", probe::COUNTER}, {"writes", probe::COUNTER},
+             {"rd_bytes", probe::COUNTER}, {"wr_bytes", probe::COUNTER}};
+    }
+    void probe_sample(int64_t now, std::vector<uint64_t> &v) override
+    {
+        v = {this->stat_reads.get(), this->stat_writes.get(), this->stat_bytes_read.get(),
+             this->stat_bytes_written.get()};
+    }
 
     static void power_ctrl_sync(vp::Block *__this, bool value);
     static void meminfo_sync_back(vp::Block *__this, void **value);

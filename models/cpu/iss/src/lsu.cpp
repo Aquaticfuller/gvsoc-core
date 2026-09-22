@@ -143,6 +143,7 @@ void Lsu::data_response(vp::Block *__this, vp::IoReq *req)
 #ifdef CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING
     _this->pending_latency = 0;
     int req_id = *((int *)req->arg_get(0));
+    iss->timing.probe_lsu_occ.add(iss->top.clock.get_cycles(), -1);
     // Call the access termination callback only we the access is not misaligned since
     // in this case, the second access with handle it.
     if (_this->misaligned_size == 0)
@@ -263,6 +264,9 @@ int Lsu::data_req_aligned(iss_addr_t addr, uint8_t *data_ptr, uint8_t *memcheck_
 
 #ifdef CONFIG_GVSOC_ISS_LSU_NB_OUTSTANDING
     req_id = *((int *)req->arg_get(0));
+    // perf-probe: the request is outstanding until data_response() -- for DENIED too, since the
+    // grant path also ends in the same response.
+    this->iss.timing.probe_lsu_occ.add(this->iss.top.clock.get_cycles(), 1);
     if (err == vp::IO_REQ_DENIED)
     {
         // In case the request is denied, make sure we don't allow any other access
@@ -581,6 +585,13 @@ bool Lsu::atomic(iss_insn_t *insn, iss_addr_t addr, int size, int reg_in, int re
     this->log_is_write.set_and_release(true);
 
     int err = this->data.req(req);
+    // perf-probe: atomics are counted where they are issued, and an async one stays outstanding
+    // until data_response() decrements the occupancy (same path as loads/stores).
+    this->iss.timing.probe_amo++;
+    if (err == vp::IO_REQ_PENDING || err == vp::IO_REQ_DENIED)
+    {
+        this->iss.timing.probe_lsu_occ.add(this->iss.top.clock.get_cycles(), 1);
+    }
     if (err == vp::IO_REQ_OK)
     {
         if (size != ISS_REG_WIDTH/8)

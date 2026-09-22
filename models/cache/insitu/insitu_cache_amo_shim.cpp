@@ -78,10 +78,24 @@ inline uint8_t opcode_to_amo(vp::IoReqOpcode op)
 }
 }
 
-class InsituCacheAmo : public vp::Component
+#include "probe/perf_probe.hpp"
+
+class InsituCacheAmo : public vp::Component, public probe::Source
 {
 public:
     explicit InsituCacheAmo(vp::ComponentConf &conf);
+    void start() override { probe::attach(this, this); }
+
+    // perf-probe source (prompt/perf_probe_design.md §4.5).
+    const char *probe_kind() const override { return "amo"; }
+    void probe_columns(std::vector<probe::Column> &c) const override
+    {
+        c = {{"rmw", probe::COUNTER}, {"lat_sum", probe::COUNTER}};
+    }
+    void probe_sample(int64_t now, std::vector<uint64_t> &v) override
+    {
+        v = {n_rmw_, lat_rmw_sum_};
+    }
     void stop() override {
         fprintf(stderr, "[INSITU-AMO %s] rmw=%lu lat_sum=%lu\n", this->get_path().c_str(),
                 (unsigned long)n_rmw_, (unsigned long)lat_rmw_sum_);

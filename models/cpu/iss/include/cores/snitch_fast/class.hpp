@@ -33,6 +33,7 @@
 #include <cpu/iss/include/exception.hpp>
 #include <cpu/iss/include/syscalls.hpp>
 #include <cpu/iss/include/timing.hpp>
+#include "probe/perf_probe.hpp"
 #ifdef CONFIG_ISS_VLEN
 #include <cpu/iss/include/vector.hpp>
 #endif
@@ -127,7 +128,7 @@ private:
 };
 
 
-class IssWrapper : public vp::Component
+class IssWrapper : public vp::Component, public probe::Source
 {
 
 public:
@@ -136,6 +137,11 @@ public:
     void start();
     void reset(bool active);
     void stop();
+
+    // perf-probe "core" source (prompt/perf_probe_design.md §4.1); implemented in snitch.cpp.
+    const char *probe_kind() const override { return "core"; }
+    void probe_columns(std::vector<probe::Column> &c) const override;
+    void probe_sample(int64_t now, std::vector<uint64_t> &v) override;
     void insn_commit(PendingInsn *pending_insn);
     static iss_reg_t vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_reg_t pc);
 

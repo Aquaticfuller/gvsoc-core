@@ -122,6 +122,7 @@ inline void Timing::event_load_load_account(int incr)
 
 inline void Timing::event_load_account(int incr)
 {
+    this->probe_ld += incr;
     this->event_account(CSR_PCER_LD, incr);
 }
 
@@ -132,21 +133,25 @@ inline void Timing::event_rvc_account(int incr)
 
 inline void Timing::event_store_account(int incr)
 {
+    this->probe_st += incr;
     this->event_account(CSR_PCER_ST, incr);
 }
 
 inline void Timing::event_branch_account()
 {
+    this->probe_branch++;
     this->event_account(CSR_PCER_BRANCH, 1);
 }
 
 inline void Timing::event_taken_branch_account(int incr)
 {
+    this->probe_taken += incr;
     this->event_account(CSR_PCER_TAKEN_BRANCH, incr);
 }
 
 inline void Timing::event_jump_account(int incr)
 {
+    this->probe_jump += incr;
     this->event_account(CSR_PCER_JUMP, incr);
 }
 
@@ -186,6 +191,7 @@ inline void Timing::insn_stall_account()
 
 inline void Timing::insn_account()
 {
+    this->probe_invocations++;
     this->event_account(CSR_PCER_INSTR, 1);
     int64_t stall_cycles = this->iss.exec.stall_cycles;
     int64_t cycles = 1;
@@ -210,24 +216,28 @@ inline void Timing::insn_account()
 
 inline void Timing::stall_fetch_account(int cycles)
 {
+    if (cycles > 0) this->probe_stall[PROBE_STALL_FETCH] += cycles;
     this->stall_cycles_account(cycles);
     this->event_account(CSR_PCER_IMISS, cycles);
 }
 
 inline void Timing::stall_misaligned_account()
 {
+    this->probe_stall[PROBE_STALL_OTHER] += 1;
     this->stall_cycles_account(1);
     this->event_account(CSR_PCER_LD, 1);
 }
 
 inline void Timing::stall_load_account(int cycles)
 {
+    if (cycles > 0) this->probe_stall[PROBE_STALL_MEM] += cycles;
     this->stall_cycles_account(cycles);
 }
 
 inline void Timing::stall_taken_branch_account()
 {
 #ifndef CONFIG_GVSOC_ISS_SNITCH
+    this->probe_stall[PROBE_STALL_OTHER] += 2;
     this->stall_cycles_account(2);
 #endif
     this->event_branch_account();
@@ -236,22 +246,26 @@ inline void Timing::stall_taken_branch_account()
 
 inline void Timing::stall_insn_account(int cycles)
 {
+    if (cycles > 0) this->probe_stall[PROBE_STALL_OTHER] += cycles;
     this->stall_cycles_account(cycles);
 }
 
 inline void Timing::stall_insn_dependency_account(int latency)
 {
+    if (latency > 1) this->probe_stall[PROBE_STALL_DEP] += latency - 1;
     this->stall_cycles_account(latency - 1);
 }
 
 inline void Timing::stall_jump_account()
 {
+    this->probe_stall[PROBE_STALL_OTHER] += 1;
     this->stall_cycles_account(1);
     this->event_jump_account(1);
 }
 
 inline void Timing::stall_load_dependency_account(int latency)
 {
+    if (latency > 0) this->probe_stall[PROBE_STALL_DEP] += latency;
     this->stall_cycles_account(latency);
     this->event_account(CSR_PCER_LD_STALL, latency);
 }

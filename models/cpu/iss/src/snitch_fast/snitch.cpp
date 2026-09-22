@@ -72,6 +72,7 @@ bool Iss::barrier_update(bool is_write, iss_reg_t &value)
         if (this->waiting_barrier)
         {
             // If not, stall the core, this will get unstalled when the barrier sync is called
+            this->timing.probe_stall_reason = Timing::PROBE_STALL_BARRIER;
             this->exec.insn_stall();
         }
     }
@@ -143,6 +144,43 @@ void IssWrapper::start()
 
     this->iss.lsu.start();
     this->iss.gdbserver.start();
+
+    // perf-probe: this hart as a "core" source, its Spatz as a "spatz" source under it.
+    if (probe::attach(this, this))
+    {
+#if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
+        probe::attach(this, &this->iss.vu, "spatz");
+#endif
+    }
+}
+
+void IssWrapper::probe_columns(std::vector<probe::Column> &c) const
+{
+    c = {{"insn", probe::COUNTER}, {"retry", probe::COUNTER}, {"ld", probe::COUNTER},
+         {"st", probe::COUNTER}, {"branch", probe::COUNTER}, {"taken", probe::COUNTER},
+         {"jump", probe::COUNTER}, {"amo", probe::COUNTER}, {"fpu_off", probe::COUNTER},
+         {"vec_issue", probe::COUNTER}, {"stall_mem", probe::COUNTER},
+         {"stall_fetch", probe::COUNTER}, {"stall_dep", probe::COUNTER},
+         {"stall_fpu", probe::COUNTER}, {"stall_vgrant", probe::COUNTER},
+         {"stall_vqfull", probe::COUNTER}, {"stall_barrier", probe::COUNTER},
+         {"wfi", probe::COUNTER}, {"stall_other", probe::COUNTER}, {"lsu_occ", probe::COUNTER}};
+}
+
+void IssWrapper::probe_sample(int64_t now, std::vector<uint64_t> &v)
+{
+    Timing &t = this->iss.timing;
+    // An open stall interval is charged up to `now` so a long park shows in the slices it spans;
+    // the close adds the full interval later, so the cumulative value stays monotonic.
+    uint64_t st[Timing::PROBE_STALL_NB];
+    for (int i = 0; i < Timing::PROBE_STALL_NB; i++) st[i] = t.probe_stall[i];
+    if (t.probe_stall_start >= 0 && now > t.probe_stall_start)
+        st[t.probe_stall_reason] += (uint64_t)(now - t.probe_stall_start);
+    v = {t.probe_invocations - t.probe_retries, t.probe_retries, t.probe_ld, t.probe_st,
+         t.probe_branch, t.probe_taken, t.probe_jump, t.probe_amo, t.probe_fpu_off,
+         t.probe_vec_issue, st[Timing::PROBE_STALL_MEM], st[Timing::PROBE_STALL_FETCH],
+         st[Timing::PROBE_STALL_DEP], st[Timing::PROBE_STALL_FPU], st[Timing::PROBE_STALL_VGRANT],
+         st[Timing::PROBE_STALL_VQFULL], st[Timing::PROBE_STALL_BARRIER], st[Timing::PROBE_STALL_WFI],
+         st[Timing::PROBE_STALL_OTHER], t.probe_lsu_occ.read(now)};
 }
 
 void IssWrapper::stop()
@@ -276,6 +314,8 @@ iss_reg_t IssWrapper::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_r
         iss->vu.shared_status_update(true);
         iss->exec.trace.msg(vp::Trace::LEVEL_TRACE,
             "Shared Spatz not granted to this hart (pc: 0x%lx)\n", pc);
+        iss->timing.probe_retries++;
+        iss->timing.probe_stall[Timing::PROBE_STALL_VGRANT]++;
         return pc;
     }
 
@@ -284,6 +324,8 @@ iss_reg_t IssWrapper::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_r
     {
         iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "%s queue is full (pc: 0x%lx)\n",
             iss->vu.queue_is_full() ? "Ara" : "Core", pc);
+        iss->timing.probe_retries++;
+        iss->timing.probe_stall[Timing::PROBE_STALL_VQFULL]++;
         return pc;
     }
 
@@ -310,6 +352,8 @@ iss_reg_t IssWrapper::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_r
                 {
                     iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "Blocked due to int reg dependency (pc: 0x%lx, reg: %d)\n",
                         pc, insn->in_regs[i]);
+                    iss->timing.probe_retries++;
+                    iss->timing.probe_stall[Timing::PROBE_STALL_DEP]++;
                     return pc;
                 }
             }
@@ -320,6 +364,8 @@ iss_reg_t IssWrapper::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_r
                 {
                     iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "Blocked due to float reg dependency (pc: 0x%lx, reg: %d)\n",
                         pc, insn->in_regs[i]);
+                    iss->timing.probe_retries++;
+                    iss->timing.probe_stall[Timing::PROBE_STALL_DEP]++;
                     return pc;
                 }
             }
@@ -346,6 +392,7 @@ iss_reg_t IssWrapper::vector_insn_stub_handler(Iss *iss, iss_insn_t *insn, iss_r
     // Allocate a slot in cva6 queue and offload the instruction
     PendingInsn &pending_insn = iss->top.pending_insn_enqueue(insn, pc);
 
+    iss->timing.probe_vec_issue++;
     iss->vu.insn_enqueue(&pending_insn);
 
     return iss_insn_next(iss, insn, pc);

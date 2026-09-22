@@ -113,6 +113,8 @@ PendingInsn *Ara::pending_insn_alloc(PendingInsn *cva6_pending_insn)
 {
     // The new instruction is marked as pending and also waiting for dependecy resolution
     this->nb_pending_insn.inc(1);
+    this->probe_vinsn++;
+    this->probe_q_occ.add(this->iss.top.clock.get_cycles(), 1);
     this->nb_waiting_insn.inc(1);
     if (this->nb_pending_insn.get() == this->queue_size)
     {
@@ -149,6 +151,7 @@ void Ara::insn_enqueue(PendingInsn *cva6_pending_insn)
         cva6_pending_insn->insn->decoder_item->u.insn.tags[ISA_TAG_VSTORE_ID])
     {
         this->nb_inflight_vlsu++;
+        this->probe_vlsu_occ.add(this->iss.top.clock.get_cycles(), 1);
     }
 #endif
     PendingInsn *pending_insn = this->pending_insn_alloc(cva6_pending_insn);
@@ -234,6 +237,7 @@ void Ara::insn_end(PendingInsn *pending_insn)
         insn->decoder_item->u.insn.tags[ISA_TAG_VSTORE_ID])
     {
         this->nb_inflight_vlsu--;
+        this->probe_vlsu_occ.add(this->iss.top.clock.get_cycles(), -1);
     }
 
     // acc_mux's lsu_busy_q clears on spatz_mem_finished, which is asserted when the op has fully
@@ -320,6 +324,7 @@ void Ara::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         if (pending_insn->done)
         {
             _this->nb_pending_insn.dec(1);
+            _this->probe_q_occ.add(_this->iss.top.clock.get_cycles(), -1);
             if (_this->nb_pending_insn.get() == 0)
             {
                 uint8_t zero = 0;
@@ -524,6 +529,28 @@ void Ara::isa_init()
     {
         block->isa_init();
     }
+}
+
+void Ara::probe_columns(std::vector<probe::Column> &c) const
+{
+    c = {{"vinsn", probe::COUNTER}, {"vlsu_ld", probe::COUNTER}, {"vlsu_st", probe::COUNTER},
+         {"vlsu_bursts", probe::COUNTER}, {"vfu_insn", probe::COUNTER}, {"vfu_busy", probe::COUNTER},
+         {"vslide_insn", probe::COUNTER}, {"vslide_busy", probe::COUNTER},
+         {"q_occ", probe::COUNTER}, {"vlsu_inflight_occ", probe::COUNTER}};
+}
+
+void Ara::probe_sample(int64_t now, std::vector<uint64_t> &v)
+{
+#if defined(CONFIG_GVSOC_ISS_USE_SPATZ)
+    AraVlsu *vlsu = static_cast<AraVlsu *>(this->blocks[Ara::vlsu_id]);
+    AraVcompute *vfpu = static_cast<AraVcompute *>(this->blocks[Ara::vfpu_id]);
+    AraVcompute *vslide = static_cast<AraVcompute *>(this->blocks[Ara::vslide_id]);
+    v = {this->probe_vinsn, vlsu->dbg_loads, vlsu->dbg_stores, vlsu->dbg_bursts,
+         vfpu->dbg_insns, vfpu->dbg_busy, vslide->dbg_insns, vslide->dbg_busy,
+         this->probe_q_occ.read(now), this->probe_vlsu_occ.read(now)};
+#else
+    v = {this->probe_vinsn, 0, 0, 0, 0, 0, 0, 0, this->probe_q_occ.read(now), 0};
+#endif
 }
 
 void Ara::dump_stats()

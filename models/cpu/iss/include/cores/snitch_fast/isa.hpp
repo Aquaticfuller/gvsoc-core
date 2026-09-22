@@ -83,6 +83,7 @@ static inline iss_reg_t flw_snitch_exec_fast(Iss *iss, iss_insn_t *insn, iss_reg
     #endif
     if (iss->fpu_lsu.load_float<uint32_t>(insn, base + SIM_GET(0), 4, REG_OUT(0)))
     {
+        iss->timing.probe_retries++;
         return pc;
     }
     return iss_insn_next(iss, insn, pc);
@@ -98,6 +99,7 @@ static inline iss_reg_t flw_snitch_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc
     iss->lsu.stack_access_check(REG_IN(0), base + SIM_GET(0));
     if (iss->fpu_lsu.load_float_perf<uint32_t>(insn, base + SIM_GET(0), 4, REG_OUT(0)))
     {
+        iss->timing.probe_retries++;
         return pc;
     }
     return iss_insn_next(iss, insn, pc);
@@ -117,6 +119,7 @@ static inline iss_reg_t fsw_snitch_exec_fast(Iss *iss, iss_insn_t *insn, iss_reg
     }
     if (iss->fpu_lsu.store_float<uint32_t>(insn, base + SIM_GET(0), 4, REG_IN(1)))
     {
+        iss->timing.probe_retries++;
         return pc;
     }
     return iss_insn_next(iss, insn, pc);
@@ -137,6 +140,7 @@ static inline iss_reg_t fsw_snitch_exec(Iss *iss, iss_insn_t *insn, iss_reg_t pc
     iss->lsu.stack_access_check(REG_OUT(0), base + SIM_GET(0));
     if (iss->fpu_lsu.store_float_perf<uint32_t>(insn, base + SIM_GET(0), 4, REG_IN(1)))
     {
+        iss->timing.probe_retries++;
         return pc;
     }
     return iss_insn_next(iss, insn, pc);

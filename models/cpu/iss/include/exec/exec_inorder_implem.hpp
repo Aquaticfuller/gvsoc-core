@@ -179,6 +179,7 @@ inline void Exec::stalled_inc()
     if (this->stalled.get() == 0)
     {
         this->instr_event.disable();
+        this->iss.timing.probe_stall_open(this->iss.top.clock.get_cycles());
     }
     this->stalled.inc(1);
 }
@@ -196,6 +197,7 @@ inline void Exec::stalled_dec()
     if (this->stalled.get() == 0)
     {
         this->instr_event.enable();
+        this->iss.timing.probe_stall_close(this->iss.top.clock.get_cycles());
     }
 }
 

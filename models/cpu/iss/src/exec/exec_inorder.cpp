@@ -202,6 +202,7 @@ void Exec::exec_instr(vp::Block *__this, vp::ClockEvent *event)
                 if (iss->regfile.scoreboard_reg_timestamp[insn->in_regs[i]] == -1)
                 {
                     iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "Stalling due to input register dependency (reg: %d)\n", insn->in_regs[i]);
+                    iss->timing.probe_stall[Timing::PROBE_STALL_DEP]++;
                     return;
                 }
             }
@@ -214,6 +215,7 @@ void Exec::exec_instr(vp::Block *__this, vp::ClockEvent *event)
                 if (iss->regfile.scoreboard_reg_timestamp[insn->out_regs[i]] == -1)
                 {
                     iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "Stalling due to output register dependency (reg: %d)\n", insn->out_regs[i]);
+                    iss->timing.probe_stall[Timing::PROBE_STALL_DEP]++;
                     return;
                 }
             }
@@ -228,6 +230,11 @@ void Exec::exec_instr(vp::Block *__this, vp::ClockEvent *event)
         iss->exec.current_insn = insn->fast_handler(iss, insn, pc);
 
         iss->exec.asm_trace_event.event_string(insn->desc->label, false);
+
+        // perf-probe: the fast handler deliberately skips insn_account() (that is what makes it
+        // fast), so the retire count has to be taken here too, or it only ever sees the handful
+        // of instructions that happened to go through the checked handler.
+        iss->timing.probe_invocations++;
 
         // Since power instruction information is filled when the instruction is decoded,
         // make sure we account it only after the instruction is executed
@@ -367,6 +374,7 @@ void Exec::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
                 if (iss->regfile.scoreboard_reg_timestamp[insn->in_regs[i]] == -1)
                 {
                     _this->trace.msg(vp::Trace::LEVEL_TRACE, "Stalling due to register dependency (reg: %d)\n", insn->in_regs[i]);
+                    iss->timing.probe_stall[Timing::PROBE_STALL_DEP]++;
                     return;
                 }
             }
@@ -379,6 +387,7 @@ void Exec::exec_instr_check_all(vp::Block *__this, vp::ClockEvent *event)
                 if (iss->regfile.scoreboard_reg_timestamp[insn->out_regs[i]] == -1)
                 {
                     iss->exec.trace.msg(vp::Trace::LEVEL_TRACE, "Stalling due to output register dependency (reg: %d)\n", insn->out_regs[i]);
+                    iss->timing.probe_stall[Timing::PROBE_STALL_DEP]++;
                     return;
                 }
             }
@@ -430,6 +439,7 @@ void Exec::fetchen_sync(vp::Block *__this, bool active)
     else if (old_val && !active)
     {
         // In case of a falling edge, stall the core to prevent him from executing
+        _this->iss.timing.probe_stall_reason = Timing::PROBE_STALL_OTHER;
         _this->stalled_inc();
         _this->busy_exit();
     }
