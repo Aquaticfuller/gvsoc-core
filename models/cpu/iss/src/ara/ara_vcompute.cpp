@@ -80,6 +80,17 @@ void AraVcompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                     // watched the wrong register and never finished -- the vector unit then
                     // hung with its queue full (RLC AM planner, vslidedown + vmv.x.s).
                     const int in_reg = insn->in_regs[insn->decoder_item->u.insn.args[insn->nb_out_reg + i].u.reg.id];
+                    // Writers of in_reg other than this instruction. An instruction that reads and
+                    // writes the same register (e.g. vadd v6, v6, x) keeps bumping its committed
+                    // count itself once the producer it chained on has ended, so waiting for the
+                    // count to reach 0 would never finish (RLC AM planner, 8 grants per TTI).
+                    int self_writes = 0;
+                    for (int j = 0; j < insn->nb_out_reg; j++)
+                    {
+                        if ((insn->decoder_item->u.insn.args[j].u.reg.flags & ISS_DECODER_ARG_FLAG_VREG) != 0 &&
+                            insn->out_regs[j] == in_reg) self_writes++;
+                    }
+                    if (_this->ara.scoreboard_out_use[in_reg] <= self_writes) continue;
                     if (_this->ara.scoreboard_committed[in_reg] != 0)
                     {
                         done = false;
