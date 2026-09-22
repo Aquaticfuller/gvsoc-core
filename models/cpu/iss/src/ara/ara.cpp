@@ -304,6 +304,10 @@ void Ara::insn_end(PendingInsn *pending_insn)
 
 void Ara::insn_commit(int reg, int size)
 {
+    // Elements committed after their writer has ended (a late notification) must not count: the
+    // writer's insn_end() reset the count to 0, and a stale non-zero count makes any later
+    // instruction that chains on this register wait for a producer that no longer exists.
+    if (this->scoreboard_out_use[reg] == 0) return;
     // If it is the first time an element is committed, we may need to start an instruction.
     if (this->scoreboard_committed[reg] == 0)
     {
@@ -363,7 +367,11 @@ void Ara::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                     int in_reg = insn->in_regs[insn->decoder_item->u.insn.args[insn->nb_out_reg + i].u.reg.id];
                     // The instruction can be chained if the register has already elements and is
                     // not already chained with another instructions
-                    if (_this->scoreboard_committed[in_reg] != 0 && !_this->scoreboard_chained[in_reg])
+                    // Only chain on a register some in-flight instruction is still writing.
+                    // Chaining on one with no writer waits for a producer that will never
+                    // finish (seen with vmv.x.s, whose fixed vs1=00000 decodes as a read of v0).
+                    if (_this->scoreboard_committed[in_reg] != 0 && !_this->scoreboard_chained[in_reg] &&
+                        _this->scoreboard_out_use[in_reg] > 0)
                     {
                         pending_insn->chained = true;
                         _this->scoreboard_chained[in_reg] = pending_insn;
@@ -531,12 +539,51 @@ void Ara::isa_init()
     }
 }
 
+// Why the head waiting instruction cannot start, replaying fsm_handler()'s checks without side
+// effects: 0 = nothing waiting or free to start; (1<<8)|r input vreg r not yet valid; (2<<8)|r output
+// vreg r still being written; (3<<8)|r output vreg r still being read; 4 = vsetvli-like waiting for
+// older instructions to drain; 5 = target block full; 6 = timestamp in the future.
+uint64_t Ara::dbg_head_stall(int64_t now)
+{
+    if (this->nb_waiting_insn.get() == 0) return 0;
+    PendingInsn *p = &this->pending_insns[this->insn_first_waiting];
+    if (p->timestamp > now) return 6;
+    iss_insn_t *insn = p->insn;
+    for (int i = 0; i < insn->nb_in_reg; i++)
+    {
+        if ((insn->decoder_item->u.insn.args[insn->nb_out_reg + i].u.reg.flags & ISS_DECODER_ARG_FLAG_VREG) == 0) continue;
+        int r = insn->in_regs[insn->decoder_item->u.insn.args[insn->nb_out_reg + i].u.reg.id];
+        if (this->scoreboard_chained[r] != p && this->scoreboard_valid_ts[r] > now) return (1 << 8) | r;
+    }
+    for (int i = 0; i < insn->nb_out_reg; i++)
+    {
+        if ((insn->decoder_item->u.insn.args[i].u.reg.flags & ISS_DECODER_ARG_FLAG_VREG) == 0) continue;
+        int r = insn->out_regs[i];
+        if (this->scoreboard_chained[r] != p && this->scoreboard_valid_ts[r] > now) return (2 << 8) | r;
+    }
+    for (int i = 0; i < insn->nb_out_reg; i++)
+    {
+        if ((insn->decoder_item->u.insn.args[i].u.reg.flags & ISS_DECODER_ARG_FLAG_VREG) == 0) continue;
+        if (this->scoreboard_in_use[insn->out_regs[i]]) return (3 << 8) | insn->out_regs[i];
+    }
+    const int block_id = insn->decoder_item->u.insn.block_id;
+    if (block_id == -1) return this->nb_pending_insn.get() == this->nb_waiting_insn.get() ? 0 : 4;
+    return this->blocks[block_id]->is_full() ? 5 : 0;
+}
+
 void Ara::probe_columns(std::vector<probe::Column> &c) const
 {
     c = {{"vinsn", probe::COUNTER}, {"vlsu_ld", probe::COUNTER}, {"vlsu_st", probe::COUNTER},
          {"vlsu_bursts", probe::COUNTER}, {"vfu_insn", probe::COUNTER}, {"vfu_busy", probe::COUNTER},
          {"vslide_insn", probe::COUNTER}, {"vslide_busy", probe::COUNTER},
-         {"q_occ", probe::COUNTER}, {"vlsu_inflight_occ", probe::COUNTER}};
+         {"q_occ", probe::COUNTER}, {"vlsu_inflight_occ", probe::COUNTER},
+         // Deadlock forensics, all point-in-time: queued / waiting instructions, the PCs at the
+         // head of each, the vector FU and slide unit queue depths, and why the head waiting
+         // instruction cannot start (see dbg_head_stall()).
+         {"nb_pending", probe::GAUGE}, {"nb_waiting", probe::GAUGE}, {"head_pc", probe::GAUGE},
+         {"wait_pc", probe::GAUGE}, {"vfu_q", probe::GAUGE}, {"vslide_q", probe::GAUGE},
+         {"wait_why", probe::GAUGE}, {"vfu_pc", probe::GAUGE}, {"vfu_chain", probe::GAUGE},
+         {"vslide_pc", probe::GAUGE}, {"vslide_chain", probe::GAUGE}};
 }
 
 void Ara::probe_sample(int64_t now, std::vector<uint64_t> &v)
@@ -545,11 +592,16 @@ void Ara::probe_sample(int64_t now, std::vector<uint64_t> &v)
     AraVlsu *vlsu = static_cast<AraVlsu *>(this->blocks[Ara::vlsu_id]);
     AraVcompute *vfpu = static_cast<AraVcompute *>(this->blocks[Ara::vfpu_id]);
     AraVcompute *vslide = static_cast<AraVcompute *>(this->blocks[Ara::vslide_id]);
+    const uint64_t np = this->nb_pending_insn.get(), nw = this->nb_waiting_insn.get();
     v = {this->probe_vinsn, vlsu->dbg_loads, vlsu->dbg_stores, vlsu->dbg_bursts,
          vfpu->dbg_insns, vfpu->dbg_busy, vslide->dbg_insns, vslide->dbg_busy,
-         this->probe_q_occ.read(now), this->probe_vlsu_occ.read(now)};
+         this->probe_q_occ.read(now), this->probe_vlsu_occ.read(now),
+         np, nw, np ? (uint64_t)this->pending_insns[this->insn_first].pc : 0,
+         nw ? (uint64_t)this->pending_insns[this->insn_first_waiting].pc : 0,
+         vfpu->dbg_queued(), vslide->dbg_queued(), this->dbg_head_stall(now),
+         vfpu->dbg_cur_pc(), vfpu->dbg_cur_chain(), vslide->dbg_cur_pc(), vslide->dbg_cur_chain()};
 #else
-    v = {this->probe_vinsn, 0, 0, 0, 0, 0, 0, 0, this->probe_q_occ.read(now), 0};
+    v = {this->probe_vinsn, 0, 0, 0, 0, 0, 0, 0, this->probe_q_occ.read(now), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 #endif
 }
 

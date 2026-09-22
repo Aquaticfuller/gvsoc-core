@@ -74,7 +74,13 @@ void AraVcompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             {
                 if ((insn->decoder_item->u.insn.args[insn->nb_out_reg + i].u.reg.flags & ISS_DECODER_ARG_FLAG_VREG) != 0)
                 {
-                    if (_this->ara.scoreboard_committed[insn->in_regs[i]] != 0)
+                    // Same indexing rule as Ara::fsm_handler(): the register lives at
+                    // in_regs[arg.id]. in_regs[i] is a gap slot for formats whose lower input
+                    // is fixed or immediate (vmv.x.s: vs1 = 00000), so a chained instruction
+                    // watched the wrong register and never finished -- the vector unit then
+                    // hung with its queue full (RLC AM planner, vslidedown + vmv.x.s).
+                    const int in_reg = insn->in_regs[insn->decoder_item->u.insn.args[insn->nb_out_reg + i].u.reg.id];
+                    if (_this->ara.scoreboard_committed[in_reg] != 0)
                     {
                         done = false;
                         break;
@@ -147,4 +153,19 @@ void AraVcompute::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         _this->event_active.event(&zero);
         _this->fsm_event.disable();
     }
+}
+
+uint64_t AraVcompute::dbg_cur_chain() const
+{
+    if (!this->pending_insn) return 0;
+    iss_insn_t *insn = this->pending_insn->insn;
+    uint64_t v = this->pending_insn->chained ? 1 : 0;
+    for (int i = 0; i < insn->nb_in_reg; i++)
+    {
+        if ((insn->decoder_item->u.insn.args[insn->nb_out_reg + i].u.reg.flags & ISS_DECODER_ARG_FLAG_VREG) == 0) continue;
+        const int r = insn->in_regs[insn->decoder_item->u.insn.args[insn->nb_out_reg + i].u.reg.id];
+        if (this->ara.scoreboard_committed[r] != 0)
+            return v | ((uint64_t)r << 8) | ((uint64_t)(this->ara.scoreboard_committed[r] & 0xffff) << 16);
+    }
+    return v | ((uint64_t)0xff << 8);
 }

@@ -73,7 +73,7 @@ private:
     // The block process them in-order
     std::queue<PendingInsn *> insns;
     // Current instruction being processed
-    PendingInsn *pending_insn;
+    PendingInsn *pending_insn = NULL;
     // When the instruction is chained, this indicates the minimum cyclestamp where the instruction
     // can finished, based on operation duration.
     int64_t end_cyclestamp;
@@ -84,6 +84,11 @@ private:
 public:
     // Issue-side diagnostics: instruction count + summed busy cycles, dumped at sim stop.
     uint64_t dbg_insns = 0, dbg_busy = 0;
+    size_t dbg_queued() const { return this->insns.size(); }
+    // Current instruction's pc, 0 if idle; and (chained | first input vreg with committed != 0 << 8
+    // | that committed count << 16) for deadlock forensics.
+    uint64_t dbg_cur_pc() const { return this->pending_insn ? this->pending_insn->pc : 0; }
+    uint64_t dbg_cur_chain() const;
 private:
 };
 
@@ -323,6 +328,8 @@ public:
     const char *probe_kind() const override { return "spatz"; }
     void probe_columns(std::vector<probe::Column> &c) const override;
     void probe_sample(int64_t now, std::vector<uint64_t> &v) override;
+    uint64_t dbg_head_stall(int64_t now);
+    friend class AraVcompute;
     uint64_t probe_vinsn = 0;             // instructions accepted into the queue
     probe::Occupancy probe_q_occ;         // Σ(pending instructions · cycles)
     probe::Occupancy probe_vlsu_occ;      // Σ(vector loads/stores in flight · cycles)
