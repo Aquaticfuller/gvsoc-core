@@ -150,7 +150,6 @@ failure is silent by construction, so look for the `[EOC]` line, not for plausib
 | `CACHEPOOL_V3_CELL_COALESCER` | 0 | per-cell part-coalescer (see limitations) |
 | `CACHEPOOL_V3_DRAMSYS` | 0 | 1 = one DRAMSys DRAM per memory channel of the refill mesh, instead of a flat backing store |
 | `CACHEPOOL_V3_DRAM_TYPE` | `hbm2-example.json` | DRAM config, from `core/models/memory/dramsys_configs/` |
-| `SPATZ_VLSU_LINE_SPLIT` | 0 | 1 = stop a unit-stride vector access being coalesced across a cache line (see limitations) |
 | `SPATZ_LOCK_NO_LSU_GATE` | 0 | 1 = disable the Free-mode load/store gate, for A/B |
 | `CACHEPOOL_BARRIER_COUNTING` | 0 | 1 = restore the old global counting barrier, for A/B |
 
@@ -692,12 +691,11 @@ the evidence the error is localised rather than global.
    and the reason throughput-bound kernels are slow. The other half of it — every mesh channel
    sharing one flat backing store — is addressed by `CACHEPOOL_V3_DRAMSYS=1` (§2), which gives
    each channel its own DRAM; whether real DRAM timing closes the gap has not yet been measured.
-2. **Cross-line truncation** — a vector access that straddles a cache line has its tail bytes
-   dropped, silently, with `IO_REQ_OK` still returned. The straddle is generated inside the
-   model, not requested by software: unit-stride vector accesses are sized at the lane width
-   regardless of element size. `SPATZ_VLSU_LINE_SPLIT=1` prevents it and costs nothing on the
-   calibration anchor, but is **default off** pending review, so the default build still
-   truncates. Any run that reports `XLINE` events has lost data.
+2. **Cross-line truncation (fixed at the source)** — the cache core still drops the tail of a
+   request that straddles a cache line. The only producer of such requests was the model's own
+   VLSU, which sized unit-stride accesses at the lane width regardless of element size; it now
+   clamps every request at the line boundary, as the hardware does. Any `XLINE` event in a
+   run therefore means a new source of straddling requests, and that run has lost data.
 3. **Cross-core shared-data visibility** — cross-core write/barrier/read patterns show
    mismatches that scale with core count. Root cause open. Per-core-private data is unaffected.
 4. **Cell coalescer** — `CACHEPOOL_V3_CELL_COALESCER=1` crashes in the multi-tile response

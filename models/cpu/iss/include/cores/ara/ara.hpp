@@ -78,7 +78,7 @@ private:
     // can finished, based on operation duration.
     int64_t end_cyclestamp;
     int width;
-    // Cache-line size in bytes, used only by the SPATZ_VLSU_LINE_SPLIT guard to stop a unit-stride
+    // Cache-line size in bytes, used only by the line-crossing clamp to stop a unit-stride
     // access from being coalesced across a line boundary. 0 disables the clamp.
     int line_bytes = 0;
 public:
@@ -196,7 +196,7 @@ private:
     int pending_elem;
     int inst_elem_size;
     int width;
-    // Cache-line size in bytes, used only by the SPATZ_VLSU_LINE_SPLIT guard to stop a unit-stride
+    // Cache-line size in bytes, used only by the line-crossing clamp to stop a unit-stride
     // access from being coalesced across a line boundary. 0 disables the clamp.
     int line_bytes = 0;
 public:

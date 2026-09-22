@@ -62,8 +62,8 @@ fsm_event(this, &AraVlsu::fsm_handler)
     }
 
     this->width = top.get_js_config()->get_child_int("vu/lsu_width");
-    // Optional, used only by the SPATZ_VLSU_LINE_SPLIT guard below; absent on targets that do not
-    // set it, in which case the clamp stays disabled.
+    // Optional, used only by the line-crossing clamp below; absent on targets that do not set it,
+    // in which case the clamp stays disabled.
     js::Config *lb = top.get_js_config()->get("vu/line_bytes");
     this->line_bytes = lb != NULL ? lb->get_int() : 0;
 
@@ -326,7 +326,7 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                 {
                     size = std::min((iss_addr_t)_this->width, _this->pending_size);
 
-                    // SPATZ_VLSU_LINE_SPLIT=1: never emit a request that crosses a cache line.
+                    // Never emit a request that crosses a cache line.
                     //
                     // A unit-stride access is coalesced to the lane width REGARDLESS of element
                     // size, so a byte-element vse8.v/vle8.v on a base that is not lane-aligned
@@ -344,11 +344,11 @@ void AraVlsu::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
                     // Clamping to the line remainder only changes requests that would otherwise be
                     // corrupted, so the blast radius is exactly the buggy cases -- unlike splitting
                     // straddling accesses inside the cache core, which touches the calibrated FSM.
-                    // Default OFF so no calibrated number moves until this is measured and reviewed.
-                    static const bool line_split = [](){
-                        const char *e = getenv("SPATZ_VLSU_LINE_SPLIT");
-                        return e && e[0] != '0'; }();
-                    if (line_split && _this->line_bytes > 0)
+                    // The hardware never issues a line-crossing access, so there is no mode in which
+                    // the unclamped path is right; it used to sit behind SPATZ_VLSU_LINE_SPLIT
+                    // (default off) and made correct AM kernels fail their transport-block check.
+                    // Only targets that set vu/line_bytes (cachepool_v3) are affected.
+                    if (_this->line_bytes > 0)
                     {
                         const uint64_t line_rem = _this->line_bytes -
                             (_this->pending_addr & (_this->line_bytes - 1));
