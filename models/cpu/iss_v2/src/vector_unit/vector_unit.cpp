@@ -130,6 +130,7 @@ PendingInsn *Vu::pending_insn_alloc(InsnEntry *entry)
     PendingInsn *pending_insn = &this->pending_insns[insn_id];
 
     pending_insn->valid = true;
+    pending_insn->mem_requests_issued = false;
     pending_insn->entry = entry;
     pending_insn->nb_bytes_done = 0;
 
@@ -147,6 +148,18 @@ PendingInsn *Vu::pending_insn_alloc(InsnEntry *entry)
         (strncmp(label, "vred", 4) == 0 || strncmp(label, "vfred", 5) == 0);
 
     return pending_insn;
+}
+
+bool Vu::mem_requests_pending()
+{
+    for (PendingInsn &pending : this->pending_insns)
+    {
+        if (!pending.valid || pending.done || pending.mem_requests_issued) continue;
+        iss_insn_t *insn = this->iss.exec.get_insn(pending.entry);
+        if (insn->decoder_item->u.insn.tags[ISA_TAG_VLOAD_ID] ||
+            insn->decoder_item->u.insn.tags[ISA_TAG_VSTORE_ID]) return true;
+    }
+    return false;
 }
 
 void Vu::insn_enqueue(InsnEntry *entry)

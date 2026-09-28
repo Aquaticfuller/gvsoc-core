@@ -44,6 +44,8 @@ public:
     bool valid;
     bool done;
     int id;
+    // Request-sent fences release before responses retire the memory operation.
+    bool mem_requests_issued;
     bool in_can_be_chained;
     bool out_can_be_chained;
     int nb_bytes_done;
@@ -875,6 +877,7 @@ public:
     // Return true when queue if full and vu can not accept new instructions
     bool queue_is_full() { return this->queue_full.get(); }
     bool queue_is_empty() { return this->nb_pending_insn == 0; }
+    bool mem_requests_pending();
     // Return the CVA6 register value associated to the instruction being executed
     inline uint64_t current_insn_reg_get() { return current_insn_reg; }
     inline uint64_t current_insn_reg_2_get() { return current_insn_reg_2; }

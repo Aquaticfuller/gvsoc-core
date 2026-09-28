@@ -521,6 +521,7 @@ void VuLsu::burst_issued(vp::IoReq *req, int port)
         pending_insn->timestamp = pending_insn->timestamp + 1;
 
         // Mark the instruction done once all bursts have been issued.
+        pending_insn->mem_requests_issued = true;
         slot->done = true;
     }
 }
