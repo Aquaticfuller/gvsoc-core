@@ -23,6 +23,10 @@
 #include <vp/itf/io.hpp>
 #include <stdio.h>
 #include <math.h>
+#include <algorithm>
+#include <deque>
+#include <unordered_map>
+#include <vector>
 
 class interleaver : public vp::Component
 {
@@ -39,6 +43,29 @@ public:
   static void response(vp::Block *__this, vp::IoReq *req);
 
 private:
+  // A downstream target may retain a request until its grant/response.
+  // Each transfer owns a distinct child request, reused only after a
+  // stripe completes, and keeps loader zero-fill data alive.
+  struct Transfer
+  {
+    vp::IoReq *parent;
+    vp::IoReq child;
+    uint64_t addr;
+    uint64_t size;
+    uint64_t done = 0;
+    uint64_t chunk_size = 0;
+    uint8_t *data;
+    std::vector<uint8_t> write_data;
+  };
+
+  static void async_handler(vp::Block *__this, vp::ClockEvent *event);
+  void async_enqueue(Transfer *transfer);
+  void async_complete(Transfer *transfer);
+  bool asynchronous;
+  vp::ClockEvent *async_event;
+  std::deque<Transfer *> ready;
+  std::unordered_map<vp::IoReq *, Transfer *> transfers;
+
   vp::Trace     trace;
 
   vp::IoMaster **out;
@@ -70,6 +97,8 @@ interleaver::interleaver(vp::ComponentConf &config)
   remove_offset = get_js_config()->get_child_int("remove_offset");
   enable_shift = get_js_config()->get_child_int("enable_shift");
   offset_translation = get_js_config()->get_child_bool("offset_translation");
+  asynchronous = get_js_config()->get_child_bool("asynchronous");
+  async_event = asynchronous ? event_new(interleaver::async_handler) : nullptr;
 
   if (stage_bits == 0)
   {
@@ -106,6 +135,23 @@ vp::IoReqStatus interleaver::req(vp::Block *__this, vp::IoReq *req)
   uint64_t size = req->get_size();
   uint8_t *data = req->get_data();
   int64_t latency = req->get_latency();
+
+  if (_this->asynchronous)
+  {
+    auto *transfer = new Transfer();
+    transfer->parent = req;
+    transfer->addr = offset - _this->remove_offset;
+    transfer->size = size;
+    transfer->data = data;
+    if (is_write && data)
+    {
+      transfer->write_data.assign(data, data + size);
+      transfer->data = transfer->write_data.data();
+    }
+    _this->transfers.emplace(&transfer->child, transfer);
+    _this->async_enqueue(transfer);
+    return vp::IO_REQ_PENDING;
+  }
 
   uint8_t *init_data = data;
   uint64_t init_size = size;
@@ -199,11 +245,70 @@ vp::IoReqStatus interleaver::req(vp::Block *__this, vp::IoReq *req)
 
 void interleaver::grant(vp::Block *__this, vp::IoReq *req)
 {
-
+  // Asynchronous targets retain DENIED requests and later respond to
+  // them. Do not reissue on grant or notify the PENDING upstream parent.
 }
 
 void interleaver::response(vp::Block *__this, vp::IoReq *req)
 {
+  interleaver *_this = (interleaver *)__this;
+  if (_this->asynchronous)
+  {
+    auto *transfer = _this->transfers.at(req);
+    transfer->done += transfer->chunk_size;
+    _this->async_enqueue(transfer);
+  }
+}
+
+void interleaver::async_enqueue(Transfer *transfer)
+{
+  ready.push_back(transfer);
+  if (!async_event->is_enqueued()) event_enqueue(async_event, 1);
+}
+
+void interleaver::async_complete(Transfer *transfer)
+{
+  vp::IoReq *parent = transfer->parent;
+  transfers.erase(&transfer->child);
+  delete transfer;
+  parent->get_resp_port()->resp(parent);
+}
+
+void interleaver::async_handler(vp::Block *__this, vp::ClockEvent *event)
+{
+  interleaver *_this = (interleaver *)__this;
+  // Work on independent transfers in parallel; a denied channel retains
+  // only its own child, so other channels can continue accepting traffic.
+  size_t count = _this->ready.size();
+  while (count--)
+  {
+    auto *transfer = _this->ready.front();
+    _this->ready.pop_front();
+    while (transfer->done < transfer->size)
+    {
+      uint64_t addr = transfer->addr + transfer->done;
+      uint64_t stripe = 1ULL << _this->interleaving_bits;
+      int output_id = (addr >> _this->interleaving_bits) & ((1 << _this->stage_bits) - 1);
+      uint64_t offset = addr;
+      if (_this->offset_translation)
+        offset = ((addr & _this->offset_mask) >> _this->stage_bits) + (addr & (stripe - 1));
+      else if (_this->enable_shift)
+        offset = ((addr >> _this->enable_shift) & (-1ULL << _this->interleaving_bits)) | (addr & (stripe - 1));
+
+      transfer->chunk_size = std::min(stripe - (addr & (stripe - 1)), transfer->size - transfer->done);
+      transfer->child.init();
+      transfer->child.set_addr(offset);
+      transfer->child.set_size(transfer->chunk_size);
+      transfer->child.set_data(transfer->data ? transfer->data + transfer->done : nullptr);
+      transfer->child.set_is_write(transfer->parent->get_is_write());
+      vp::IoReqStatus status = _this->out[output_id]->req(&transfer->child);
+      if (status == vp::IO_REQ_PENDING || status == vp::IO_REQ_DENIED) break;
+      if (status != vp::IO_REQ_OK)
+        _this->trace.fatal("Invalid asynchronous interleaver access at 0x%llx\n", addr);
+      transfer->done += transfer->chunk_size;
+    }
+    if (transfer->done == transfer->size) _this->async_complete(transfer);
+  }
 }
 
 extern "C" vp::Component *gv_new(vp::ComponentConf &config)

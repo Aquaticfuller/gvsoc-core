@@ -50,6 +50,7 @@ public:
     void reset(bool active);
 
     void paraSendRequest(vp::IoReq *req);
+    void sync_to_sc();
 
     static vp::IoReqStatus req(vp::Block *__this, vp::IoReq *req);
 
@@ -299,8 +300,17 @@ vp::IoReqStatus ddr::handlePimToggle(vp::Block *__this, vp::IoReq *req)
     return vp::IO_REQ_OK;
 }
 
+void ddr::sync_to_sc()
+{
+    // SystemC callbacks can run after GVSoC's last engine step. Advance
+    // both clocks before a response or grant schedules a GVSoC event.
+    this->time.get_engine()->update((int64_t)sc_core::sc_time_stamp().to_double());
+    this->clock.get_engine()->sync();
+}
+
 void ddr::rspCallback(void *__this, int is_write){
     ddr *_this = (ddr *)__this;
+    _this->sync_to_sc();
     int rep_byte_int, mask;
     _this->trace.msg("---- Response Callback Triggered \n");
 
@@ -338,8 +348,8 @@ void ddr::rspCallback(void *__this, int is_write){
             if (_this->pending_read_req_queue.front().second.size() == 0)
             {
                 _this->trace.msg("---- Response read \n");
-                req->get_resp_port()->resp(req);
                 _this->pending_read_req_queue.pop_front();
+                req->get_resp_port()->resp(req);
             }
         }
     }
@@ -347,14 +357,15 @@ void ddr::rspCallback(void *__this, int is_write){
 
 void ddr::reqCallback(void *__this){
     ddr *_this = (ddr *)__this;
+    _this->sync_to_sc();
 
     while(_this->dram_can_accept_req(_this->dram_id) && _this->denied_req_queue.size() != 0)
     {
         vp::IoReq *req = _this->denied_req_queue.front();
+        _this->denied_req_queue.pop();
         _this->paraSendRequest(req);
         req->get_resp_port()->grant(req);
         if (req->get_is_write()) req->get_resp_port()->resp(req);
-        _this->denied_req_queue.pop();
     }
 }
 

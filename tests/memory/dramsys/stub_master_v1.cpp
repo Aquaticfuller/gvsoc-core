@@ -45,6 +45,7 @@ private:
         std::string name;
         vp::IoReq *req = nullptr;
         uint8_t  *data = nullptr;
+        std::vector<uint8_t> expected;
         bool     resolved = false;
         // If true, this entry is NOT fired by the cycle-timer; instead it
         // is issued from mark_resolved() when the immediately preceding
@@ -137,6 +138,9 @@ StubMasterV1::StubMasterV1(vp::ComponentConf &config)
             {
                 e->data[i] = (hexv(data_hex[i*2]) << 4) | hexv(data_hex[i*2+1]);
             }
+            std::string expected_hex = item->get_child_str("expected_hex");
+            for (size_t i = 0; i + 1 < expected_hex.size(); i += 2)
+                e->expected.push_back((hexv(expected_hex[i]) << 4) | hexv(expected_hex[i+1]));
 
             e->chain_to_prev = item->get_child_bool("chain_to_prev");
             e->idx = this->schedule.size();
@@ -176,9 +180,17 @@ void StubMasterV1::log_done(const char *tag, ScheduleEntry *e)
     // validated end-to-end without printing the whole buffer.
     uint8_t cksum = 0;
     for (uint64_t i = 0; i < e->size; i++) cksum ^= e->data[i];
-    printf("[%ld] %s %s name=%s latency=%lu data=%s checksum=%02x\n",
+    printf("[%ld] %s %s name=%s latency=%lu data=%s checksum=%02x",
         now, this->logname.c_str(), tag, e->name.c_str(),
         (unsigned long)e->req->get_latency(), hex, cksum);
+    if (!e->expected.empty())
+    {
+        uint64_t mismatches = e->expected.size() == e->size ? 0 : 1;
+        for (uint64_t i = 0; i < e->size && i < e->expected.size(); i++)
+            mismatches += e->data[i] != e->expected[i];
+        printf(" mismatches=%lu", (unsigned long)mismatches);
+    }
+    printf("\n");
 }
 
 void StubMasterV1::mark_resolved(ScheduleEntry *e)

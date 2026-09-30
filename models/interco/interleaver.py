@@ -37,10 +37,15 @@ class Interleaver(st.Component):
     remove_offset: int, optional
         Specify an offset to be removed to the incoming access address when it is
         dispatched (default: 0).
+    asynchronous: bool, optional
+        Use owned requests to split read/write transfers to asynchronous targets
+        such as DRAMSys. Always return PENDING upstream; a downstream DENIED
+        request must be retained by the target until grant and response.
+        The default synchronous path is unchanged.
 
     """
 
-    def __init__(self, parent, name, nb_slaves: int, interleaving_bits: int, nb_masters: int=0, stage_bits: int=0, remove_offset: int=0, enable_shift: int=0, offset_translation: bool=True):
+    def __init__(self, parent, name, nb_slaves: int, interleaving_bits: int, nb_masters: int=0, stage_bits: int=0, remove_offset: int=0, enable_shift: int=0, offset_translation: bool=True, asynchronous: bool=False):
 
         super(Interleaver, self).__init__(parent, name)
 
@@ -53,5 +58,6 @@ class Interleaver(st.Component):
             'stage_bits': stage_bits,
             'remove_offset': remove_offset,
             'enable_shift': enable_shift,
-            'offset_translation': offset_translation
+            'offset_translation': offset_translation,
+            'asynchronous': asynchronous,
         })

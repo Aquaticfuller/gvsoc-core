@@ -161,21 +161,35 @@ which is what the RTL testbench has. The two DRAM windows are contiguous, so the
 address space striped across the channels; a refill routed to mesh channel *n* lands in DRAM
 *n*, because the mesh and the interleaver select on the same address bits.
 
-It needs SystemC preloaded and the SystemC-enabled launcher — `dramsys.so` does not link
-SystemC itself, so without the preload the `sc_api_version` symbol is unresolved:
+At 4x4 groups there are eight DRAMSys channels, selected by address bits `[12:10]`
+(1 KiB stripes). The asynchronous interleaver owns downstream requests and preserves
+write buffers while DRAMSys retains denied transfers. This fixes the loader stall
+and partial/corrupt multi-stripe transfers (2026-09-30).
+
+It needs the SystemC environment and launcher. Build with DRAMSys enabled so CMake
+includes the interleaver and DRAM model; the plain launcher cannot resolve the
+SystemC symbols:
 
 ```bash
 # once
 make dramsys_preparation
 
-# then: generate the config, and run it under the SystemC launcher
-CACHEPOOL_V3_DRAMSYS=1 gvsoc --target=cachepool_v3 --binary <elf> image flash run   # writes gvsoc_config.json
-LD_PRELOAD="$PWD/third_party/systemc_install/lib64/libsystemc.so.3.0.1 \
-  $PWD/add_dramsyslib_patches/build_dynlib_from_github_dramsys5/DRAMSys/build/lib/libDRAMSys_Simulator.so" \
-  install/bin/gvsoc_launcher_sc --config=gvsoc_config.json
+# build the desired topology with SystemC enabled
+source sourceme_systemc.sh
+export CACHEPOOL_V3_DRAMSYS=1
+export CACHEPOOL_V3_NB_X_GROUPS=4 CACHEPOOL_V3_NB_Y_GROUPS=4
+make build TARGETS=cachepool_v3   # use the host's toolchain/header setup
+
+# in a fresh run directory, using the binary's peripheral register map
+CACHEPOOL_V3_PERIPH_MAP=rlc_next \
+  gvsoc --target=cachepool_v3 --binary <elf> prepare
+gvsoc_launcher_sc --config=gvsoc_config.json
 ```
 
-Expect **10-100× the wall-clock** of the flat store. Use small kernels.
+The repository-root `cachepool.mk` automates launcher/library selection. DRAMSys
+can be much slower in wall-clock; start with a small kernel. Posted write responses
+mean accepted into the DRAM queue, not physical write completion. Flat-mode timing
+calibration does not carry over to this backend.
 
 ### Diagnostics
 

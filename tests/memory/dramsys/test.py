@@ -1,6 +1,7 @@
 """Stand-alone testbench for the memory.dramsys wrapper.
 
-Hooks a stub io v1 master directly to memory.dramsys.i_INPUT (no SoC, no CPU).
+Hooks a stub master to memory.dramsys.i_INPUT (no SoC, no CPU), directly
+or through a two-channel asynchronous interleaver for striped transfers.
 Each test case is selected via the ``case`` TargetParameter, which picks a
 build_case dict with a schedule of io requests to fire.
 """
@@ -12,6 +13,7 @@ import gvsoc.runner
 import vp.clock_domain
 import memory.dramsys
 import interco.router_v2
+import interco.interleaver
 from gvrun.parameter import TargetParameter
 
 from stub_master_v1 import StubMasterV1
@@ -19,6 +21,28 @@ from stub_master_v2 import StubMasterV2
 
 
 def build_case(case_name: str) -> dict:
+    if case_name == 'interleaved_burst_checksum':
+        # Concurrent writes and reads that cross 1 KiB stripes. Unaligned
+        # starts also exercise the read masks on both sides of each stripe.
+        spec = build_case('large_burst_checksum')
+        patterns = {}
+        for item in spec['schedule']:
+            item['addr'] += 0x3fd
+            if item['is_write']:
+                patterns[item['addr']] = item['data_hex']
+            else:
+                item['expected_hex'] = patterns[item['addr']]
+        spec['interleaved'] = True
+        return spec
+
+    if case_name == 'interleaved_read_loop':
+        spec = build_case('read_loop')
+        pattern = spec['schedule'][0]['data_hex']
+        for item in spec['schedule'][1:]:
+            item['expected_hex'] = pattern
+        spec['interleaved'] = True
+        return spec
+
     if case_name == 'read_basic':
         # Single 4-byte read at 0x0. DRAMSys returns whatever the backing
         # store holds (uninitialised, but the wrapper must successfully
@@ -228,8 +252,17 @@ class Chip(gvsoc.systree.Component):
 
         clock = vp.clock_domain.Clock_domain(self, 'clock', frequency=1_000_000_000)
 
-        ddr = memory.dramsys.Dramsys(self, 'ddr', version=version)
-        clock.o_CLOCK(ddr.i_CLOCK())
+        if spec.get('interleaved', False):
+            ddr = interco.interleaver.Interleaver(self, 'stripes', nb_slaves=2,
+                                                interleaving_bits=10, asynchronous=True)
+            clock.o_CLOCK(ddr.i_CLOCK())
+            for channel in range(2):
+                dram = memory.dramsys.Dramsys(self, f'ddr{channel}')
+                clock.o_CLOCK(dram.i_CLOCK())
+                self.bind(ddr, f'out_{channel}', dram, 'input')
+        else:
+            ddr = memory.dramsys.Dramsys(self, 'ddr', version=version)
+            clock.o_CLOCK(ddr.i_CLOCK())
 
         if version == 1:
             master = StubMasterV1(self, 'master', schedule=spec['schedule'],
@@ -254,7 +287,10 @@ class Chip(gvsoc.systree.Component):
             master.o_OUTPUT(router.i_INPUT())
             router.o_MAP_DEFAULT(ddr.i_INPUT(), name='ddr')
         else:
-            master.o_OUTPUT(ddr.i_INPUT())
+            if spec.get('interleaved', False):
+                self.bind(master, 'output', ddr, 'input')
+            else:
+                master.o_OUTPUT(ddr.i_INPUT())
 
 
 class Target(gvsoc.runner.Target):
