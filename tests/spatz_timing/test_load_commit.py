@@ -62,6 +62,28 @@ int main(){
  assert(m.rob_count[0]==1 && m.insns[0].nb_pending_bursts==4 && m.vu.committed==0);
  m.commit_narrow_loads();assert(m.narrow_commits.size()==1); // one row per edge
  m.vu.iss.clock.cycle=2;m.commit_narrow_loads();assert(m.narrow_commits.size()==2);
+
+ // An arrived response from a younger load cannot complete an older row.
+ VuLsu tagged;tagged.vu.iss.clock.cycle=1;
+ tagged.reqs[2].slot=&tagged.insns[1];
+ tagged.commit_narrow_loads();
+ assert(tagged.narrow_commits.empty() && tagged.rob_count[0]==2 && tagged.rob_count[1]==2);
+ tagged.reqs[2].slot=&tagged.insns[0];tagged.commit_narrow_loads();
+ assert(tagged.narrow_commits.size()==1);
+
+ // Three real words occupy a full row and a one-lane tail. The other
+ // tail lane already holds a younger response; it supplies no padding data
+ // and keeps its request and pending-beat count when the older load drains.
+ VuLsu tail;tail.insns[0].nb_remaining_bursts=3;tail.insns[0].nb_pending_bursts=3;
+ tail.insns[1].nb_pending_bursts=1;tail.reqs[3].slot=&tail.insns[1];
+ tail.vu.iss.clock.cycle=1;tail.commit_narrow_loads();
+ tail.vu.iss.clock.cycle=2;tail.commit_narrow_loads();
+ assert(tail.narrow_commits.size()==2 && tail.narrow_commits.back().words.size()==1);
+ assert(tail.narrow_commits.back().words.front()==&tail.reqs[1]);
+ assert(tail.insns[0].nb_remaining_bursts==0 && tail.rob_count[0]==0);
+ assert(tail.rob_count[1]==1 && tail.rob_first[1]==1 && tail.rob[1][1].allocated);
+ assert(tail.insns[1].nb_pending_bursts==1 && tail.vu.committed==0);
+
  VuLsu old;old.clocked_narrow=false;old.commit_narrow_loads();
  assert(old.vu.committed==16 && old.insns[0].nb_pending_bursts==0);
 }
@@ -70,4 +92,4 @@ with tempfile.TemporaryDirectory(prefix='spatz-commit-test-') as tmp:
  p=Path(tmp);(p/'test.cpp').write_text(fixture+method+main)
  subprocess.run(['g++','-std=c++17','-Wall','-Wextra',str(p/'test.cpp'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True)
-print('PASS next-edge visibility, required-lane readiness, one row/cycle, delayed writeback and legacy control')
+print('PASS next-edge visibility, required-lane readiness, instruction tags, partial tails, one row/cycle, delayed writeback and legacy control')
